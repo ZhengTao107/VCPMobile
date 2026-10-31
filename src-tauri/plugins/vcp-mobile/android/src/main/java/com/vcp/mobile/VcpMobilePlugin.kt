@@ -254,6 +254,8 @@ class VcpMobilePlugin(private val activity: Activity) : Plugin(activity) {
 
     companion object {
         const val TAG = "VcpMobilePlugin"
+        // 单次 picker 多选上限；与 Rust system.rs MAX_PICK_FILES 保持一致
+        private const val MAX_PICK_FILES = 16
         // 下载目录导出上限：设置备份（JSON + base64 头像）正常远低于此值
         private const val MAX_DOWNLOAD_EXPORT_BYTES = 8 * 1024 * 1024
         private var instanceRef: java.lang.ref.WeakReference<VcpMobilePlugin>? = null
@@ -1433,6 +1435,11 @@ class VcpMobilePlugin(private val activity: Activity) : Plugin(activity) {
                     launchCameraIntent(invoke)
                 }
                 "gallery", "avatar" -> {
+                    // avatar 永远单选：isMultiPick 对 avatar/camera 恒为 false
+                    if (isMultiPick(args)) {
+                        launchMultiImagePicker(invoke, pickLimit(args.maxItems))
+                        return
+                    }
                     val intent = Intent(Intent.ACTION_GET_CONTENT).apply {
                         type = "image/*"
                         addCategory(Intent.CATEGORY_OPENABLE)
@@ -1440,9 +1447,13 @@ class VcpMobilePlugin(private val activity: Activity) : Plugin(activity) {
                     startActivityForResult(invoke, intent, "onPickFileResult")
                 }
                 else -> {
+                    val multiple = isMultiPick(args)
                     val intent = Intent(Intent.ACTION_GET_CONTENT).apply {
                         type = "*/*"
                         addCategory(Intent.CATEGORY_OPENABLE)
+                        if (multiple) {
+                            putExtra(Intent.EXTRA_ALLOW_MULTIPLE, true)
+                        }
                     }
                     startActivityForResult(invoke, intent, "onPickFileResult")
                 }
@@ -1554,6 +1565,60 @@ class VcpMobilePlugin(private val activity: Activity) : Plugin(activity) {
         }
     }
 
+    private fun pickLimit(requested: Int): Int = requested.coerceIn(1, MAX_PICK_FILES)
+
+    /** Rust pick_file 用同一判定决定反序列化形状；改这里必须同步 system.rs。 */
+    private fun isMultiPick(args: PickFileArgs): Boolean =
+        args.multiple && args.mode != "avatar" && args.mode != "camera" && pickLimit(args.maxItems) > 1
+
+    private fun launchMultiImagePicker(invoke: Invoke, limit: Int) {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            val maxAllowed = min(limit, MediaStore.getPickImagesMaxLimit())
+            if (maxAllowed > 1) {
+                val intent = Intent(MediaStore.ACTION_PICK_IMAGES).apply {
+                    type = "image/*"
+                    putExtra(MediaStore.EXTRA_PICK_IMAGES_MAX, maxAllowed)
+                }
+                try {
+                    startActivityForResult(invoke, intent, "onPickFileResult")
+                    return
+                } catch (e: android.content.ActivityNotFoundException) {
+                    Log.w(TAG, "[pickFile] ACTION_PICK_IMAGES unavailable, falling back to GET_CONTENT", e)
+                }
+            }
+        }
+        val intent = Intent(Intent.ACTION_GET_CONTENT).apply {
+            type = "image/*"
+            addCategory(Intent.CATEGORY_OPENABLE)
+            putExtra(Intent.EXTRA_ALLOW_MULTIPLE, true)
+        }
+        startActivityForResult(invoke, intent, "onPickFileResult")
+    }
+
+    /** 先读 clipData（多选），截到 limit；没有 clipData 时退回 data。 */
+    private fun collectPickedUris(data: Intent?, limit: Int): List<Uri> {
+        val uris = ArrayList<Uri>()
+        val clip = data?.clipData
+        if (clip != null) {
+            for (i in 0 until clip.itemCount) {
+                if (uris.size >= limit) break
+                clip.getItemAt(i)?.uri?.let { uris.add(it) }
+            }
+        }
+        if (uris.isEmpty()) {
+            data?.data?.let { uris.add(it) }
+        }
+        return uris
+    }
+
+    private fun dispatchPickerEvent(eventName: String, detail: JSObject) {
+        val safeDetail = escapeJsonForJsString(detail.toString())
+        val script = "window.dispatchEvent(new CustomEvent('$eventName', { detail: JSON.parse(\"$safeDetail\") }))"
+        activity.runOnUiThread {
+            webViewRef?.evaluateJavascript(script, null)
+        }
+    }
+
     @ActivityCallback
     fun onPickFileResult(invoke: Invoke, result: ActivityResult) {
         if (result.resultCode != Activity.RESULT_OK) {
@@ -1562,369 +1627,451 @@ class VcpMobilePlugin(private val activity: Activity) : Plugin(activity) {
             return
         }
 
-        val uri = result.data?.data
-        if (uri == null) {
-            Log.w(TAG, "[onPickFileResult] Selected URI is null")
-            invoke.reject("No file selected")
+        val args = invoke.parseArgs(PickFileArgs::class.java)
+
+        // 单选：返回形状与改造前一致（不带 stagingTicket），avatar/camera 只走这里
+        if (!isMultiPick(args)) {
+            val uri = result.data?.data ?: result.data?.clipData?.let { clip ->
+                if (clip.itemCount > 0) clip.getItemAt(0)?.uri else null
+            }
+            if (uri == null) {
+                Log.w(TAG, "[onPickFileResult] Selected URI is null")
+                invoke.reject("No file selected")
+                return
+            }
+            val isAvatarMode = args.mode == "avatar"
+            executePluginTask(executorDomains.fileIoExecutor, invoke, "processPickedFile") {
+                try {
+                    val pickedFile = processPickedUri(uri, java.util.UUID.randomUUID().toString(), isAvatarMode, false)
+                    invoke.resolve(pickedFile)
+                } catch (e: Throwable) {
+                    Log.e(TAG, "[onPickFileResult] File pick handling failed", e)
+                    invoke.reject("Handling picked file failed: ${e.message}")
+                }
+            }
             return
         }
 
-        executePluginTask(executorDomains.fileIoExecutor, invoke, "processPickedFile", fileTask@{
-            var currentTempFile: java.io.File? = null
-            var currentTranscodeSourceFile: java.io.File? = null
-            var currentThumbnailFile: java.io.File? = null
-            var currentAvatarWorkFile: java.io.File? = null
-            try {
-                val context = activity
-                val contentResolver = context.contentResolver
-                val stagingTicket = java.util.UUID.randomUUID().toString()
-                val mode = invoke.parseArgs(PickFileArgs::class.java).mode
-                val isAvatarMode = mode == "avatar"
+        // 多选：逐个串行处理，每个文件独立 stagingTicket，单个失败只记入 errors
+        val limit = pickLimit(args.maxItems)
+        val uris = collectPickedUris(result.data, limit)
+        if (uris.isEmpty()) {
+            Log.w(TAG, "[onPickFileResult] Selected URI list is empty")
+            invoke.reject("No file selected")
+            return
+        }
+        val selectedCount = result.data?.clipData?.itemCount ?: uris.size
+        val skipped = max(0, selectedCount - uris.size)
+        if (skipped > 0) {
+            Log.w(TAG, "[onPickFileResult] Selected $selectedCount items, truncated to $limit")
+        }
 
-                // 1. 获取文件名和大小
-                var originalName = "unknown"
-                var size = 0L
-                contentResolver.query(uri, null, null, null, null)?.use { cursor ->
-                    val nameIndex = cursor.getColumnIndex(android.provider.OpenableColumns.DISPLAY_NAME)
-                    val sizeIndex = cursor.getColumnIndex(android.provider.OpenableColumns.SIZE)
-                    if (cursor.moveToFirst()) {
-                        if (nameIndex != -1) originalName = cursor.getString(nameIndex)
-                        if (sizeIndex != -1) size = cursor.getLong(sizeIndex)
+        executePluginTask(executorDomains.fileIoExecutor, invoke, "processPickedFiles") {
+            val tickets = uris.map { java.util.UUID.randomUUID().toString() }
+            dispatchPickerEvent("vcp-mobile-file-batch-start", JSObject().apply {
+                put("count", uris.size)
+                put("skipped", skipped)
+                put("limit", limit)
+                put("tickets", JSArray().apply { tickets.forEach { put(it) } })
+            })
+
+            val files = JSArray()
+            val errors = JSArray()
+            var firstError: String? = null
+            for ((index, uri) in uris.withIndex()) {
+                val ticket = tickets[index]
+                try {
+                    files.put(processPickedUri(uri, ticket, false, true))
+                } catch (e: Throwable) {
+                    Log.e(TAG, "[onPickFileResult] Picked file ${index + 1}/${uris.size} failed", e)
+                    val message = e.message ?: e.javaClass.simpleName
+                    if (firstError == null) firstError = message
+                    val failure = JSObject().apply {
+                        put("stagingTicket", ticket)
+                        put("message", message)
                     }
+                    errors.put(failure)
+                    dispatchPickerEvent("vcp-mobile-file-failed", failure)
+                    if (e is InterruptedException || Thread.currentThread().isInterrupted) break
                 }
+            }
 
-                // 2. 获取 MIME 类型
-                var mimeType = contentResolver.getType(uri) ?: "application/octet-stream"
-                Log.i(TAG, "[onPickFileResult] Processing picked file: $originalName (size=$size, mime=$mimeType)")
+            val batch = JSObject().apply {
+                put("files", files)
+                put("errors", errors)
+                put("skipped", skipped)
+            }
+            // 双轨：invoke 回执在 JNI 断裂时可能丢失，事件兜底
+            dispatchPickerEvent("vcp-mobile-file-batch", batch)
+            if (files.length() == 0) {
+                invoke.reject("Handling picked files failed: ${firstError ?: "no file processed"}")
+            } else {
+                invoke.resolve(batch)
+            }
+        }
+    }
 
-                // 3. 发送预准备事件给前端，让前端立即创建进度卡片
-                if (!isAvatarMode) {
-                    val startDetail = JSObject().apply {
-                        put("name", originalName)
-                        put("size", size)
-                        put("mime", mimeType)
-                    }
-                    val safeStartDetail = escapeJsonForJsString(startDetail.toString())
-                    activity.runOnUiThread {
-                        webViewRef?.evaluateJavascript("window.dispatchEvent(new CustomEvent('vcp-mobile-file-start', { detail: JSON.parse(\"$safeStartDetail\") }))", null)
-                    }
+    /**
+     * 单个 picker URI：流式拷贝+SHA-256、按需转码、落 staging、缩略图或头像工作副本，
+     * 并派发带 stagingTicket 的 start/progress/picked 事件（头像模式不派发）。
+     * 失败时清理本次产物并抛出，由调用方决定 reject 还是记入批次错误。
+     */
+    private fun processPickedUri(
+        uri: Uri,
+        stagingTicket: String,
+        isAvatarMode: Boolean,
+        exposeTicket: Boolean,
+    ): JSObject {
+        var currentTempFile: java.io.File? = null
+        var currentTranscodeSourceFile: java.io.File? = null
+        var currentThumbnailFile: java.io.File? = null
+        var currentAvatarWorkFile: java.io.File? = null
+        try {
+            val context = activity
+            val contentResolver = context.contentResolver
+
+            // 1. 获取文件名和大小
+            var originalName = "unknown"
+            var size = 0L
+            contentResolver.query(uri, null, null, null, null)?.use { cursor ->
+                val nameIndex = cursor.getColumnIndex(android.provider.OpenableColumns.DISPLAY_NAME)
+                val sizeIndex = cursor.getColumnIndex(android.provider.OpenableColumns.SIZE)
+                if (cursor.moveToFirst()) {
+                    if (nameIndex != -1) originalName = cursor.getString(nameIndex)
+                    if (sizeIndex != -1) size = cursor.getLong(sizeIndex)
                 }
+            }
 
-                // 4. 流式安全拷贝至 cacheDir 并同步计算 SHA-256 (64KB buffer)
-                val uploadsDir = java.io.File(context.cacheDir, "uploads").apply { mkdirs() }
-                var tempFile = java.io.File(uploadsDir, "pick_${stagingTicket}_temp")
-                currentTempFile = tempFile
-                val digest = java.security.MessageDigest.getInstance("SHA-256")
-                
-                contentResolver.openInputStream(uri).use { inputStream ->
-                    if (inputStream == null) {
-                        Log.e(TAG, "[onPickFileResult] openInputStream returned null")
-                        invoke.reject("Could not open input stream")
-                        return@fileTask
-                    }
-                    java.io.FileOutputStream(tempFile).use { outputStream ->
-                        val buffer = ByteArray(65536)
-                        var bytesRead: Int
-                        var totalRead = 0L
-                        var lastReportTime = System.currentTimeMillis()
-                        
-                        while (inputStream.read(buffer).also { bytesRead = it } != -1) {
-                            outputStream.write(buffer, 0, bytesRead)
-                            digest.update(buffer, 0, bytesRead)
-                            totalRead += bytesRead
-                            
-                            val now = System.currentTimeMillis()
-                            if (!isAvatarMode && now - lastReportTime > 200) {
-                                lastReportTime = now
-                                val progress = if (size > 0) ((totalRead.toDouble() / size) * 100).toInt() else 0
-                                val progressDetail = JSObject().apply {
-                                    put("loaded", totalRead)
-                                    put("total", size)
-                                    put("progress", progress)
-                                    put("name", originalName)
-                                    put("mime", mimeType)
-                                }
-                                val safeProgressDetail = escapeJsonForJsString(progressDetail.toString())
-                                val progressScript = "window.dispatchEvent(new CustomEvent('vcp-mobile-file-progress', { detail: JSON.parse(\"$safeProgressDetail\") }))"
-                                activity.runOnUiThread {
-                                    webViewRef?.evaluateJavascript(progressScript, null)
-                                }
+            // 2. 获取 MIME 类型
+            var mimeType = contentResolver.getType(uri) ?: "application/octet-stream"
+            Log.i(TAG, "[processPickedUri] Processing picked file: $originalName (size=$size, mime=$mimeType)")
+
+            // 3. 发送预准备事件给前端，让前端立即创建进度卡片
+            if (!isAvatarMode) {
+                val startDetail = JSObject().apply {
+                    put("name", originalName)
+                    put("size", size)
+                    put("mime", mimeType)
+                    put("stagingTicket", stagingTicket)
+                }
+                val safeStartDetail = escapeJsonForJsString(startDetail.toString())
+                activity.runOnUiThread {
+                    webViewRef?.evaluateJavascript("window.dispatchEvent(new CustomEvent('vcp-mobile-file-start', { detail: JSON.parse(\"$safeStartDetail\") }))", null)
+                }
+            }
+
+            // 4. 流式安全拷贝至 cacheDir 并同步计算 SHA-256 (64KB buffer)
+            val uploadsDir = java.io.File(context.cacheDir, "uploads").apply { mkdirs() }
+            var tempFile = java.io.File(uploadsDir, "pick_${stagingTicket}_temp")
+            currentTempFile = tempFile
+            val digest = java.security.MessageDigest.getInstance("SHA-256")
+
+            val sourceStream = contentResolver.openInputStream(uri)
+                ?: throw IllegalStateException("Could not open input stream")
+            sourceStream.use { inputStream ->
+                java.io.FileOutputStream(tempFile).use { outputStream ->
+                    val buffer = ByteArray(65536)
+                    var bytesRead: Int
+                    var totalRead = 0L
+                    var lastReportTime = System.currentTimeMillis()
+
+                    while (inputStream.read(buffer).also { bytesRead = it } != -1) {
+                        outputStream.write(buffer, 0, bytesRead)
+                        digest.update(buffer, 0, bytesRead)
+                        totalRead += bytesRead
+
+                        val now = System.currentTimeMillis()
+                        if (!isAvatarMode && now - lastReportTime > 200) {
+                            lastReportTime = now
+                            val progress = if (size > 0) ((totalRead.toDouble() / size) * 100).toInt() else 0
+                            val progressDetail = JSObject().apply {
+                                put("loaded", totalRead)
+                                put("total", size)
+                                put("progress", progress)
+                                put("name", originalName)
+                                put("mime", mimeType)
+                                put("stagingTicket", stagingTicket)
+                            }
+                            val safeProgressDetail = escapeJsonForJsString(progressDetail.toString())
+                            val progressScript = "window.dispatchEvent(new CustomEvent('vcp-mobile-file-progress', { detail: JSON.parse(\"$safeProgressDetail\") }))"
+                            activity.runOnUiThread {
+                                webViewRef?.evaluateJavascript(progressScript, null)
                             }
                         }
                     }
                 }
+            }
 
-                val hashBytes = digest.digest()
-                var hash = hashBytes.joinToString("") { "%02x".format(it) }
+            val hashBytes = digest.digest()
+            var hash = hashBytes.joinToString("") { "%02x".format(it) }
 
-                // ⚡ 多媒体硬件预转码与 API 动态门槛拦截预处理层
-                val ext = originalName.substringAfterLast(".").lowercase()
-                val sdkInt = android.os.Build.VERSION.SDK_INT
-                val isUnsupportedVideo = listOf("mkv", "avi", "flv", "wmv", "ts").contains(ext)
-                val isUnsupportedAudio = listOf("wma", "aiff").contains(ext)
-                val isUnsupportedHeic = (ext == "heic" || ext == "heif") && sdkInt < 28
-                val isUnsupportedAvif = ext == "avif" && sdkInt < 31
-                val isUnsupportedOpus = ext == "opus" && sdkInt < 29
+            // ⚡ 多媒体硬件预转码与 API 动态门槛拦截预处理层
+            val ext = originalName.substringAfterLast(".").lowercase()
+            val sdkInt = android.os.Build.VERSION.SDK_INT
+            val isUnsupportedVideo = listOf("mkv", "avi", "flv", "wmv", "ts").contains(ext)
+            val isUnsupportedAudio = listOf("wma", "aiff").contains(ext)
+            val isUnsupportedHeic = (ext == "heic" || ext == "heif") && sdkInt < 28
+            val isUnsupportedAvif = ext == "avif" && sdkInt < 31
+            val isUnsupportedOpus = ext == "opus" && sdkInt < 29
 
-                val needTranscode = isUnsupportedVideo || isUnsupportedAudio || isUnsupportedHeic || isUnsupportedAvif || isUnsupportedOpus
+            val needTranscode = isUnsupportedVideo || isUnsupportedAudio || isUnsupportedHeic || isUnsupportedAvif || isUnsupportedOpus
 
-                var fileExtension = java.io.File(originalName).extension.let { 
-                    if (it.isEmpty()) "" else ".$it" 
-                }
+            var fileExtension = java.io.File(originalName).extension.let {
+                if (it.isEmpty()) "" else ".$it"
+            }
 
-                if (needTranscode) {
-                    Log.i(TAG, "[onPickFileResult] File need transcode: $originalName (ext=$ext, sdk=$sdkInt)")
-                    val isAudioOnly = isUnsupportedAudio || isUnsupportedOpus || (ext == "ogg" && sdkInt < 29)
-                    val isImageOnly = isUnsupportedHeic || isUnsupportedAvif
-                    val outputSuffix = if (isAudioOnly) "m4a" else if (isImageOnly) "jpg" else "mp4"
-                    val transcodedFile = java.io.File(uploadsDir, "transcoded_${stagingTicket}.$outputSuffix")
-                    currentTranscodeSourceFile = tempFile
-                    currentTempFile = transcodedFile
+            if (needTranscode) {
+                Log.i(TAG, "[processPickedUri] File need transcode: $originalName (ext=$ext, sdk=$sdkInt)")
+                val isAudioOnly = isUnsupportedAudio || isUnsupportedOpus || (ext == "ogg" && sdkInt < 29)
+                val isImageOnly = isUnsupportedHeic || isUnsupportedAvif
+                val outputSuffix = if (isAudioOnly) "m4a" else if (isImageOnly) "jpg" else "mp4"
+                val transcodedFile = java.io.File(uploadsDir, "transcoded_${stagingTicket}.$outputSuffix")
+                currentTranscodeSourceFile = tempFile
+                currentTempFile = transcodedFile
 
-                    val latch = CountDownLatch(1)
-                    val transcodeAbandoned = java.util.concurrent.atomic.AtomicBoolean(false)
-                    val transcodeError = java.util.concurrent.atomic.AtomicReference<Throwable?>(null)
-                    val transformerRef = java.util.concurrent.atomic.AtomicReference<Transformer?>(null)
+                val latch = CountDownLatch(1)
+                val transcodeAbandoned = java.util.concurrent.atomic.AtomicBoolean(false)
+                val transcodeError = java.util.concurrent.atomic.AtomicReference<Throwable?>(null)
+                val transformerRef = java.util.concurrent.atomic.AtomicReference<Transformer?>(null)
 
-                    activity.runOnUiThread {
+                activity.runOnUiThread {
+                    if (transcodeAbandoned.get()) {
+                        latch.countDown()
+                        return@runOnUiThread
+                    }
+                    try {
+                        val request = TransformationRequest.Builder()
+                            .setVideoMimeType(if (!isAudioOnly && !isImageOnly) MimeTypes.VIDEO_H264 else null)
+                            .setAudioMimeType(MimeTypes.AUDIO_AAC)
+                            .build()
+
+                        @Suppress("DEPRECATION")
+                        val transformer = Transformer.Builder(context)
+                            .setTransformationRequest(request)
+                            .addListener(object : Transformer.Listener {
+                                override fun onCompleted(composition: Composition, result: ExportResult) {
+                                    latch.countDown()
+                                    if (transcodeAbandoned.get()) transcodedFile.delete()
+                                }
+
+                                override fun onError(composition: Composition, result: ExportResult, exception: ExportException) {
+                                    transcodeError.set(exception)
+                                    latch.countDown()
+                                    if (transcodeAbandoned.get()) transcodedFile.delete()
+                                }
+                            })
+                            .build()
+                        transformerRef.set(transformer)
                         if (transcodeAbandoned.get()) {
+                            transformer.cancel()
                             latch.countDown()
                             return@runOnUiThread
                         }
-                        try {
-                            val request = TransformationRequest.Builder()
-                                .setVideoMimeType(if (!isAudioOnly && !isImageOnly) MimeTypes.VIDEO_H264 else null)
-                                .setAudioMimeType(MimeTypes.AUDIO_AAC)
-                                .build()
 
-                            @Suppress("DEPRECATION")
-                            val transformer = Transformer.Builder(context)
-                                .setTransformationRequest(request)
-                                .addListener(object : Transformer.Listener {
-                                    override fun onCompleted(composition: Composition, result: ExportResult) {
-                                        latch.countDown()
-                                        if (transcodeAbandoned.get()) transcodedFile.delete()
-                                    }
+                        val mediaItem = MediaItem.fromUri(Uri.fromFile(tempFile))
+                        val editedMediaItem = EditedMediaItem.Builder(mediaItem)
+                            .setRemoveAudio(false)
+                            .build()
 
-                                    override fun onError(composition: Composition, result: ExportResult, exception: ExportException) {
-                                        transcodeError.set(exception)
-                                        latch.countDown()
-                                        if (transcodeAbandoned.get()) transcodedFile.delete()
-                                    }
-                                })
-                                .build()
-                            transformerRef.set(transformer)
-                            if (transcodeAbandoned.get()) {
-                                transformer.cancel()
-                                latch.countDown()
-                                return@runOnUiThread
-                            }
-
-                            val mediaItem = MediaItem.fromUri(Uri.fromFile(tempFile))
-                            val editedMediaItem = EditedMediaItem.Builder(mediaItem)
-                                .setRemoveAudio(false)
-                                .build()
-
-                            transformer.start(editedMediaItem, transcodedFile.absolutePath)
-                        } catch (e: Throwable) {
-                            transcodeError.set(e)
-                            latch.countDown()
-                            if (transcodeAbandoned.get()) transcodedFile.delete()
-                        }
-                    }
-
-                    val transcodeCompleted = try {
-                        latch.await(300, java.util.concurrent.TimeUnit.SECONDS)
-                    } catch (error: InterruptedException) {
-                        transcodeAbandoned.set(true)
-                        activity.runOnUiThread { transformerRef.get()?.cancel() }
-                        transcodedFile.delete()
-                        Thread.currentThread().interrupt()
-                        throw error
-                    }
-                    if (!transcodeCompleted) {
-                        transcodeAbandoned.set(true)
-                        activity.runOnUiThread { transformerRef.get()?.cancel() }
-                        transcodedFile.delete()
-                        throw java.util.concurrent.TimeoutException("Transcoding timed out after 5 minutes")
-                    }
-                    transcodeError.get()?.let { throw it }
-
-                    // 转码成功，物理删除原格式的临时文件以释放空间
-                    if (!tempFile.delete()) {
-                        transcodedFile.delete()
-                        throw IllegalStateException("Failed to delete transcoded source staging file")
-                    }
-                    currentTranscodeSourceFile = null
-
-                    // 重新计算转码后文件的 CAS SHA-256 哈希
-                    val newDigest = java.security.MessageDigest.getInstance("SHA-256")
-                    java.io.FileInputStream(transcodedFile).use { fis ->
-                        val buf = ByteArray(65536)
-                        var n: Int
-                        while (fis.read(buf).also { n = it } != -1) {
-                            newDigest.update(buf, 0, n)
-                        }
-                    }
-                    val newHashBytes = newDigest.digest()
-                    hash = newHashBytes.joinToString("") { "%02x".format(it) }
-
-                    // 更新下游变量
-                    fileExtension = ".$outputSuffix"
-                    mimeType = if (isAudioOnly) "audio/mp4" else if (isImageOnly) "image/jpeg" else "video/mp4"
-                    originalName = originalName.substringBeforeLast(".") + "." + outputSuffix
-                    tempFile = transcodedFile
-                }
-
-                val stagingStem = pickerUploadStagingStem(stagingTicket, hash)
-                val finalTempFile = java.io.File(
-                    uploadsDir,
-                    pickerUploadStagingName(stagingTicket, hash, fileExtension),
-                )
-
-                if (finalTempFile.exists()) {
-                    throw IllegalStateException("picker upload staging ticket 已存在")
-                }
-                if (!tempFile.renameTo(finalTempFile)) {
-                    try {
-                        tempFile.copyTo(finalTempFile, overwrite = false)
-                    } catch (error: Throwable) {
-                        finalTempFile.delete()
-                        throw error
-                    }
-                    if (!tempFile.delete()) {
-                        finalTempFile.delete()
-                        throw IllegalStateException("无法清理已复制的 picker source staging")
+                        transformer.start(editedMediaItem, transcodedFile.absolutePath)
+                    } catch (e: Throwable) {
+                        transcodeError.set(e)
+                        latch.countDown()
+                        if (transcodeAbandoned.get()) transcodedFile.delete()
                     }
                 }
-                currentTempFile = finalTempFile
-                val ownedFinalTempFile = currentTempFile
 
-                val finalSize = if (size > 0) size else ownedFinalTempFile.length()
-
-                // Avatar 专用模式：原图只在 Native 层流式落盘，采样完成后立即删除。
-                // WebView 只接收最长边 1120px 的受控工作副本，不触发附件事件。
-                if (isAvatarMode) {
-                    val processLatch = CountDownLatch(1)
-                    val preparationAbandoned = java.util.concurrent.atomic.AtomicBoolean(false)
-                    val processedPath = java.util.concurrent.atomic.AtomicReference<String?>(null)
-                    val processError = java.util.concurrent.atomic.AtomicReference<Throwable?>(null)
-                    MediaBridge.processImageAsync(ownedFinalTempFile.absolutePath, context) { processResult ->
-                        processResult
-                            .onSuccess { processedPath.set(it) }
-                            .onFailure { processError.set(it) }
-                        processLatch.countDown()
-                        if (preparationAbandoned.get()) {
-                            processedPath.getAndSet(null)?.let { java.io.File(it).delete() }
-                        }
-                    }
-                    val processCompleted = try {
-                        processLatch.await(30, java.util.concurrent.TimeUnit.SECONDS)
-                    } catch (error: InterruptedException) {
-                        preparationAbandoned.set(true)
-                        processedPath.getAndSet(null)?.let { java.io.File(it).delete() }
-                        Thread.currentThread().interrupt()
-                        throw error
-                    }
-                    if (!processCompleted) {
-                        preparationAbandoned.set(true)
-                        processedPath.getAndSet(null)?.let { java.io.File(it).delete() }
-                        throw java.util.concurrent.TimeoutException("Avatar image preparation timed out")
-                    }
-                    processError.get()?.let { throw it }
-
-                    val avatarWorkFile = processedPath.getAndSet(null)?.let { java.io.File(it) }
-                        ?: throw IllegalStateException("Avatar image preparation returned no path")
-                    if (!avatarWorkFile.exists() || avatarWorkFile.length() <= 0L) {
-                        avatarWorkFile.delete()
-                        throw IllegalStateException("Avatar image preparation returned an invalid file")
-                    }
-                    currentAvatarWorkFile = avatarWorkFile
-
-                    val avatarDigest = java.security.MessageDigest.getInstance("SHA-256")
-                    java.io.FileInputStream(avatarWorkFile).use { input ->
-                        val buffer = ByteArray(65536)
-                        var bytesRead: Int
-                        while (input.read(buffer).also { bytesRead = it } != -1) {
-                            avatarDigest.update(buffer, 0, bytesRead)
-                        }
-                    }
-                    val avatarHash = avatarDigest.digest().joinToString("") { "%02x".format(it) }
-
-                    if (!ownedFinalTempFile.delete()) {
-                        throw IllegalStateException("Failed to delete avatar source staging file")
-                    }
-                    currentTempFile = null
-
-                    val avatarResult = JSObject().apply {
-                        put("path", avatarWorkFile.absolutePath)
-                        put("name", "avatar_work.webp")
-                        put("mime", "image/webp")
-                        put("size", avatarWorkFile.length())
-                        put("hash", avatarHash)
-                        put("thumbnailPath", org.json.JSONObject.NULL)
-                    }
-                    invoke.resolve(avatarResult)
-                    currentAvatarWorkFile = null
-                    return@fileTask
+                val transcodeCompleted = try {
+                    latch.await(300, java.util.concurrent.TimeUnit.SECONDS)
+                } catch (error: InterruptedException) {
+                    transcodeAbandoned.set(true)
+                    activity.runOnUiThread { transformerRef.get()?.cancel() }
+                    transcodedFile.delete()
+                    Thread.currentThread().interrupt()
+                    throw error
                 }
-
-                // 4. 图片资源触发 Native 硬件加速缩略图硬解
-                var thumbnailPath: String? = null
-                if (mimeType.startsWith("image/")) {
-                    thumbnailPath = generateNativeThumbnail(context, ownedFinalTempFile, stagingStem)
-                    currentThumbnailFile = thumbnailPath?.let { java.io.File(it) }
-                    thumbnailPath = currentThumbnailFile?.absolutePath
+                if (!transcodeCompleted) {
+                    transcodeAbandoned.set(true)
+                    activity.runOnUiThread { transformerRef.get()?.cancel() }
+                    transcodedFile.delete()
+                    throw java.util.concurrent.TimeoutException("Transcoding timed out after 5 minutes")
                 }
+                transcodeError.get()?.let { throw it }
 
-                // 5. 组装结果物理路径并回传给 Rust 桥接
-                val resultObject = JSObject()
-                resultObject.put("path", ownedFinalTempFile.absolutePath)
-                resultObject.put("name", originalName)
-                resultObject.put("mime", mimeType)
-                resultObject.put("size", finalSize)
-                resultObject.put("hash", hash)
-                if (thumbnailPath != null) {
-                    resultObject.put("thumbnailPath", thumbnailPath)
+                // 转码成功，物理删除原格式的临时文件以释放空间
+                if (!tempFile.delete()) {
+                    transcodedFile.delete()
+                    throw IllegalStateException("Failed to delete transcoded source staging file")
                 }
+                currentTranscodeSourceFile = null
 
-                Log.i(TAG, "[onPickFileResult] File copy & process complete: path=${ownedFinalTempFile.absolutePath}, hash=$hash")
-                
-                // 双轨通信：主动推送最终结果给前端，穿透 JNI 断裂层
-                if (!isAvatarMode) {
-                    val pickedDetail = JSObject().apply {
-                        put("path", ownedFinalTempFile.absolutePath)
-                        put("name", originalName)
-                        put("mime", mimeType)
-                        put("size", finalSize)
-                        put("hash", hash)
-                        if (thumbnailPath != null) {
-                            put("thumbnailPath", thumbnailPath)
-                        } else {
-                            put("thumbnailPath", org.json.JSONObject.NULL)
-                        }
-                    }
-                    val safePickedDetail = escapeJsonForJsString(pickedDetail.toString())
-                    val pickedScript = "window.dispatchEvent(new CustomEvent('vcp-mobile-file-picked', { detail: JSON.parse(\"$safePickedDetail\") }))"
-                    activity.runOnUiThread {
-                        webViewRef?.evaluateJavascript(pickedScript, null)
+                // 重新计算转码后文件的 CAS SHA-256 哈希
+                val newDigest = java.security.MessageDigest.getInstance("SHA-256")
+                java.io.FileInputStream(transcodedFile).use { fis ->
+                    val buf = ByteArray(65536)
+                    var n: Int
+                    while (fis.read(buf).also { n = it } != -1) {
+                        newDigest.update(buf, 0, n)
                     }
                 }
-                
-                invoke.resolve(resultObject)
-                currentTempFile = null
-                currentThumbnailFile = null
-            } catch (e: Throwable) {
-                Log.e(TAG, "[onPickFileResult] File pick handling failed", e)
-                try {
-                    currentTempFile?.delete()
-                    currentTranscodeSourceFile?.delete()
-                    currentThumbnailFile?.delete()
-                    currentAvatarWorkFile?.delete()
-                } catch (_: Exception) {}
-                invoke.reject("Handling picked file failed: ${e.message}")
+                val newHashBytes = newDigest.digest()
+                hash = newHashBytes.joinToString("") { "%02x".format(it) }
+
+                // 更新下游变量
+                fileExtension = ".$outputSuffix"
+                mimeType = if (isAudioOnly) "audio/mp4" else if (isImageOnly) "image/jpeg" else "video/mp4"
+                originalName = originalName.substringBeforeLast(".") + "." + outputSuffix
+                tempFile = transcodedFile
             }
-        })
+
+            val stagingStem = pickerUploadStagingStem(stagingTicket, hash)
+            val finalTempFile = java.io.File(
+                uploadsDir,
+                pickerUploadStagingName(stagingTicket, hash, fileExtension),
+            )
+
+            if (finalTempFile.exists()) {
+                throw IllegalStateException("picker upload staging ticket 已存在")
+            }
+            if (!tempFile.renameTo(finalTempFile)) {
+                try {
+                    tempFile.copyTo(finalTempFile, overwrite = false)
+                } catch (error: Throwable) {
+                    finalTempFile.delete()
+                    throw error
+                }
+                if (!tempFile.delete()) {
+                    finalTempFile.delete()
+                    throw IllegalStateException("无法清理已复制的 picker source staging")
+                }
+            }
+            currentTempFile = finalTempFile
+            val ownedFinalTempFile = finalTempFile
+
+            val finalSize = if (size > 0) size else ownedFinalTempFile.length()
+
+            // Avatar 专用模式：原图只在 Native 层流式落盘，采样完成后立即删除。
+            // WebView 只接收最长边 1120px 的受控工作副本，不触发附件事件。
+            if (isAvatarMode) {
+                val processLatch = CountDownLatch(1)
+                val preparationAbandoned = java.util.concurrent.atomic.AtomicBoolean(false)
+                val processedPath = java.util.concurrent.atomic.AtomicReference<String?>(null)
+                val processError = java.util.concurrent.atomic.AtomicReference<Throwable?>(null)
+                MediaBridge.processImageAsync(ownedFinalTempFile.absolutePath, context) { processResult ->
+                    processResult
+                        .onSuccess { processedPath.set(it) }
+                        .onFailure { processError.set(it) }
+                    processLatch.countDown()
+                    if (preparationAbandoned.get()) {
+                        processedPath.getAndSet(null)?.let { java.io.File(it).delete() }
+                    }
+                }
+                val processCompleted = try {
+                    processLatch.await(30, java.util.concurrent.TimeUnit.SECONDS)
+                } catch (error: InterruptedException) {
+                    preparationAbandoned.set(true)
+                    processedPath.getAndSet(null)?.let { java.io.File(it).delete() }
+                    Thread.currentThread().interrupt()
+                    throw error
+                }
+                if (!processCompleted) {
+                    preparationAbandoned.set(true)
+                    processedPath.getAndSet(null)?.let { java.io.File(it).delete() }
+                    throw java.util.concurrent.TimeoutException("Avatar image preparation timed out")
+                }
+                processError.get()?.let { throw it }
+
+                val avatarWorkFile = processedPath.getAndSet(null)?.let { java.io.File(it) }
+                    ?: throw IllegalStateException("Avatar image preparation returned no path")
+                if (!avatarWorkFile.exists() || avatarWorkFile.length() <= 0L) {
+                    avatarWorkFile.delete()
+                    throw IllegalStateException("Avatar image preparation returned an invalid file")
+                }
+                currentAvatarWorkFile = avatarWorkFile
+
+                val avatarDigest = java.security.MessageDigest.getInstance("SHA-256")
+                java.io.FileInputStream(avatarWorkFile).use { input ->
+                    val buffer = ByteArray(65536)
+                    var bytesRead: Int
+                    while (input.read(buffer).also { bytesRead = it } != -1) {
+                        avatarDigest.update(buffer, 0, bytesRead)
+                    }
+                }
+                val avatarHash = avatarDigest.digest().joinToString("") { "%02x".format(it) }
+
+                if (!ownedFinalTempFile.delete()) {
+                    throw IllegalStateException("Failed to delete avatar source staging file")
+                }
+                currentTempFile = null
+
+                val avatarResult = JSObject().apply {
+                    put("path", avatarWorkFile.absolutePath)
+                    put("name", "avatar_work.webp")
+                    put("mime", "image/webp")
+                    put("size", avatarWorkFile.length())
+                    put("hash", avatarHash)
+                    put("thumbnailPath", org.json.JSONObject.NULL)
+                }
+                currentAvatarWorkFile = null
+                return avatarResult
+            }
+
+            // 4. 图片资源触发 Native 硬件加速缩略图硬解
+            var thumbnailPath: String? = null
+            if (mimeType.startsWith("image/")) {
+                thumbnailPath = generateNativeThumbnail(context, ownedFinalTempFile, stagingStem)
+                currentThumbnailFile = thumbnailPath?.let { java.io.File(it) }
+                thumbnailPath = currentThumbnailFile?.absolutePath
+            }
+
+            // 5. 组装结果物理路径并回传给 Rust 桥接
+            val resultObject = JSObject()
+            resultObject.put("path", ownedFinalTempFile.absolutePath)
+            resultObject.put("name", originalName)
+            resultObject.put("mime", mimeType)
+            resultObject.put("size", finalSize)
+            resultObject.put("hash", hash)
+            if (thumbnailPath != null) {
+                resultObject.put("thumbnailPath", thumbnailPath)
+            }
+            if (exposeTicket) {
+                resultObject.put("stagingTicket", stagingTicket)
+            }
+
+            Log.i(TAG, "[processPickedUri] File copy & process complete: path=${ownedFinalTempFile.absolutePath}, hash=$hash")
+
+            // 双轨通信：主动推送最终结果给前端，穿透 JNI 断裂层
+            val pickedDetail = JSObject().apply {
+                put("path", ownedFinalTempFile.absolutePath)
+                put("name", originalName)
+                put("mime", mimeType)
+                put("size", finalSize)
+                put("hash", hash)
+                put("stagingTicket", stagingTicket)
+                if (thumbnailPath != null) {
+                    put("thumbnailPath", thumbnailPath)
+                } else {
+                    put("thumbnailPath", org.json.JSONObject.NULL)
+                }
+            }
+            val safePickedDetail = escapeJsonForJsString(pickedDetail.toString())
+            val pickedScript = "window.dispatchEvent(new CustomEvent('vcp-mobile-file-picked', { detail: JSON.parse(\"$safePickedDetail\") }))"
+            activity.runOnUiThread {
+                webViewRef?.evaluateJavascript(pickedScript, null)
+            }
+
+            currentTempFile = null
+            currentThumbnailFile = null
+            return resultObject
+        } catch (e: Throwable) {
+            try {
+                currentTempFile?.delete()
+                currentTranscodeSourceFile?.delete()
+                currentThumbnailFile?.delete()
+                currentAvatarWorkFile?.delete()
+            } catch (_: Exception) {}
+            throw e
+        }
     }
 
     private fun generateNativeThumbnail(context: Context, originalFile: java.io.File, hash: String): String? {
@@ -3012,6 +3159,8 @@ class VerifyApkSignatureArgs {
 @InvokeArg
 class PickFileArgs {
     var mode: String = "file"
+    var multiple: Boolean = false
+    var maxItems: Int = 9
 }
 
 @InvokeArg
