@@ -2,6 +2,7 @@ import { onMounted, onUnmounted, ref, watch } from 'vue';
 import { listen, type UnlistenFn } from '@tauri-apps/api/event';
 import { useAppLifecycleStore } from '../stores/appLifecycle';
 import { useChatStreamStore } from '../stores/chatStreamStore';
+import { requestAutoSync } from '../sync/autoSyncTrigger';
 import { isIOS } from '../utils/platform';
 import type { LifecycleSnapshotDto } from '../types/lifecycle';
 
@@ -53,7 +54,8 @@ export function useAppLifecycle() {
       lifecycleStore.hydrateSystemStatus().catch((err) => {
         console.error("[useAppLifecycle] Failed to hydrate system status:", err);
       });
-      void reconcileInterruptedStreams('App foreground');
+      void Promise.resolve(reconcileInterruptedStreams('App foreground'))
+        .then(() => requestAutoSync('App foreground'));
     }
   });
 
@@ -65,7 +67,8 @@ export function useAppLifecycle() {
   };
 
   const handleOnline = () => {
-    void reconcileInterruptedStreams("Device online");
+    void Promise.resolve(reconcileInterruptedStreams("Device online"))
+      .then(() => requestAutoSync("Device online"));
   };
 
   onMounted(async () => {

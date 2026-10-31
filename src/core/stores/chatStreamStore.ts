@@ -8,6 +8,7 @@ import { useAvatarStore } from "./avatar";
 import { useTopicStore } from "./topicListManager";
 import { useChatHistoryStore } from "./chatHistoryStore";
 import { useNotificationStore } from "./notification";
+import { requestAutoSync } from "../sync/autoSyncTrigger";
 import type {
   ActiveGenerationDto,
   AuroraRecoverySnapshot,
@@ -1121,6 +1122,7 @@ export const useChatStreamStore = defineStore("chatStream", () => {
           if (callbacks?.onStreamFinished) {
             callbacks.onStreamFinished(actualMessageId, topicId);
           }
+          requestAutoSync("stream-end");
           if (typeof navigator !== "undefined" && navigator.vibrate) {
             navigator.vibrate(40);
           }

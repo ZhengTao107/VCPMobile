@@ -15,6 +15,8 @@ export interface AppSettings {
   syncServerUrl: string;
   syncHttpUrl: string;
   syncToken: string;
+  /** 消息完成/回前台/联网后自动同步；缺省视为开启，仅显式 false 关闭。 */
+  autoSync?: boolean;
   adminUsername: string;
   adminPassword: string;
   fileKey: string;
