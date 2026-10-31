@@ -23,6 +23,8 @@ export interface PickedFile {
   size: number;
   hash: string;
   thumbnailPath?: string | null;
+  /** 仅 picker 多选批次返回，用于按卡片对账 */
+  stagingTicket?: string;
 }
 
 export type PickFileMode = 'file' | 'camera' | 'gallery' | 'avatar';

@@ -404,38 +404,145 @@ pub struct PickedFileInfo {
     pub size: u64,
     pub hash: String,
     pub thumbnail_path: Option<String>,
+    /// 仅 picker 多选批次返回，供前端按卡片对账；单选与分享结果不带此字段。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub staging_ticket: Option<String>,
+}
+
+/// 单次 picker 多选硬上限；与 Kotlin `VcpMobilePlugin.MAX_PICK_FILES` 保持一致。
+#[cfg(any(target_os = "android", test))]
+const MAX_PICK_FILES: u32 = 16;
+#[cfg(any(target_os = "android", test))]
+const DEFAULT_PICK_ITEMS: u32 = 9;
+
+#[cfg(any(target_os = "android", test))]
+fn pick_limit(requested: Option<u32>) -> u32 {
+    requested.unwrap_or(DEFAULT_PICK_ITEMS).clamp(1, MAX_PICK_FILES)
+}
+
+/// 与 Kotlin `isMultiPick` 同一判定：决定原生返回单对象还是批次。avatar/camera 永远单选。
+#[cfg(any(target_os = "android", test))]
+fn is_multi_pick(mode: &str, multiple: bool, limit: u32) -> bool {
+    multiple && mode != "avatar" && mode != "camera" && limit > 1
+}
+
+#[cfg(target_os = "android")]
+#[derive(Deserialize)]
+struct PickedFileBatch {
+    files: Vec<PickedFileInfo>,
+}
+
+/// 未请求多选时保持旧的单对象形状；多选返回数组（失败项由原生 `vcp-mobile-file-failed` 事件告知）。
+#[derive(Serialize)]
+#[serde(untagged)]
+pub enum PickFileOutput {
+    Single(PickedFileInfo),
+    Multiple(Vec<PickedFileInfo>),
 }
 
 #[tauri::command]
 pub fn pick_file<R: Runtime>(
     app: AppHandle<R>,
     mode: Option<String>,
-) -> Result<PickedFileInfo, String> {
+    multiple: Option<bool>,
+    max_items: Option<u32>,
+) -> Result<PickFileOutput, String> {
     #[cfg(target_os = "android")]
     {
         let state = app.state::<VcpMobileState<R>>();
         let plugin_handle = state.mobile_plugin_handle()?;
+        let mode = mode.unwrap_or_else(|| "file".to_string());
+        let limit = pick_limit(max_items);
 
-        let file_info = plugin_handle
-            .run_mobile_plugin::<PickedFileInfo>(
+        if !is_multi_pick(&mode, multiple.unwrap_or(false), limit) {
+            let file_info = plugin_handle
+                .run_mobile_plugin::<PickedFileInfo>(
+                    "pickFile",
+                    serde_json::json!({
+                        "mode": mode
+                    }),
+                )
+                .map_err(|e| format!("run_mobile_plugin failed: {}", e))?;
+            return Ok(PickFileOutput::Single(file_info));
+        }
+
+        let batch = plugin_handle
+            .run_mobile_plugin::<PickedFileBatch>(
                 "pickFile",
                 serde_json::json!({
-                    "mode": mode.unwrap_or_else(|| "file".to_string())
+                    "mode": mode,
+                    "multiple": true,
+                    "maxItems": limit,
                 }),
             )
             .map_err(|e| format!("run_mobile_plugin failed: {}", e))?;
-        Ok(file_info)
+        Ok(PickFileOutput::Multiple(batch.files))
     }
     #[cfg(target_os = "ios")]
     {
-        let _ = (app, mode);
+        let _ = (app, mode, multiple, max_items);
         crate::ios_not_implemented("pick_file")
     }
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
     {
         let _ = app;
         let _ = mode;
+        let _ = (multiple, max_items);
         Err("该接口仅在 Android 物理端可用".to_string())
+    }
+}
+
+#[cfg(test)]
+mod pick_file_shape_tests {
+    use super::*;
+
+    fn info(ticket: Option<&str>) -> PickedFileInfo {
+        PickedFileInfo {
+            path: "p".into(),
+            name: "n".into(),
+            mime: "m".into(),
+            size: 1,
+            hash: "h".into(),
+            thumbnail_path: None,
+            staging_ticket: ticket.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn avatar_and_camera_never_multi() {
+        assert!(!is_multi_pick("avatar", true, 9));
+        assert!(!is_multi_pick("camera", true, 9));
+    }
+
+    #[test]
+    fn gallery_and_file_multi_only_when_requested() {
+        assert!(is_multi_pick("gallery", true, 9));
+        assert!(is_multi_pick("file", true, 2));
+        assert!(!is_multi_pick("gallery", false, 9));
+        assert!(!is_multi_pick("file", true, 1));
+    }
+
+    #[test]
+    fn pick_limit_clamps() {
+        assert_eq!(pick_limit(None), 9);
+        assert_eq!(pick_limit(Some(0)), 1);
+        assert_eq!(pick_limit(Some(99)), 16);
+    }
+
+    #[test]
+    fn single_output_shape_unchanged() {
+        let value = serde_json::to_value(PickFileOutput::Single(info(None))).unwrap();
+        assert_eq!(
+            value,
+            serde_json::json!({"path":"p","name":"n","mime":"m","size":1,"hash":"h","thumbnailPath":null})
+        );
+    }
+
+    #[test]
+    fn multiple_output_is_array_with_ticket() {
+        let value = serde_json::to_value(PickFileOutput::Multiple(vec![info(Some("t1"))])).unwrap();
+        assert_eq!(value[0]["stagingTicket"], "t1");
+        assert!(value.is_array());
     }
 }
 
