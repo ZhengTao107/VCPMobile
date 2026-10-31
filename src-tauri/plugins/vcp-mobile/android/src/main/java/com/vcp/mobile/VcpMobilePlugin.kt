@@ -1676,38 +1676,42 @@ class VcpMobilePlugin(private val activity: Activity) : Plugin(activity) {
             })
 
             val files = JSArray()
-            val errors = JSArray()
-            var firstError: String? = null
+            val failed = JSArray()
             for ((index, uri) in uris.withIndex()) {
                 val ticket = tickets[index]
                 try {
                     files.put(processPickedUri(uri, ticket, false, true))
                 } catch (e: Throwable) {
                     Log.e(TAG, "[onPickFileResult] Picked file ${index + 1}/${uris.size} failed", e)
-                    val message = e.message ?: e.javaClass.simpleName
-                    if (firstError == null) firstError = message
+                    val reason = e.message ?: e.javaClass.simpleName
+                    // 失败可能早于 start 事件，回执自带显示名，前端不依赖卡片取名
+                    val displayName: String? = runCatching {
+                        activity.contentResolver.query(
+                            uri, arrayOf(android.provider.OpenableColumns.DISPLAY_NAME), null, null, null
+                        )?.use { cursor ->
+                            if (cursor.moveToFirst() && !cursor.isNull(0)) cursor.getString(0) else null
+                        }
+                    }.getOrNull()
                     val failure = JSObject().apply {
                         put("stagingTicket", ticket)
-                        put("message", message)
+                        if (displayName != null) put("name", displayName)
+                        put("reason", reason)
                     }
-                    errors.put(failure)
+                    failed.put(failure)
                     dispatchPickerEvent("vcp-mobile-file-failed", failure)
                     if (e is InterruptedException || Thread.currentThread().isInterrupted) break
                 }
             }
 
+            // 回执自带完整结果（成功、逐项失败、截断数），前端以回执为准；
+            // 全部失败也 resolve，让前端汇总逐项原因。事件只用于进度和 JNI 回执丢失时的兜底。
             val batch = JSObject().apply {
                 put("files", files)
-                put("errors", errors)
+                put("failed", failed)
                 put("skipped", skipped)
             }
-            // 双轨：invoke 回执在 JNI 断裂时可能丢失，事件兜底
             dispatchPickerEvent("vcp-mobile-file-batch", batch)
-            if (files.length() == 0) {
-                invoke.reject("Handling picked files failed: ${firstError ?: "no file processed"}")
-            } else {
-                invoke.resolve(batch)
-            }
+            invoke.resolve(batch)
         }
     }
 
