@@ -3,6 +3,7 @@ import { ref } from "vue";
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { useDataReload } from "../composables/useDataReload";
+import { waitUntil } from "../sync/autoSyncTrigger";
 import { useNotificationStore } from "./notification";
 import { isAndroid, isIOS } from "../utils/platform";
 import type { BatteryStatusDto } from "../types/native";
@@ -70,6 +71,7 @@ type BufferedSessionEvent = {
 };
 
 const MAX_BUFFERED_SESSION_EVENTS = 32;
+const AUTO_SYNC_SETTLE_TIMEOUT_MS = 10 * 60 * 1000;
 const ERROR_CATEGORIES = new Set<SyncTerminalError["category"]>([
   "device",
   "configuration",
@@ -391,6 +393,8 @@ export const useSyncSessionStore = defineStore("syncSession", () => {
   let lastConnectionStatus = "";
   // 活进度行：阶段内原地刷新的单条日志，避免刷屏又保留进度感知
   let progressLineId: string | null = null;
+  // 自动同步的无面板会话；用户打开面板时由 open() 接管并清除。
+  const quiet = ref(false);
 
   const isCurrentView = (generation: number) =>
     isOpen.value && generation === viewGeneration;
@@ -404,6 +408,11 @@ export const useSyncSessionStore = defineStore("syncSession", () => {
     status.value === "completed_with_warnings";
 
   const open = () => {
+    if (isOpen.value && quiet.value) {
+      // 后台自动同步进行中：面板接管当前会话继续展示，不重置状态。
+      quiet.value = false;
+      return;
+    }
     const generation = ++viewGeneration;
     startAttempt += 1;
     cleanupListeners();
@@ -440,7 +449,7 @@ export const useSyncSessionStore = defineStore("syncSession", () => {
     setTerminalError(localTerminalError(code, detail));
   };
 
-  const stopAndReload = (): Promise<void> => {
+  const stopAndReload = (quietRun = false): Promise<void> => {
     if (settlement) return settlement;
     shutdownPending = true;
     const work = (async () => {
@@ -454,7 +463,7 @@ export const useSyncSessionStore = defineStore("syncSession", () => {
           needsReload.value = false;
         } catch (error) {
           console.error("[SyncSession] Failed to reload synchronized data:", error);
-          useNotificationStore().addNotification({
+          if (!quietRun) useNotificationStore().addNotification({
             id: "sync_data_reload_failed",
             type: "error",
             title: "同步数据刷新失败",
@@ -471,7 +480,7 @@ export const useSyncSessionStore = defineStore("syncSession", () => {
     return completion;
   };
 
-  const beginSync = async (preserveLogs: boolean) => {
+  const beginSync = async (preserveLogs: boolean, quietRun = false) => {
     if (status.value !== "idle") return;
     const generation = viewGeneration;
     const attempt = ++startAttempt;
@@ -492,7 +501,7 @@ export const useSyncSessionStore = defineStore("syncSession", () => {
 
     if (settlement || shutdownPending || needsReload.value) {
       try {
-        await stopAndReload();
+        await stopAndReload(quietRun);
       } catch (error) {
         if (isCurrentAttempt(generation, attempt)) {
           const terminal = parseCommandError(error, "STOP_SYNC_FAILED");
@@ -542,18 +551,18 @@ export const useSyncSessionStore = defineStore("syncSession", () => {
 
             return;
           }
-          pushLog(levelKnown ? "success" : "warning", levelKnown
+          if (!quietRun) pushLog(levelKnown ? "success" : "warning", levelKnown
             ? "设备状态检查完成"
             : "无法确认当前电量，将继续同步");
-        } else {
+        } else if (!quietRun) {
           pushLog("warning", "无法确认设备状态，将继续同步");
         }
       } catch (error: unknown) {
         if (!isCurrentAttempt(generation, attempt)) return;
-        pushLog("warning", "无法确认设备状态，将继续同步");
+        if (!quietRun) pushLog("warning", "无法确认设备状态，将继续同步");
         console.warn("Get battery status failed, continuing sync:", error);
       }
-    } else {
+    } else if (!quietRun) {
       pushLog("warning", "无法确认设备状态，将继续同步");
     }
 
@@ -647,11 +656,14 @@ export const useSyncSessionStore = defineStore("syncSession", () => {
     activeTab.value = "live";
     cleanupListeners();
     listenerSetup = null;
+    const quietRun = quiet.value;
+    quiet.value = false;
 
     try {
-      await stopAndReload();
+      await stopAndReload(quietRun);
     } catch (e) {
       console.warn("[SyncSession] Failed to stop backend sync session:", e);
+      if (quietRun) return;
       const terminal = parseCommandError(e, "STOP_SYNC_FAILED");
       useNotificationStore().addNotification({
         id: "sync_shutdown_pending",
@@ -661,6 +673,44 @@ export const useSyncSessionStore = defineStore("syncSession", () => {
         toastOnly: false,
       });
     }
+  };
+
+  /**
+   * 自动同步：不挂面板的一次完整会话（open → beginSync → 等终态 → close 刷新）。
+   * 面板已打开或已有会话时让位；运行中用户打开面板则由面板接管，本函数不再关闭。
+   */
+  const runAutoSync = async (
+    reason: string,
+    options: { beforeClose?: () => Promise<unknown> } = {},
+  ): Promise<"skipped" | "taken_over" | "timeout" | "completed" | "error"> => {
+    if (isOpen.value) return "skipped";
+    open();
+    quiet.value = true;
+    const generation = viewGeneration;
+    const owned = () => quiet.value && isCurrentView(generation);
+    await beginSync(false, true);
+    if (owned() && !isTerminal()) {
+      await waitUntil(() => !owned() || isTerminal(), AUTO_SYNC_SETTLE_TIMEOUT_MS);
+    }
+    if (!owned()) return "taken_over";
+    if (!isTerminal()) {
+      console.warn(`[AutoSync] ${reason}: 同步会话超时未结束，留给同步面板接管`);
+      return "timeout";
+    }
+    const outcome = status.value === "error" ? "error" : "completed";
+    if (outcome === "error" && terminalError.value) {
+      const e = terminalError.value;
+      console.warn(
+        `[AutoSync] ${reason} failed: ${e.code} ${e.message}${e.logFile ? ` (log: ${e.logFile})` : ""}`,
+      );
+    }
+    if (options.beforeClose) {
+      await options.beforeClose().catch((error) => {
+        console.warn("[AutoSync] beforeClose failed:", error);
+      });
+    }
+    if (owned() && canDismiss.value) await close();
+    return outcome;
   };
 
   const readSummary = (value: unknown): SyncSummary | null => {
@@ -1050,6 +1100,7 @@ export const useSyncSessionStore = defineStore("syncSession", () => {
     close,
     startSync,
     retrySync,
+    runAutoSync,
     switchTab,
   };
 });
