@@ -4,7 +4,7 @@ import { invoke, convertFileSrc } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { useNotificationStore } from "./notification";
 import { isAndroid } from "../utils/platform";
-import type { PickedFile, PickFileMode } from "tauri-plugin-vcp-mobile";
+import type { PickedFile, PickedFileBatch, PickFileMode } from "tauri-plugin-vcp-mobile";
 import type {
   NativeFileProgressDetail,
   NativeFileStartDetail,
@@ -60,15 +60,25 @@ export const nativePickArgs = (mode: PickFileMode): NativePickArgs =>
 
 type TicketedDetail = { stagingTicket?: string };
 
+/** 原生失败项：回执 failed[] 与 vcp-mobile-file-failed 事件同形 */
 interface NativePickFailureDetail {
   stagingTicket?: string;
-  message?: string;
+  name?: string;
+  reason?: string;
 }
 
-interface NativePickBatchDetail {
-  files?: PickedFile[];
-  errors?: NativePickFailureDetail[];
+interface NativePickResult {
+  files: PickedFile[];
+  failed: NativePickFailureDetail[];
+  skipped: number;
 }
+
+/** 单选回执是 PickedFile；多选回执（及 batch 事件）是 {files, failed, skipped} */
+const normalizePickReply = (res: PickedFile | PickedFileBatch | null | undefined): NativePickResult => {
+  if (!res) return { files: [], failed: [], skipped: 0 };
+  if ("files" in res) return { files: res.files ?? [], failed: res.failed ?? [], skipped: res.skipped ?? 0 };
+  return { files: [res], failed: [], skipped: 0 };
+};
 
 const newStableId = () => `att_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
 
@@ -341,7 +351,8 @@ export const useAttachmentStore = defineStore("attachment", () => {
       // stagingTicket → 卡片 stableId；单选模式下所有事件归同一张卡片
       const singleKey = "__single__";
       const cardIds = new Map<string, string>();
-      const failures = new Map<string, string>(); // stableId → 原生失败原因
+      // stableId → 原生失败；回执与事件按 ticket 合并，同一文件只提示一次
+      const failures = new Map<string, { name?: string; reason: string }>();
       const cardIdFor = (ticket?: string) => {
         const key = multi && ticket ? ticket : singleKey;
         let id = cardIds.get(key);
@@ -350,6 +361,14 @@ export const useAttachmentStore = defineStore("attachment", () => {
           cardIds.set(key, id);
         }
         return id;
+      };
+      const recordFailure = (f: NativePickFailureDetail) => {
+        const id = cardIdFor(f.stagingTicket);
+        const prev = failures.get(id);
+        failures.set(id, {
+          name: prev?.name ?? f.name,
+          reason: prev?.reason ?? (f.reason || "处理失败"),
+        });
       };
       const findCard = (id: string) => stagedAttachments.value.findIndex((a) => a.id === id);
       const dropCard = (id: string) => {
@@ -370,8 +389,9 @@ export const useAttachmentStore = defineStore("attachment", () => {
       };
 
       try {
-        // 1. 原生 picker：invoke 回执与 CustomEvent 双轨，任一先到即结算；空闲熔断随事件续期
-        const pickedFiles = await new Promise<PickedFile[]>((resolve, reject) => {
+        // 1. 原生 picker：invoke 回执与 CustomEvent 双轨，任一先到即结算；空闲熔断随事件续期。
+        //    回执自带失败项与截断数，先于事件到达也不丢失败原因；事件只负责进度和回执丢失时的兜底。
+        const pickResult = await new Promise<NativePickResult>((resolve, reject) => {
           let settled = false;
           let timer: ReturnType<typeof setTimeout> | undefined;
 
@@ -415,7 +435,7 @@ export const useAttachmentStore = defineStore("attachment", () => {
             if (!multi) {
               const picked = (event as CustomEvent<PickedFile>).detail;
               console.log("[AttachmentStore] Native picker returned via EventBus:", picked);
-              settle(() => resolve([picked]));
+              settle(() => resolve(normalizePickReply(picked)));
               return;
             }
             arm(); // 多选：单个文件完成只续期，等批次结果
@@ -424,18 +444,14 @@ export const useAttachmentStore = defineStore("attachment", () => {
           const handleFailed = (event: Event) => {
             if (settled) return;
             arm();
-            const { stagingTicket, message } = (event as CustomEvent<NativePickFailureDetail>).detail;
-            failures.set(cardIdFor(stagingTicket), message || "处理失败");
+            recordFailure((event as CustomEvent<NativePickFailureDetail>).detail);
           };
 
           const handleBatch = (event: Event) => {
             if (settled || !multi) return;
-            const batch = (event as CustomEvent<NativePickBatchDetail>).detail;
-            for (const failure of batch.errors ?? []) {
-              failures.set(cardIdFor(failure.stagingTicket), failure.message || "处理失败");
-            }
+            const batch = (event as CustomEvent<PickedFileBatch>).detail;
             console.log("[AttachmentStore] Native multi-picker returned via EventBus:", batch);
-            settle(() => resolve(batch.files ?? []));
+            settle(() => resolve(normalizePickReply(batch)));
           };
 
           const listeners: Array<[string, (event: Event) => void]> = [
@@ -452,10 +468,10 @@ export const useAttachmentStore = defineStore("attachment", () => {
           for (const [name, handler] of listeners) window.addEventListener(name, handler);
           arm();
 
-          invoke<PickedFile | PickedFile[] | null>("plugin:vcp-mobile|pick_file", { ...pickArgs })
+          invoke<PickedFile | PickedFileBatch | null>("plugin:vcp-mobile|pick_file", { ...pickArgs })
             .then((res) => {
               console.log("[AttachmentStore] Native picker returned via Invoke:", res);
-              settle(() => resolve(Array.isArray(res) ? res : res ? [res] : []));
+              settle(() => resolve(normalizePickReply(res)));
             })
             .catch((err) => settle(() => reject(err)));
         });
@@ -464,8 +480,10 @@ export const useAttachmentStore = defineStore("attachment", () => {
         const unsupported: string[] = [];
         const failed: string[] = [];
         const handledIds = new Set<string>();
+        // 以回执为准：失败项并入事件已记录的失败（同 ticket 去重）
+        for (const failure of pickResult.failed) recordFailure(failure);
 
-        for (const picked of pickedFiles) {
+        for (const picked of pickResult.files) {
           if (!picked?.path) continue;
           const id = cardIdFor(picked.stagingTicket);
           handledIds.add(id);
@@ -537,11 +555,11 @@ export const useAttachmentStore = defineStore("attachment", () => {
         for (const id of new Set(cardIds.values())) {
           if (handledIds.has(id)) continue;
           const idx = findCard(id);
-          const name = idx !== -1 ? stagedAttachments.value[idx].name : "文件";
+          const failure = failures.get(id);
+          const name = failure?.name ?? (idx !== -1 ? stagedAttachments.value[idx].name : undefined) ?? "文件";
           dropCard(id);
-          const reason = failures.get(id);
-          if (reason) {
-            failed.push(`${name}: ${reason}`);
+          if (failure) {
+            failed.push(`${name}: ${failure.reason}`);
           } else {
             console.log("[AttachmentStore] Pick cancelled or returned empty path.");
           }
@@ -558,8 +576,16 @@ export const useAttachmentStore = defineStore("attachment", () => {
         if (failed.length > 0) {
           notificationStore.addNotification({
             type: "warning",
-            title: failed.length > 1 ? `${failed.length} 个附件添加失败` : "选取附件失败",
+            title: `${failed.length} 个文件导入失败`,
             message: `❌ ${failed.join("\n")}`,
+            toastOnly: true,
+          });
+        }
+        if (pickResult.skipped > 0) {
+          notificationStore.addNotification({
+            type: "warning",
+            title: "已达选择上限",
+            message: `单次最多 ${pickArgs.maxItems ?? NATIVE_PICK_MAX_ITEMS} 个，已忽略 ${pickResult.skipped} 个`,
             toastOnly: true,
           });
         }

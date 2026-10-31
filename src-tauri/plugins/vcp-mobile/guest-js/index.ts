@@ -27,6 +27,21 @@ export interface PickedFile {
   stagingTicket?: string;
 }
 
+/** picker 多选批次中处理失败的单项 */
+export interface PickFailure {
+  stagingTicket: string;
+  name?: string;
+  reason: string;
+}
+
+/** pick_file 传 multiple=true 时的回执；单选仍返回 PickedFile */
+export interface PickedFileBatch {
+  files: PickedFile[];
+  failed: PickFailure[];
+  /** 超过 maxItems 被截断、未处理的数量 */
+  skipped: number;
+}
+
 export type PickFileMode = 'file' | 'camera' | 'gallery' | 'avatar';
 
 export function pickFile(mode?: PickFileMode): Promise<PickedFile> {

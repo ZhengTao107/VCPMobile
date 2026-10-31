@@ -426,18 +426,33 @@ fn is_multi_pick(mode: &str, multiple: bool, limit: u32) -> bool {
     multiple && mode != "avatar" && mode != "camera" && limit > 1
 }
 
-#[cfg(target_os = "android")]
-#[derive(Deserialize)]
-struct PickedFileBatch {
-    files: Vec<PickedFileInfo>,
+/// picker 多选批次中处理失败的单项；与 Kotlin `onPickFileResult` 的 failed 项同形。
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PickFailure {
+    pub staging_ticket: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    pub reason: String,
 }
 
-/// 未请求多选时保持旧的单对象形状；多选返回数组（失败项由原生 `vcp-mobile-file-failed` 事件告知）。
+/// 多选批次回执：成功文件、逐项失败、因上限截断的数量全部随 invoke 返回，前端以此为准。
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PickedFileBatch {
+    pub files: Vec<PickedFileInfo>,
+    #[serde(default)]
+    pub failed: Vec<PickFailure>,
+    #[serde(default)]
+    pub skipped: u32,
+}
+
+/// 未请求多选时保持旧的单对象形状；多选返回 `{files, failed, skipped}`。
 #[derive(Serialize)]
 #[serde(untagged)]
 pub enum PickFileOutput {
     Single(PickedFileInfo),
-    Multiple(Vec<PickedFileInfo>),
+    Multiple(PickedFileBatch),
 }
 
 #[tauri::command]
@@ -476,7 +491,7 @@ pub fn pick_file<R: Runtime>(
                 }),
             )
             .map_err(|e| format!("run_mobile_plugin failed: {}", e))?;
-        Ok(PickFileOutput::Multiple(batch.files))
+        Ok(PickFileOutput::Multiple(batch))
     }
     #[cfg(target_os = "ios")]
     {
@@ -539,10 +554,46 @@ mod pick_file_shape_tests {
     }
 
     #[test]
-    fn multiple_output_is_array_with_ticket() {
-        let value = serde_json::to_value(PickFileOutput::Multiple(vec![info(Some("t1"))])).unwrap();
-        assert_eq!(value[0]["stagingTicket"], "t1");
-        assert!(value.is_array());
+    fn multiple_output_carries_failed_and_skipped() {
+        let batch = PickedFileBatch {
+            files: vec![info(Some("t1"))],
+            failed: vec![
+                PickFailure {
+                    staging_ticket: "t2".into(),
+                    name: Some("b.png".into()),
+                    reason: "copy failed".into(),
+                },
+                PickFailure { staging_ticket: "t3".into(), name: None, reason: "io".into() },
+            ],
+            skipped: 2,
+        };
+        let value = serde_json::to_value(PickFileOutput::Multiple(batch)).unwrap();
+        assert_eq!(value["files"][0]["stagingTicket"], "t1");
+        assert_eq!(
+            value["failed"][0],
+            serde_json::json!({"stagingTicket":"t2","name":"b.png","reason":"copy failed"})
+        );
+        assert_eq!(value["failed"][1], serde_json::json!({"stagingTicket":"t3","reason":"io"}));
+        assert_eq!(value["skipped"], 2);
+    }
+
+    #[test]
+    fn native_batch_deserializes_with_defaults() {
+        let batch: PickedFileBatch = serde_json::from_value(serde_json::json!({
+            "files": [{"path":"p","name":"n","mime":"m","size":1,"hash":"h","thumbnailPath":null,"stagingTicket":"t1"}],
+            "failed": [{"stagingTicket":"t2","reason":"copy failed"}],
+            "skipped": 3
+        }))
+        .unwrap();
+        assert_eq!(batch.files[0].staging_ticket.as_deref(), Some("t1"));
+        assert_eq!(batch.failed[0].staging_ticket, "t2");
+        assert!(batch.failed[0].name.is_none());
+        assert_eq!(batch.skipped, 3);
+
+        let minimal: PickedFileBatch =
+            serde_json::from_value(serde_json::json!({"files": []})).unwrap();
+        assert!(minimal.failed.is_empty());
+        assert_eq!(minimal.skipped, 0);
     }
 }
 
