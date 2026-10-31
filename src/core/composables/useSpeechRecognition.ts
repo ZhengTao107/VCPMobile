@@ -3,6 +3,122 @@ import { useSettingsStore } from '../stores/settings';
 import { useAudioRecorder } from './useAudioRecorder';
 import { isAndroid } from '../utils/platform';
 
+export type SpeechStopResult = { ok: true; text: string } | { ok: false; error: string };
+
+export interface BackendTranscribeOptions {
+  serverUrl: string;
+  apiKey: string;
+  /** 提交时请求后端同步等待的秒数（后端会再按 AudioSyncWaitSeconds 截断） */
+  waitSec?: number;
+  /** 整次转写（提交 + 轮询）的总超时 */
+  timeoutMs?: number;
+  pollIntervalMs?: number;
+  fetchImpl?: typeof fetch;
+}
+
+const TRANSCRIBE_HASH_RE = /^[a-f0-9]{64}$/i;
+
+const blobToAudioDataUrl = async (blob: Blob): Promise<string> => {
+  const bytes = new Uint8Array(await blob.arrayBuffer());
+  let binary = '';
+  for (let i = 0; i < bytes.length; i += 0x8000) {
+    binary += String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000) as unknown as number[]);
+  }
+  // 后端只收 data:audio/*；recorder 的 mimeType 可能带 ;codecs=opus，后端正则允许
+  const mime = blob.type && blob.type.startsWith('audio/') ? blob.type : 'audio/webm';
+  return `data:${mime};base64,${btoa(binary)}`;
+};
+
+const abortableSleep = (ms: number, signal: AbortSignal): Promise<void> =>
+  new Promise((resolve, reject) => {
+    if (signal.aborted) return reject(new Error('aborted'));
+    const onAbort = () => {
+      clearTimeout(timer);
+      reject(new Error('aborted'));
+    };
+    const timer = setTimeout(() => {
+      signal.removeEventListener('abort', onAbort);
+      resolve();
+    }, ms);
+    signal.addEventListener('abort', onAbort, { once: true });
+  });
+
+const describeTranscribeHttpError = (status: number, body: any, phase: 'submit' | 'poll'): string => {
+  const detail = typeof body?.error === 'string' && body.error ? `：${body.error}` : '';
+  if (status === 503) return '后端未开启语音转写（ImageProcessor AudioTranscribe=false），请在服务器开启后重试';
+  if (status === 401 || status === 403) return 'API 密钥无效或无权访问语音转写，请检查设置中的 VCP API Key';
+  if (status === 404) {
+    return phase === 'submit'
+      ? '后端不支持 /v1/audio-transcribe，请升级 VCPToolBox'
+      : '转写任务已丢失，请重新录音';
+  }
+  if (status === 400) return `语音转写请求参数错误${detail}`;
+  if (status === 422) return `语音转写失败${detail}`;
+  return `服务器返回 ${status}${detail}`;
+};
+
+/**
+ * 录音降级路径：提交到 VCPToolBox 的 POST /v1/audio-transcribe，
+ * 202 时按 hash 轮询 GET /v1/audio-transcribe/:hash；提交与轮询共用一个总超时。
+ */
+export async function transcribeViaBackend(blob: Blob, opts: BackendTranscribeOptions): Promise<SpeechStopResult> {
+  const {
+    serverUrl,
+    apiKey,
+    waitSec = 20,
+    timeoutMs = 30_000,
+    pollIntervalMs = 1_000,
+    fetchImpl = globalThis.fetch.bind(globalThis),
+  } = opts;
+
+  let origin: string;
+  try {
+    // 只取 origin，兼容配置了完整 /v1/chat/completions 的地址
+    origin = new URL(serverUrl).origin;
+  } catch {
+    return { ok: false, error: 'VCP 服务器地址格式无效' };
+  }
+  const endpoint = `${origin}/v1/audio-transcribe`;
+  const authHeaders = { Authorization: `Bearer ${apiKey}` };
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+
+  try {
+    const data = await blobToAudioDataUrl(blob);
+    let phase: 'submit' | 'poll' = 'submit';
+    let res = await fetchImpl(endpoint, {
+      method: 'POST',
+      headers: { ...authHeaders, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ data, waitSec }),
+      signal: controller.signal,
+    });
+
+    for (;;) {
+      const body: any = await res.json().catch(() => null);
+      if (res.status === 200 && body?.status === 'done') {
+        return { ok: true, text: String(body.text ?? '').trim() };
+      }
+      if (res.status !== 202) {
+        return { ok: false, error: describeTranscribeHttpError(res.status, body, phase) };
+      }
+      const hash = String(body?.hash ?? '');
+      if (!TRANSCRIBE_HASH_RE.test(hash)) {
+        return { ok: false, error: '服务器返回的转写任务标识无效' };
+      }
+      await abortableSleep(pollIntervalMs, controller.signal);
+      phase = 'poll';
+      res = await fetchImpl(`${endpoint}/${hash}`, { headers: authHeaders, signal: controller.signal });
+    }
+  } catch (err: any) {
+    if (controller.signal.aborted) {
+      return { ok: false, error: `语音转写超时（${Math.round(timeoutMs / 1000)} 秒），请稍后重试` };
+    }
+    return { ok: false, error: `网络错误，无法连接 VCP 服务器：${err?.message || String(err)}` };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 export function useSpeechRecognition() {
   const settingsStore = useSettingsStore();
   const { isRecording, startRecording, stopRecording, cancelRecording } = useAudioRecorder();
@@ -121,66 +237,37 @@ export function useSpeechRecognition() {
   };
 
   /**
-   * 停止语音输入并获取识别结果 (云端模式下会发起网络请求)
+   * 停止语音输入并获取识别结果（降级模式下会提交后端转写）
    */
-  const stopListening = async (): Promise<string> => {
-    if (!isListening.value) return transcriptionResult.value;
+  const stopListening = async (): Promise<SpeechStopResult> => {
+    if (!isListening.value) return { ok: true, text: transcriptionResult.value };
 
     if (!isFallbackMode.value && recognitionInstance) {
       // 原生模式：直接结束，内容已在 onresult 中累加完成
       recognitionInstance.stop();
       isListening.value = false;
-      return transcriptionResult.value;
-    } else {
-      // 云端 Whisper 模式：停止录音 -> 上传转写 -> 返回文本
-      isListening.value = false;
-      const recordResult = await stopRecording();
-      if (!recordResult) return '';
-
-      const { blob } = recordResult;
-      
-      // 检查配置
-      const serverUrl = settingsStore.settings?.vcpServerUrl;
-      const apiKey = settingsStore.settings?.vcpApiKey;
-
-      if (!serverUrl || !apiKey) {
-        console.warn('[SpeechRecognition] Server settings missing for Whisper STT.');
-        return '[错误：未配置云端 API 密钥，无法完成识别]';
-      }
-
-      try {
-        // 对齐桌面端，做 baseURL 归一化提取，以防配置了完整 Completions 的 URL
-        const urlObj = new URL(serverUrl);
-        const baseUrl = `${urlObj.protocol}//${urlObj.host}`;
-        const whisperEndpoint = new URL('/v1/audio/transcriptions', baseUrl).toString();
-
-        const formData = new FormData();
-        formData.append('file', blob, 'recording.webm');
-        formData.append('model', 'whisper-1');
-
-        const response = await fetch(whisperEndpoint, {
-          method: 'POST',
-          headers: {
-            'Authorization': `Bearer ${apiKey}`
-          },
-          body: formData
-        });
-
-        if (!response.ok) {
-          throw new Error(`Whisper server responded with ${response.status}`);
-        }
-
-        const data = await response.json();
-        if (data && data.text) {
-          transcriptionResult.value = data.text.trim();
-          return data.text.trim();
-        }
-        return '';
-      } catch (err: any) {
-        console.error('[SpeechRecognition] Whisper cloud transcription failed:', err);
-        return `[识别失败: ${err.message || String(err)}]`;
-      }
+      return { ok: true, text: transcriptionResult.value };
     }
+
+    // 降级模式：停止录音 -> 提交 VCPToolBox /v1/audio-transcribe -> 返回结构化结果
+    isListening.value = false;
+    const recordResult = await stopRecording();
+    if (!recordResult) return { ok: false, error: '未获取到录音数据，请重试' };
+
+    const serverUrl = settingsStore.settings?.vcpServerUrl;
+    const apiKey = settingsStore.settings?.vcpApiKey;
+    if (!serverUrl || !apiKey) {
+      console.warn('[SpeechRecognition] Server settings missing for backend transcription.');
+      return { ok: false, error: '未配置 VCP 服务器地址或 API 密钥，无法完成识别' };
+    }
+
+    const result = await transcribeViaBackend(recordResult.blob, { serverUrl, apiKey });
+    if (result.ok) {
+      transcriptionResult.value = result.text;
+    } else {
+      console.error('[SpeechRecognition] Backend transcription failed:', result.error);
+    }
+    return result;
   };
 
   /**

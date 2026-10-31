@@ -176,9 +176,16 @@ const handleSTTTouchEnd = async (e: TouchEvent) => {
       toastOnly: true,
     });
   } else {
-    const recognizedText = await stopListening();
-    if (recognizedText && !recognizedText.startsWith('[')) {
-      input.value += recognizedText;
+    const result = await stopListening();
+    if (!result.ok) {
+      notificationStore.addNotification({
+        type: 'warning',
+        title: '语音转写失败',
+        message: result.error,
+        toastOnly: true,
+      });
+    } else if (result.text) {
+      input.value += result.text;
       
       // 自动切回键盘并聚焦，方便用户在键盘上微调！
       isAudioMode.value = false;
