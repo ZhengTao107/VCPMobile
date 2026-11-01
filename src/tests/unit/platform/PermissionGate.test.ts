@@ -71,6 +71,24 @@ describe('shared permission guide', () => {
     expect(bootstrap).not.toHaveBeenCalled();
   });
 
+  it('lets Android users defer the keep-alive guide and continue into the app', async () => {
+    native.android = true;
+    mockInvoke('plugin:vcp-mobile|check_all_permissions', () => ({
+      notification: false, storage: false, battery: false,
+      microphone: false, camera: false, location: false,
+    }));
+    mockInvoke('plugin:vcp-mobile|check_notification_listener_permission', () => ({ enabled: false }));
+    mockInvoke('plugin:vcp-mobile|get_free_disk_space', () => ({ freeGb: 2, totalGb: 64 }));
+    wrapper = mount(PermissionGate);
+    await flushPromises();
+
+    const defer = wrapper.findAll('button').find(button => button.text().includes('稍后再说'));
+    expect(defer).toBeTruthy();
+    await defer!.trigger('click');
+    await flushPromises();
+    expect(continueFromPermissionGuide).toHaveBeenCalledOnce();
+  });
+
   it('offers one optional iOS notification item, reports refusal and still lets the user continue', async () => {
     native.ios = true;
     mockInvoke('plugin:vcp-mobile|get_notification_permission', () => ({ authorization: 'notDetermined' }));

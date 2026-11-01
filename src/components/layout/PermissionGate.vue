@@ -291,7 +291,11 @@ onUnmounted(() => {
                 <span>下一步</span>
                 <div class="i-heroicons-arrow-right text-lg"></div>
               </button>
-              <button v-else-if="!allGranted" @click="exitApp" class="text-xs font-bold text-gray-400 active:text-gray-900 transition-colors py-2 px-4">
+              <button v-else-if="!allGranted" @click="continueToApp" :disabled="continuing"
+                class="w-full py-3 text-[14px] font-bold text-gray-500 rounded-2xl border border-gray-200 active:bg-gray-100 disabled:opacity-50">
+                {{ continuing ? '正在进入…' : '稍后再说，继续进入应用' }}
+              </button>
+              <button v-if="!isIOS && !allGranted" @click="exitApp" class="text-xs font-bold text-gray-400 active:text-gray-900 transition-colors py-2 px-4">
                 暂不授权，退出应用
               </button>
             </div>
@@ -381,6 +385,10 @@ onUnmounted(() => {
               </button>
               <button v-else-if="currentStep === 2" class="w-full py-4 bg-gray-300 text-gray-500 text-[15px] font-bold rounded-2xl cursor-not-allowed flex items-center justify-center gap-2" disabled>
                 <span>请先跳转完成保活设置</span>
+              </button>
+              <button v-if="currentStep === 2 && !step2Ready" @click="continueToApp" :disabled="continuing"
+                class="w-full py-3 text-[14px] font-bold text-gray-500 rounded-2xl border border-gray-200 active:bg-gray-100 disabled:opacity-50">
+                {{ continuing ? '正在进入…' : '稍后再说，继续进入应用' }}
               </button>
             </div>
           </div>

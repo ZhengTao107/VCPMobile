@@ -188,6 +188,36 @@ describe('platform-aware bootstrap', () => {
     expect(lifecycle.state).toBe('READY');
   });
 
+  it('lets an Android user defer the keep-alive guide once, remembers it with a warning, and forgets it after all grants', async () => {
+    testPlatform.value = 'android';
+    mockInvoke('plugin:vcp-mobile|check_all_permissions', () => ({ notification: false, battery: true }));
+    mockInvoke('plugin:vcp-mobile|check_notification_listener_permission', () => ({ enabled: false }));
+    const lifecycle = useAppLifecycleStore();
+    await lifecycle.bootstrap();
+    expect(lifecycle.state).toBe('PERMISSIONS');
+
+    await lifecycle.continueFromPermissionGuide();
+    expect(lifecycle.state).toBe('READY');
+    expect(useNotificationStore().historyList.some((item) => item.id === 'startup_permission_skipped')).toBe(true);
+
+    disposePinia(pinia);
+    pinia = createPinia();
+    setActivePinia(pinia);
+    await useAppLifecycleStore().bootstrap();
+    expect(useAppLifecycleStore().state).toBe('READY');
+    expect(useNotificationStore().historyList.some((item) => item.id === 'startup_permission_skipped')).toBe(true);
+
+    mockInvoke('plugin:vcp-mobile|check_all_permissions', () => ({ notification: true, battery: true }));
+    mockInvoke('plugin:vcp-mobile|check_notification_listener_permission', () => ({ enabled: true }));
+    disposePinia(pinia);
+    pinia = createPinia();
+    setActivePinia(pinia);
+    await useAppLifecycleStore().bootstrap();
+    expect(useAppLifecycleStore().state).toBe('READY');
+    expect(localStorage.getItem('vcp_android_permission_skip_v1')).toBeNull();
+    expect(useNotificationStore().historyList.some((item) => item.id === 'startup_permission_skipped')).toBe(false);
+  });
+
   it('retains the Android foreground fallback with an explicit warning when its permission query fails', async () => {
     testPlatform.value = 'android';
     mockInvoke('plugin:vcp-mobile|check_all_permissions', async () => { throw new Error('permission query failed'); });
