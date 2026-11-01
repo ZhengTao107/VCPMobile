@@ -24,6 +24,8 @@ const PULL_WORKER_CONCURRENCY: usize = 4;
 const MAX_ENTITY_BATCH_BYTES: usize = 10 * 1024 * 1024;
 const MAX_AVATAR_RESPONSE_BYTES: usize = 20 * 1024 * 1024;
 const MAX_ERROR_RESPONSE_BYTES: usize = 1024 * 1024;
+// Fork deviation (ptp4g#23): only the wait for the next transport chunk is bounded.
+const PULL_STREAM_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 
 async fn read_response_limited(
     response: reqwest::Response,
@@ -115,6 +117,30 @@ fn http_transport_error(operation: &str, stage: SyncErrorStage, error: &reqwest:
         &format!("{operation} failed: {error}"),
         Vec::new(),
     )
+}
+
+/// Waits for the next transport chunk. A peer that stays silent for `idle` becomes a
+/// retryable transport failure, so a stalled tunnel falls into the existing resume path.
+async fn next_chunk_within_idle<S>(
+    stream: &mut S,
+    idle: std::time::Duration,
+) -> Result<Option<S::Item>, String>
+where
+    S: futures_util::Stream + Unpin,
+{
+    tokio::time::timeout(idle, stream.next())
+        .await
+        .map_err(|_| {
+            encode_local_sync_error(
+                "HTTP_TRANSPORT_FAILED",
+                SyncErrorStage::Messages,
+                &format!(
+                    "Batch pull stream idle for {}s without data",
+                    idle.as_secs()
+                ),
+                Vec::new(),
+            )
+        })
 }
 
 fn protocol_error(stage: SyncErrorStage, message: impl AsRef<str>) -> String {
@@ -931,9 +957,10 @@ impl PullExecutor {
         let mut search_start = 0; // 核心优化：新增扫描游标，避免 O(N^2) 重复扫描
 
         loop {
-            // The stream is bounded by explicit cancellation and transport failure, not
-            // elapsed wall-clock time. Large histories may legitimately pause between chunks.
-            let next_chunk = stream.next().await;
+            // Upstream leaves this read unbounded so large histories may pause between
+            // chunks. Only the wait for the next chunk is timed here; local parsing, worker
+            // slots and DB writes are not, so slow processing never trips the idle budget.
+            let next_chunk = next_chunk_within_idle(&mut stream, PULL_STREAM_IDLE_TIMEOUT).await?;
             let Some(chunk_result) = next_chunk else {
                 break;
             };
@@ -1529,5 +1556,45 @@ mod ndjson_frame_tests {
         ] {
             assert!(parse_topic_ndjson_frame(success_frame(frame).to_string().as_bytes()).is_err());
         }
+    }
+}
+
+#[cfg(test)]
+mod idle_timeout_tests {
+    use super::next_chunk_within_idle;
+    use crate::vcp_modules::sync_error::is_attempt_restart_code;
+    use futures_util::stream;
+    use std::time::Duration;
+
+    #[tokio::test]
+    async fn silent_peer_becomes_retryable_transport_failure() {
+        let mut silent = stream::pending::<u8>();
+        let error = next_chunk_within_idle(&mut silent, Duration::from_millis(50))
+            .await
+            .expect_err("silent stream must time out");
+        assert!(error.contains("HTTP_TRANSPORT_FAILED"), "{error}");
+        assert!(error.contains("idle"), "{error}");
+        assert!(is_attempt_restart_code("HTTP_TRANSPORT_FAILED"));
+    }
+
+    #[tokio::test]
+    async fn ready_chunks_pass_through_and_end_of_stream_is_none() {
+        let mut chunks = stream::iter(vec![1u8, 2u8]);
+        let idle = Duration::from_millis(50);
+        assert_eq!(next_chunk_within_idle(&mut chunks, idle).await, Ok(Some(1)));
+        assert_eq!(next_chunk_within_idle(&mut chunks, idle).await, Ok(Some(2)));
+        assert_eq!(next_chunk_within_idle(&mut chunks, idle).await, Ok(None));
+    }
+
+    #[tokio::test]
+    async fn slow_chunk_within_budget_is_not_cut_off() {
+        let mut slow = Box::pin(stream::once(async {
+            tokio::time::sleep(Duration::from_millis(30)).await;
+            7u8
+        }));
+        assert_eq!(
+            next_chunk_within_idle(&mut slow, Duration::from_millis(200)).await,
+            Ok(Some(7))
+        );
     }
 }
