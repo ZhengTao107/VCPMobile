@@ -389,6 +389,24 @@ export const useAttachmentStore = defineStore("attachment", () => {
           status: "loading",
         });
       };
+      // 多选：失败卡片保留并标记原因，用户能看到是哪张并手动移除；没有 src，发送时会被跳过。
+      // 单选沿用旧行为直接移除。start 事件前就失败的（无卡片）补建一张。
+      const failCard = (id: string, name: string | undefined, reason: string) => {
+        if (!multi) {
+          dropCard(id);
+          return;
+        }
+        ensureCard(id, name, undefined, undefined, 0);
+        const idx = findCard(id);
+        if (idx === -1) return;
+        stagedAttachments.value[idx] = {
+          ...stagedAttachments.value[idx],
+          src: "",
+          status: "failed",
+          failReason: reason,
+          progress: undefined,
+        };
+      };
 
       try {
         // 1. 原生 picker：invoke 回执与 CustomEvent 双轨，任一先到即结算；空闲熔断随事件续期。
@@ -548,21 +566,23 @@ export const useAttachmentStore = defineStore("attachment", () => {
             }
           } catch (err: any) {
             console.error(`[AttachmentStore] Registering ${picked.name} failed:`, err);
-            dropCard(id);
-            failed.push(`${picked.name || "文件"}: ${err?.message || String(err)}`);
+            const reason = err?.message || String(err);
+            failCard(id, picked.name, reason);
+            failed.push(`${picked.name || "文件"}: ${reason}`);
           }
         }
 
-        // 4. 原生已建卡但没有返回结果的（处理失败、取消或空路径）清理掉
+        // 4. 原生没有返回结果的：有失败记录的标为失败卡片，取消或空路径的清理掉
         for (const id of new Set(cardIds.values())) {
           if (handledIds.has(id)) continue;
           const idx = findCard(id);
           const failure = failures.get(id);
           const name = failure?.name ?? (idx !== -1 ? stagedAttachments.value[idx].name : undefined) ?? "文件";
-          dropCard(id);
           if (failure) {
+            failCard(id, name, failure.reason);
             failed.push(`${name}: ${failure.reason}`);
           } else {
+            dropCard(id);
             console.log("[AttachmentStore] Pick cancelled or returned empty path.");
           }
         }

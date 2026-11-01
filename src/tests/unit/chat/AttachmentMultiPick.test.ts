@@ -107,8 +107,13 @@ describe("attachmentStore native multi-pick", () => {
     const store = useAttachmentStore();
     await store.handleAttachment("file");
 
-    expect(store.stagedAttachments.map((a) => a.name)).toEqual(["a.png"]);
-    expect(store.stagedAttachments[0].status).toBe("done");
+    // 失败卡片保留在原位，带原因、无 src；成功的照常 done
+    expect(store.stagedAttachments.map((a) => [a.name, a.status, a.failReason])).toEqual([
+      ["c.png", "failed", "disk full"],
+      ["b.png", "failed", "copy failed"],
+      ["a.png", "done", undefined],
+    ]);
+    expect(store.stagedAttachments.filter((a) => a.status === "failed").every((a) => a.src === "")).toBe(true);
     expect(addNotification).toHaveBeenCalledTimes(1);
     const { title, message } = addNotification.mock.calls[0][0];
     expect(title).toBe("2 个文件导入失败");
@@ -144,7 +149,10 @@ describe("attachmentStore native multi-pick", () => {
     await store.handleAttachment("gallery");
     await new Promise((resolve) => setTimeout(resolve, 5));
 
-    expect(store.stagedAttachments.map((a) => a.name)).toEqual(["a.png"]);
+    expect(store.stagedAttachments.map((a) => [a.name, a.status, a.failReason])).toEqual([
+      ["b.png", "failed", "copy failed"],
+      ["a.png", "done", undefined],
+    ]);
     expect(addNotification).toHaveBeenCalledTimes(1);
     expect(String(addNotification.mock.calls[0][0].message)).toContain("b.png: copy failed");
   });
@@ -162,7 +170,13 @@ describe("attachmentStore native multi-pick", () => {
     const store = useAttachmentStore();
     await store.handleAttachment("gallery");
 
-    expect(store.stagedAttachments).toHaveLength(0);
+    // t1 有卡片原地标失败；t2 在 start 前失败，补建一张失败卡片
+    expect(store.stagedAttachments).toHaveLength(2);
+    expect(store.stagedAttachments.every((a) => a.status === "failed")).toBe(true);
+    expect(Object.fromEntries(store.stagedAttachments.map((a) => [a.name, a.failReason]))).toEqual({
+      "a.png": "io",
+      "b.png": "decode",
+    });
     expect(addNotification).toHaveBeenCalledTimes(1);
     const { title, message } = addNotification.mock.calls[0][0];
     expect(title).toBe("2 个文件导入失败");
@@ -267,5 +281,22 @@ describe("attachmentStore native multi-pick", () => {
 
     expect(store.stagedAttachments).toHaveLength(entries.length);
     expect(addNotification).not.toHaveBeenCalled();
+  });
+
+  it("still drops the card on single-pick failure (camera keeps legacy behavior)", async () => {
+    mockInvoke(PICK, () => {
+      emit("vcp-mobile-file-start", { name: "Camera_2.jpg", size: 10, mime: "image/jpeg" });
+      return picked(undefined, "Camera_2.jpg");
+    });
+    mockInvoke("register_local_file", async () => {
+      throw new Error("disk full");
+    });
+
+    const store = useAttachmentStore();
+    await store.handleAttachment("camera");
+
+    expect(store.stagedAttachments).toHaveLength(0);
+    expect(addNotification).toHaveBeenCalledTimes(1);
+    expect(String(addNotification.mock.calls[0][0].message)).toContain("Camera_2.jpg: disk full");
   });
 });

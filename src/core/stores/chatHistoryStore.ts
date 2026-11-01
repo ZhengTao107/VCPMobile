@@ -683,8 +683,10 @@ export const useChatHistoryStore = defineStore("chatHistory", () => {
       if (latest.error || latest.aborted || hasEvictedNewer.value) return;
     }
     const key = captureLoadedConversation();
-    if (!key || (!content.trim() && attachmentStore.stagedAttachments.length === 0)) return;
-    if (attachmentStore.stagedAttachments.some(attachment => attachment.status !== "done")) return;
+    // 导入失败的卡片没有 src，绝不随消息发出：只按其余附件判断能否发送
+    const sendable = attachmentStore.stagedAttachments.filter(attachment => attachment.status !== "failed");
+    if (!key || (!content.trim() && sendable.length === 0)) return;
+    if (sendable.some(attachment => attachment.status !== "done")) return;
 
     if (typeof navigator !== "undefined" && navigator.vibrate) {
       navigator.vibrate(25);
@@ -742,11 +744,20 @@ export const useChatHistoryStore = defineStore("chatHistory", () => {
       return;
     }
 
-    const currentStaged = attachmentStore.stagedAttachments.map((attachment, attachmentOrder) => ({
+    const skippedFailed = attachmentStore.stagedAttachments.length - sendable.length;
+    const currentStaged = sendable.map((attachment, attachmentOrder) => ({
       ...attachment,
       attachmentOrder,
     }));
     attachmentStore.clearStaged();
+    if (skippedFailed > 0) {
+      notificationStore.addNotification({
+        type: "info",
+        title: "已跳过失败附件",
+        message: `${skippedFailed} 个导入失败的附件未随消息发送`,
+        toastOnly: true,
+      });
+    }
 
     const now = Date.now();
     const userName = settingsStore.settings?.userName || "User";
