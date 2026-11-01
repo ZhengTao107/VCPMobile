@@ -1747,6 +1747,7 @@ fn absorb_sse_data(
     data: &str,
     pending_chunk: &mut String,
     last_finish_reason: &mut Option<String>,
+    metrics: &mut crate::vcp_modules::chat::context_metrics::RoundCollector,
 ) -> Result<bool, String> {
     if data.trim() == "[DONE]" {
         return Ok(true);
@@ -1762,6 +1763,10 @@ fn absorb_sse_data(
             .or_else(|| error.get("message").and_then(Value::as_str))
             .unwrap_or("Upstream SSE request failed");
         return Err(message.to_string());
+    }
+    if let Some(round) = crate::vcp_modules::chat::context_metrics::extract_from_sse_payload(&value) {
+        metrics.record(round);
+        return Ok(false);
     }
     if let Some(choice) = value
         .get("choices")
@@ -1821,6 +1826,9 @@ async fn handle_streaming_request<R: Runtime>(
     let mut aurora_buffer = AuroraBuffer::new();
     let mut pending_chunk = String::new();
     let mut last_finish_reason = None;
+    let mut metrics_rounds = crate::vcp_modules::chat::context_metrics::RoundCollector::default();
+    let attachment_tokens =
+        crate::vcp_modules::chat::context_metrics::estimate_attachment_tokens(&request_body["messages"]);
     let send_update = |buffer: &mut AuroraBuffer| {
         output.send_aurora(buffer, &message_id, &context, None, false);
     };
@@ -1958,7 +1966,7 @@ async fn handle_streaming_request<R: Runtime>(
                     #[cfg(not(target_os = "android"))]
                     match next {
                         Some(Ok(data)) => {
-                            if absorb_sse_data(&data, &mut pending_chunk, &mut last_finish_reason)? {
+                            if absorb_sse_data(&data, &mut pending_chunk, &mut last_finish_reason, &mut metrics_rounds)? {
                                 return Ok(());
                             }
                         }
@@ -2026,6 +2034,9 @@ async fn handle_streaming_request<R: Runtime>(
                                         .ok_or_else(|| "Helper snapshot end is missing completion state".to_string())?;
                                     snapshot_in_progress = false;
                                     snapshot_received = true;
+                                    if let Some(rounds) = event["contextMetricsRounds"].as_array() {
+                                        metrics_rounds.extend(rounds.iter().cloned());
+                                    }
                                     flush_aurora_window(&mut aurora_buffer, &mut pending_chunk);
                                     output.send_aurora(&mut aurora_buffer, &message_id, &context, None, true);
                                     if let Some(reason) = event["finishReason"].as_str() {
@@ -2055,6 +2066,11 @@ async fn handle_streaming_request<R: Runtime>(
                                 "error" => {
                                     return Err(event["error"].as_str()
                                         .unwrap_or("Helper stream request failed").to_string());
+                                }
+                                "context_metrics" => {
+                                    if let Some(round) = crate::vcp_modules::chat::context_metrics::normalize_round(&event["contextMetrics"]) {
+                                        metrics_rounds.record(round);
+                                    }
                                 }
                                 _ => return Err("Unknown helper stream event".to_string()),
                             }
@@ -2098,6 +2114,26 @@ async fn handle_streaming_request<R: Runtime>(
     flush_aurora_window(&mut aurora_buffer, &mut pending_chunk);
     aurora_buffer.finalize();
     send_update(&mut aurora_buffer);
+    // 用量遥测是元数据：在 finalize 之前单独写 context_metrics 列，失败只告警。
+    if !metrics_rounds.is_empty() || attachment_tokens > 0 {
+        if let Some(db) = app.try_state::<DbState>() {
+            match message_key_from_context(&context, &message_id) {
+                Ok(key) => {
+                    if let Err(error) = crate::vcp_modules::chat::context_metrics::persist(
+                        &db,
+                        &key,
+                        &metrics_rounds.to_vec(),
+                        attachment_tokens,
+                    )
+                    .await
+                    {
+                        log::warn!("[VCPClient] context metrics not persisted: {error}");
+                    }
+                }
+                Err(error) => log::warn!("[VCPClient] context metrics key unavailable: {error}"),
+            }
+        }
+    }
     outcome.map_err(|message| {
         VcpRequestFailure::streaming(message, aurora_buffer.full_text.clone())
     })?;
@@ -2106,6 +2142,8 @@ async fn handle_streaming_request<R: Runtime>(
         json!({
             "fullContent": aurora_buffer.full_text,
             "streamingStarted": true,
+            "contextMetricsRounds": metrics_rounds.to_vec(),
+            "attachmentTokenEstimate": attachment_tokens,
             "finishReason": last_finish_reason.unwrap_or_else(|| "completed".to_string()),
         }),
         is_aborted,
@@ -3331,24 +3369,29 @@ mod active_request_tests {
     fn sse_round_finish_keeps_collecting_until_done_and_reports_upstream_errors() {
         let mut text = String::new();
         let mut reason = None;
+        let mut metrics = crate::vcp_modules::chat::context_metrics::RoundCollector::default();
         for data in [
             r#"{"choices":[{"delta":{"content":"before"},"finish_reason":"tool_calls"}]}"#,
+            r#"{"object":"vcp.context.metrics","messageId":"m","contextMetrics":{"totalContextTokens":42,"roundIndex":1}}"#,
             r#"{"choices":[{"delta":{"content":"after"},"finish_reason":"stop"}]}"#,
         ] {
-            assert!(!absorb_sse_data(data, &mut text, &mut reason).unwrap());
+            assert!(!absorb_sse_data(data, &mut text, &mut reason, &mut metrics).unwrap());
         }
         assert_eq!(text, "beforeafter");
         assert_eq!(reason.as_deref(), Some("stop"));
-        assert!(absorb_sse_data("[DONE]", &mut text, &mut reason).unwrap());
+        assert_eq!(metrics.to_vec().len(), 1);
+        assert_eq!(metrics.to_vec()[0]["totalContextTokens"], 42.0);
+        assert!(absorb_sse_data("[DONE]", &mut text, &mut reason, &mut metrics).unwrap());
         assert_eq!(
             absorb_sse_data(
                 r#"{"error":{"message":"quota exhausted"}}"#,
                 &mut text,
-                &mut reason
+                &mut reason,
+                &mut metrics
             ),
             Err("quota exhausted".to_string()),
         );
-        assert!(absorb_sse_data("{", &mut text, &mut reason).is_err());
+        assert!(absorb_sse_data("{", &mut text, &mut reason, &mut metrics).is_err());
         assert_eq!(text, "beforeafter");
     }
 

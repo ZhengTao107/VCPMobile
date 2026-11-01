@@ -10,6 +10,7 @@ import { useTopicStore } from "./topicListManager";
 import { useNotificationStore } from "./notification";
 import { clearMessageCache } from "../utils/astRenderer";
 import { extractMentionedMemberIds } from "../utils/mention";
+import { applyTopicContextMetrics, type MessageContextMetricsPayload } from "../utils/contextMetricsDisplay";
 
 import type {
   ChatMessage,
@@ -287,6 +288,16 @@ export const useChatHistoryStore = defineStore("chatHistory", () => {
       const hydrated = messages.map(
         msg => streamStore.getActiveStreamMessage(ownerId, ownerType, topicId, msg.id) || msg,
       );
+      // 用量遥测是本端元数据，旁路读取；失败只是不显示。
+      void Promise.resolve()
+        .then(() => invoke<Record<string, MessageContextMetricsPayload>>('get_topic_context_metrics', {
+          ownerId, ownerType, topicId,
+        }))
+        .then(metrics => {
+          if (!sessionStore.isConversationCurrent(key)) return;
+          applyTopicContextMetrics(currentChatHistory.value, metrics);
+        })
+        .catch(() => {});
       let addedCount = hydrated.length;
       if (!loadingOlder) {
         currentChatHistory.value = mergeHistoryWindow([], hydrated, false);
