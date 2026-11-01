@@ -492,7 +492,7 @@ impl BatchDiffHandler {
                     match validate_topic_batch_outcomes("pull", &pull_topics, pull_result) {
                         Ok(successful) => {
                             for topic in successful {
-                                tracker.mark_modified(&topic).await;
+                                tracker.mark_pulled(&topic).await;
                             }
                         }
                         Err(failure) => {
@@ -561,7 +561,7 @@ impl BatchDiffHandler {
                     match validate_topic_batch_outcomes("push", &push_topics, push_result) {
                         Ok(successful) => {
                             for topic in successful {
-                                tracker.mark_modified(&topic).await;
+                                tracker.mark_pushed(&topic).await;
                             }
                         }
                         Err(failure) => {

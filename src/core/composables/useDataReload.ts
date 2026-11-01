@@ -4,6 +4,7 @@ import { useChatSessionStore } from '../stores/chatSessionStore';
 import { useAssistantStore } from '../stores/assistant';
 import { useAvatarStore } from '../stores/avatar';
 import { useTopicStore } from '../stores/topicListManager';
+import { planSyncReload, type SyncTopicSets } from '../sync/incrementalReload';
 
 /**
  * 统一的数据重载逻辑：重建/同步/主题切换后调用，
@@ -48,5 +49,32 @@ export function useDataReload() {
     }
   };
 
-  return { performFullReload };
+  /**
+   * 同步收尾的增量刷新：只重载被桌面改动且正在查看的话题，pushed-only 不动界面。
+   * 返回 false 表示条件不满足（集合缺失/截断/元数据有改动），调用方应改走 performFullReload。
+   */
+  const performIncrementalReload = async (
+    sets: SyncTopicSets | null,
+    metadataChanged: boolean,
+  ): Promise<boolean> => {
+    const selected = sessionStore.currentSelectedItem;
+    const topicId = sessionStore.currentTopicId;
+    const current =
+      selected && topicId
+        ? { ownerType: selected.type, ownerId: selected.id, topicId }
+        : null;
+    const plan = planSyncReload(sets, metadataChanged, current);
+    if (plan.kind === 'full') return false;
+    if (plan.invalidateTopicCaches) topicStore.invalidateAllTopicCaches();
+    if (plan.reloadCurrentOwnerTopics && selected) {
+      await topicStore.loadTopicList(selected.id, selected.type);
+    }
+    if (plan.reloadCurrentHistory && selected && topicId) {
+      clearHtmlCache();
+      await chatHistoryStore.loadHistoryPaginated(selected.id, selected.type, topicId);
+    }
+    return true;
+  };
+
+  return { performFullReload, performIncrementalReload };
 }
