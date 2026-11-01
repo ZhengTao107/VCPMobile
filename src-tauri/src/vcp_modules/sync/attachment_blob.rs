@@ -89,7 +89,6 @@ pub(crate) struct BlobRef {
 pub(crate) struct LocalBlob {
     pub path: PathBuf,
     pub size: u64,
-    pub mime: String,
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -414,7 +413,6 @@ impl<R: Runtime> BlobLocal for TauriBlobLocal<'_, R> {
             .map(|file| LocalBlob {
                 path: file.path,
                 size: file.size_bytes,
-                mime: file.mime_type,
             })
     }
 
@@ -834,7 +832,8 @@ impl AttachmentBlobSync {
             .put(self.url(&blob.hash))
             .bearer_auth(&self.token)
             .header(CONTENT_LENGTH, file.size)
-            .header(CONTENT_TYPE, file.mime.as_str())
+            // 电脑侧只接受 octet-stream（其余返回 415）；扩展名由 X-Attachment-Name 提供。
+            .header(CONTENT_TYPE, "application/octet-stream")
             .header("X-Attachment-Name", encode_attachment_name(&blob.name))
             .body(reqwest::Body::wrap_stream(stream))
             .send()
@@ -1026,6 +1025,7 @@ mod tests {
         blobs: HashMap<String, Vec<u8>>,
         put_calls: usize,
         put_names: Vec<String>,
+        put_content_types: Vec<String>,
         put_failures: usize,
         put_status: Option<u16>,
     }
@@ -1058,6 +1058,12 @@ mod tests {
     ) -> AxStatus {
         let mut state = state.lock().unwrap();
         state.put_calls += 1;
+        let content_type = headers
+            .get(header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default()
+            .to_string();
+        state.put_content_types.push(content_type);
         if let Some(code) = state.put_status {
             return AxStatus::from_u16(code).unwrap();
         }
@@ -1157,7 +1163,6 @@ mod tests {
                 LocalBlob {
                     path,
                     size: bytes.len() as u64,
-                    mime: "image/png".into(),
                 },
             );
             BlobRef {
@@ -1309,6 +1314,10 @@ mod tests {
         assert_eq!(
             state.put_names,
             vec![urlencoding::encode("新 图.png").into_owned()]
+        );
+        assert_eq!(
+            state.put_content_types,
+            vec!["application/octet-stream".to_string()]
         );
     }
 
