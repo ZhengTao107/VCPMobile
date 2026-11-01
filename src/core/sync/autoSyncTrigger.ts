@@ -1,5 +1,6 @@
 import { watch } from "vue";
 import { useSettingsStore, type AppSettings } from "../stores/settings";
+import type { ConversationKey } from "../stores/chatSessionStore";
 
 /**
  * 自动同步触发器（主人自用 fork）：消息完成 / 回到前台 / 联网后，
@@ -48,6 +49,20 @@ export const waitUntil = (
       if (ok) finish(true);
     }, { flush: "sync" });
   });
+
+type ConversationRef = Pick<ConversationKey, "ownerId" | "ownerType" | "topicId">;
+
+/**
+ * 只等当前打开的会话停止流式输出：收尾 performFullReload 只重载当前 owner 的话题列表
+ * 和当前话题历史；后台话题的流对象留在 chatStreamStore 池里，不受重载影响。
+ * 当前会话在等待期间切换时谓词会重新求值。
+ */
+export const waitForCurrentConversationIdle = (
+  stream: { isConversationStreaming: (key: ConversationRef | null | undefined) => boolean },
+  session: { currentConversationKey: ConversationRef | null },
+  timeoutMs: number = STREAM_IDLE_TIMEOUT_MS,
+): Promise<boolean> =>
+  waitUntil(() => !stream.isConversationStreaming(session.currentConversationKey), timeoutMs);
 
 export interface AutoSyncTriggerOptions {
   isReady: () => boolean;
@@ -109,25 +124,28 @@ export function createAutoSyncTrigger(
 
 // 默认实例的重依赖按需动态加载：chatStreamStore 静态引用本模块，避免循环导入。
 const runDefaultAutoSync = async (reason: string) => {
-  const [{ useAppLifecycleStore }, { useSyncSessionStore }, { useChatStreamStore }] =
-    await Promise.all([
-      import("../stores/appLifecycle"),
-      import("../stores/syncSession"),
-      import("../stores/chatStreamStore"),
-    ]);
+  const [
+    { useAppLifecycleStore },
+    { useSyncSessionStore },
+    { useChatStreamStore },
+    { useChatSessionStore },
+  ] = await Promise.all([
+    import("../stores/appLifecycle"),
+    import("../stores/syncSession"),
+    import("../stores/chatStreamStore"),
+    import("../stores/chatSessionStore"),
+  ]);
   const phase = useAppLifecycleStore().lifecycleSnapshot?.phase;
   // 后台不发起；回到前台时会重新触发。
   if ((phase && phase !== "active") || (typeof document !== "undefined" && document.hidden)) {
     return;
   }
   const stream = useChatStreamStore();
+  const session = useChatSessionStore();
   await useSyncSessionStore().runAutoSync(reason, {
-    // 收尾会 performFullReload 当前话题，避开正在流式输出的消息。
-    beforeClose: () =>
-      waitUntil(
-        () => Object.keys(stream.sessionActiveStreams).length === 0,
-        STREAM_IDLE_TIMEOUT_MS,
-      ),
+    // 收尾会 performFullReload 当前话题：只避开当前会话的流，后台话题生成不阻塞。
+    // 注意：start_manual_sync 的 Rust 预检仍在任一 active_generations 存在时拒绝启动。
+    beforeClose: () => waitForCurrentConversationIdle(stream, session),
   });
 };
 

@@ -621,6 +621,16 @@ export const useChatStreamStore = defineStore("chatStream", () => {
     );
   }
 
+  // 按完整会话身份判断是否仍有活跃流；读取 sessionActiveStreams，可被响应式追踪。
+  function isConversationStreaming(
+    key: Pick<ConversationKey, "ownerId" | "ownerType" | "topicId"> | null | undefined,
+  ): boolean {
+    if (!key) return false;
+    const streams =
+      sessionActiveStreams.value[conversationMapKey(key.ownerId, key.ownerType, key.topicId)];
+    return Boolean(streams && streams.length > 0);
+  }
+
   // 兼容旧逻辑的计算属性
   const activeStreamingIds = computed(() => {
     if (!sessionStore.currentSelectedItem?.id || !sessionStore.currentTopicId)
@@ -1537,6 +1547,7 @@ export const useChatStreamStore = defineStore("chatStream", () => {
     isMessageActive,
     isMessageActiveInSession,
     getActiveStreamMessage,
+    isConversationStreaming,
     isGroupGenerating,
     computeShell,
     addSessionStream,
