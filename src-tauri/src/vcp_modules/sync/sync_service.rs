@@ -27,7 +27,7 @@ use std::future::Future;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
 use std::sync::Mutex;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tauri::{AppHandle, Emitter, Manager, Runtime, State};
 use tokio::sync::{mpsc, Mutex as AsyncMutex, RwLock};
 use tokio::task::{JoinHandle, JoinSet};
@@ -43,10 +43,13 @@ const WS_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const WS_OPERATION_TIMEOUT: Duration = Duration::from_secs(5);
 const PHASE_RESPONSE_TIMEOUT: Duration = Duration::from_secs(60);
 const FINAL_ACK_TIMEOUT: Duration = Duration::from_secs(30);
+/// 连续无进展的自动重试次数上限：两次重试之间只要有批次落库，计数与退避回到起点。
 const MAX_SYNC_RETRIES: u32 = 6;
 /// 退避 1→2→4→8→16→30s，总计约 1 分钟，覆盖穿透进程重拉等短时断连。
 const INITIAL_RETRY_DELAY: Duration = Duration::from_secs(1);
 const MAX_RETRY_DELAY: Duration = Duration::from_secs(30);
+/// 整轮墙钟上限：进展会重置重试计数，用它兜住"每次只前进一点"的无限重连。
+const MAX_SYNC_SESSION_WALL: Duration = Duration::from_secs(60 * 60);
 // Bound how long a caller waits, not the lifetime of already accepted DB writes.
 // A session which exceeds this budget remains owned until its real drain exits.
 const SYNC_STOP_WAIT: Duration = Duration::from_secs(5);
@@ -513,6 +516,72 @@ fn take_retry_slot(retry_count: &mut u32, retry_delay: &mut Duration) -> Option<
     Some(backoff)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RetryExhaustion {
+    NoProgress,
+    WallClock,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RetryDecision {
+    Retry {
+        backoff: Duration,
+        reset_after_batches: Option<u64>,
+    },
+    Exhausted(RetryExhaustion),
+}
+
+/// 会话级重试预算。进展信号是 Phase 3 批次成功落库（handle_diff_batch 在本批
+/// write_queue.flush 成功后才返回 Ok），按会话累计，跨 attempt 不清零。
+#[derive(Debug)]
+struct SyncRetryBudget {
+    count: u32,
+    delay: Duration,
+    committed_batches: u64,
+    committed_at_last_retry: u64,
+    started_at: Instant,
+}
+
+impl SyncRetryBudget {
+    fn new(started_at: Instant) -> Self {
+        Self {
+            count: 0,
+            delay: INITIAL_RETRY_DELAY,
+            committed_batches: 0,
+            committed_at_last_retry: 0,
+            started_at,
+        }
+    }
+
+    fn record_committed_batch(&mut self) {
+        self.committed_batches = self.committed_batches.saturating_add(1);
+    }
+
+    fn attempts(&self) -> u32 {
+        self.count
+    }
+
+    fn next(&mut self, now: Instant) -> RetryDecision {
+        if now.saturating_duration_since(self.started_at) >= MAX_SYNC_SESSION_WALL {
+            return RetryDecision::Exhausted(RetryExhaustion::WallClock);
+        }
+        let mut reset_after_batches = None;
+        if self.committed_batches > self.committed_at_last_retry {
+            self.committed_at_last_retry = self.committed_batches;
+            self.count = 0;
+            self.delay = INITIAL_RETRY_DELAY;
+            reset_after_batches = Some(self.committed_batches);
+        }
+        match take_retry_slot(&mut self.count, &mut self.delay) {
+            Some(backoff) => RetryDecision::Retry {
+                backoff,
+                reset_after_batches,
+            },
+            None => RetryDecision::Exhausted(RetryExhaustion::NoProgress),
+        }
+    }
+}
+
 #[derive(Debug)]
 struct AttemptRestartFailure {
     code: String,
@@ -539,47 +608,60 @@ async fn schedule_sync_retry<R: Runtime>(
     session_id: u64,
     status: &Arc<RwLock<String>>,
     cancel_token: &CancellationToken,
-    retry_count: &mut u32,
-    retry_delay: &mut Duration,
+    retry_budget: &mut SyncRetryBudget,
     error_code: &str,
     message: &str,
 ) -> bool {
     if cancel_token.is_cancelled() {
         return false;
     }
-    let Some(backoff) = take_retry_slot(retry_count, retry_delay) else {
-        let final_message =
-            format!("{message}; retry budget exhausted after {MAX_SYNC_RETRIES} automatic retries");
-        emit_sync_log(app_handle, "error", &final_message);
-        publish_sync_error(
-            app_handle,
-            session_id,
-            status,
-            error_code,
-            &final_message,
-            Vec::new(),
-        )
-        .await;
-        return false;
+    let backoff = match retry_budget.next(Instant::now()) {
+        RetryDecision::Retry {
+            backoff,
+            reset_after_batches,
+        } => {
+            if let Some(batches) = reset_after_batches {
+                emit_sync_log(
+                    app_handle,
+                    "info",
+                    &format!("重试计数因进展重置（本轮已落库 {batches} 批）"),
+                );
+            }
+            backoff
+        }
+        RetryDecision::Exhausted(reason) => {
+            let final_message = match reason {
+                RetryExhaustion::NoProgress => format!(
+                    "{message}; retry budget exhausted after {MAX_SYNC_RETRIES} consecutive retries without progress（连续无进展）"
+                ),
+                RetryExhaustion::WallClock => format!(
+                    "{message}; sync session exceeded the {}-minute wall-clock limit（墙钟上限）",
+                    MAX_SYNC_SESSION_WALL.as_secs() / 60
+                ),
+            };
+            emit_sync_log(app_handle, "error", &final_message);
+            publish_sync_error(
+                app_handle,
+                session_id,
+                status,
+                error_code,
+                &final_message,
+                Vec::new(),
+            )
+            .await;
+            return false;
+        }
     };
+    let retry_count = retry_budget.attempts();
     emit_sync_log(
         app_handle,
         "warning",
-        &format!(
-            "{message}; reconnecting after {backoff:?} ({}/{MAX_SYNC_RETRIES})",
-            *retry_count
-        ),
+        &format!("{message}; reconnecting after {backoff:?} ({retry_count}/{MAX_SYNC_RETRIES})"),
     );
     let operator_message = if error_code == "SYNC_SNAPSHOT_STALE" {
-        format!(
-            "检测到同步期间数据变化，正在重新比对（{}/{MAX_SYNC_RETRIES}）",
-            *retry_count
-        )
+        format!("检测到同步期间数据变化，正在重新比对（{retry_count}/{MAX_SYNC_RETRIES}）")
     } else {
-        format!(
-            "连接中断，正在进行第 {}/{} 次自动重试",
-            *retry_count, MAX_SYNC_RETRIES
-        )
+        format!("连接中断，正在进行第 {retry_count}/{MAX_SYNC_RETRIES} 次自动重试")
     };
     emit_operator_sync_log(app_handle, session_id, "warning", &operator_message);
     !cancelled_during(cancel_token, backoff).await
@@ -1507,8 +1589,7 @@ async fn run_sync_session(
             return Ok(());
         }
     };
-    let mut retry_count = 0u32;
-    let mut retry_delay = INITIAL_RETRY_DELAY;
+    let mut retry_budget = SyncRetryBudget::new(Instant::now());
     let mut next_attempt_id = 0u64;
 
     let db = app_handle.state::<DbState>();
@@ -1671,8 +1752,7 @@ async fn run_sync_session(
                             session_id,
                             &connection_status_for_task,
                             &cancel_token,
-                            &mut retry_count,
-                            &mut retry_delay,
+                            &mut retry_budget,
                             code,
                             &message,
                         )
@@ -1713,8 +1793,7 @@ async fn run_sync_session(
                         session_id,
                         &connection_status_for_task,
                         &cancel_token,
-                        &mut retry_count,
-                        &mut retry_delay,
+                        &mut retry_budget,
                         "WS_SEND_FAILED",
                         &message,
                     )
@@ -2531,6 +2610,9 @@ async fn run_sync_session(
                                         ).await;
                                         let _ = close_ws_with_deadline(&mut ws_stream).await;
                                         break 'attempt;
+                                    } else {
+                                        // Ok 只在本批 write_queue.flush 成功后返回：这是"已落库"的进展信号。
+                                        retry_budget.record_committed_batch();
                                     }
                                 },
                                 SyncCommand::FailAttempt { attempt_id: command_attempt, code, message } => {
@@ -3040,8 +3122,7 @@ async fn run_sync_session(
                         session_id,
                         &connection_status_for_task,
                         &cancel_token,
-                        &mut retry_count,
-                        &mut retry_delay,
+                        &mut retry_budget,
                         &retry.code,
                         &retry.message,
                     )
@@ -3062,8 +3143,7 @@ async fn run_sync_session(
                     session_id,
                     &connection_status_for_task,
                     &cancel_token,
-                    &mut retry_count,
-                    &mut retry_delay,
+                    &mut retry_budget,
                     "WS_CONNECT_TIMEOUT",
                     &retry_message,
                 )
@@ -3101,8 +3181,7 @@ async fn run_sync_session(
                     session_id,
                     &connection_status_for_task,
                     &cancel_token,
-                    &mut retry_count,
-                    &mut retry_delay,
+                    &mut retry_budget,
                     error_code,
                     &retry_message,
                 )
@@ -3931,6 +4010,90 @@ mod tests {
         }
         assert_eq!(seen, vec![1, 2, 4, 8, 16, 30]);
         assert_eq!(count, MAX_SYNC_RETRIES);
+    }
+
+    fn retry_reset_marker(decision: RetryDecision) -> Option<u64> {
+        match decision {
+            RetryDecision::Retry {
+                reset_after_batches,
+                ..
+            } => reset_after_batches,
+            RetryDecision::Exhausted(reason) => panic!("unexpected exhaustion: {reason:?}"),
+        }
+    }
+
+    #[test]
+    fn retry_budget_resets_whenever_a_batch_commits_between_failures() {
+        let start = Instant::now();
+        let mut budget = SyncRetryBudget::new(start);
+        for round in 1..=u64::from(MAX_SYNC_RETRIES) * 3 {
+            budget.record_committed_batch();
+            match budget.next(start) {
+                RetryDecision::Retry {
+                    backoff,
+                    reset_after_batches,
+                } => {
+                    assert_eq!(backoff, INITIAL_RETRY_DELAY);
+                    assert_eq!(reset_after_batches, Some(round));
+                }
+                other => panic!("round {round} exhausted despite progress: {other:?}"),
+            }
+        }
+        assert_eq!(budget.attempts(), 1);
+    }
+
+    #[test]
+    fn retry_budget_exhausts_after_consecutive_failures_without_progress() {
+        let start = Instant::now();
+        let mut budget = SyncRetryBudget::new(start);
+        budget.record_committed_batch();
+        assert_eq!(retry_reset_marker(budget.next(start)), Some(1));
+        for _ in 1..MAX_SYNC_RETRIES {
+            assert_eq!(retry_reset_marker(budget.next(start)), None);
+        }
+        assert_eq!(
+            budget.next(start),
+            RetryDecision::Exhausted(RetryExhaustion::NoProgress)
+        );
+    }
+
+    #[test]
+    fn retry_budget_stops_at_session_wall_clock_even_with_progress() {
+        let start = Instant::now();
+        let mut budget = SyncRetryBudget::new(start);
+        budget.record_committed_batch();
+        let just_before = start + MAX_SYNC_SESSION_WALL - Duration::from_secs(1);
+        assert_eq!(retry_reset_marker(budget.next(just_before)), Some(1));
+        budget.record_committed_batch();
+        let deadline = start + MAX_SYNC_SESSION_WALL;
+        assert_eq!(
+            budget.next(deadline),
+            RetryDecision::Exhausted(RetryExhaustion::WallClock)
+        );
+    }
+
+    #[test]
+    fn retry_budget_keeps_backoff_sequence_without_progress() {
+        let start = Instant::now();
+        let mut budget = SyncRetryBudget::new(start);
+        let mut seen = Vec::new();
+        loop {
+            match budget.next(start) {
+                RetryDecision::Retry {
+                    backoff,
+                    reset_after_batches,
+                } => {
+                    assert_eq!(reset_after_batches, None);
+                    seen.push(backoff.as_secs());
+                }
+                RetryDecision::Exhausted(reason) => {
+                    assert_eq!(reason, RetryExhaustion::NoProgress);
+                    break;
+                }
+            }
+        }
+        assert_eq!(seen, vec![1, 2, 4, 8, 16, 30]);
+        assert_eq!(budget.attempts(), MAX_SYNC_RETRIES);
     }
 
     #[test]
