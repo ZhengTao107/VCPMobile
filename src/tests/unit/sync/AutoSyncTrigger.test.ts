@@ -218,4 +218,79 @@ describe("quiet auto sync session", () => {
     emitTauriEvent("vcp-sync-completed", completed(7));
     await store.close();
   });
+
+  describe("reload after completion", () => {
+    const noChange = (sessionId: number) => ({
+      sessionId,
+      status: "completed",
+      summary: {
+        successfulTopics: 0, totalTopics: 0, failedTopics: 0,
+        legacyAttachmentWarnings: 0, failedTopicIds: [],
+      },
+    });
+    const reloadCount = () =>
+      invokeMock.mock.calls.filter(([command]) => command === "get_assistants_snapshot").length;
+
+    it("skips the full reload when the auto sync observed no writes", async () => {
+      const store = useSyncSessionStore();
+      const run = store.runAutoSync("test");
+      await vi.waitFor(() => expect(store.activeSessionId).toBe(7));
+      emitTauriEvent("vcp-sync-status", { sessionId: 7, status: "open" });
+      emitTauriEvent("vcp-sync-progress", { sessionId: 7, phase: "topic_validation", total: 0, completed: 0 });
+      emitTauriEvent("vcp-sync-completed", noChange(7));
+      await expect(run).resolves.toBe("completed");
+      expect(reloadCount()).toBe(0);
+      expect(store.needsReload).toBe(false);
+    });
+
+    it("keeps the full reload when message topics changed", async () => {
+      const store = useSyncSessionStore();
+      const run = store.runAutoSync("test");
+      await vi.waitFor(() => expect(store.activeSessionId).toBe(7));
+      emitTauriEvent("vcp-sync-status", { sessionId: 7, status: "open" });
+      emitTauriEvent("vcp-sync-completed", completed(7));
+      await expect(run).resolves.toBe("completed");
+      expect(reloadCount()).toBe(1);
+    });
+
+    it("keeps the full reload when only metadata operations ran", async () => {
+      const store = useSyncSessionStore();
+      const run = store.runAutoSync("test");
+      await vi.waitFor(() => expect(store.activeSessionId).toBe(7));
+      emitTauriEvent("vcp-sync-status", { sessionId: 7, status: "open" });
+      emitTauriEvent("vcp-sync-progress", { sessionId: 7, phase: "owner_metadata", total: 2, completed: 2 });
+      emitTauriEvent("vcp-sync-completed", noChange(7));
+      await expect(run).resolves.toBe("completed");
+      expect(reloadCount()).toBe(1);
+    });
+
+    it("keeps the full reload when early session events were dropped", async () => {
+      let resolveSession!: (id: number) => void;
+      mockInvoke("start_manual_sync", () => new Promise<number>((resolve) => { resolveSession = resolve; }));
+      const store = useSyncSessionStore();
+      const run = store.runAutoSync("test");
+      await vi.waitFor(() =>
+        expect(invokeMock.mock.calls.some(([command]) => command === "start_manual_sync")).toBe(true));
+      for (let i = 0; i < 40; i += 1) {
+        emitTauriEvent("vcp-sync-progress", { sessionId: 7, phase: "topic_validation", total: 0, completed: 0 });
+      }
+      resolveSession(7);
+      await vi.waitFor(() => expect(store.activeSessionId).toBe(7));
+      emitTauriEvent("vcp-sync-status", { sessionId: 7, status: "open" });
+      emitTauriEvent("vcp-sync-completed", noChange(7));
+      await expect(run).resolves.toBe("completed");
+      expect(reloadCount()).toBe(1);
+    });
+
+    it("keeps the full reload for a manual panel sync even without writes", async () => {
+      const store = useSyncSessionStore();
+      store.open();
+      await store.startSync();
+      emitTauriEvent("vcp-sync-status", { sessionId: 7, status: "open" });
+      emitTauriEvent("vcp-sync-completed", noChange(7));
+      expect(store.status).toBe("completed");
+      await store.close();
+      expect(reloadCount()).toBe(1);
+    });
+  });
 });

@@ -53,8 +53,9 @@ export const waitUntil = (
 type ConversationRef = Pick<ConversationKey, "ownerId" | "ownerType" | "topicId">;
 
 /**
- * 只等当前打开的会话停止流式输出：收尾 performFullReload 只重载当前 owner 的话题列表
- * 和当前话题历史；后台话题的流对象留在 chatStreamStore 池里，不受重载影响。
+ * 只等当前打开的会话停止流式输出。收尾若需重载，performFullReload 会清 AST 缓存、重拉
+ * agents/groups 与头像、作废全部话题缓存，并重建当前 owner 话题列表与当前话题历史（先清空再载入）；
+ * 本轮确认无写入时 syncSession 跳过重载。后台话题的流对象留在 chatStreamStore 池里，不受重载影响。
  * 当前会话在等待期间切换时谓词会重新求值。
  */
 export const waitForCurrentConversationIdle = (
@@ -143,7 +144,7 @@ const runDefaultAutoSync = async (reason: string) => {
   const stream = useChatStreamStore();
   const session = useChatSessionStore();
   await useSyncSessionStore().runAutoSync(reason, {
-    // 收尾会 performFullReload 当前话题：只避开当前会话的流，后台话题生成不阻塞。
+    // 收尾可能 performFullReload 当前话题：只避开当前会话的流，后台话题生成不阻塞。
     // 注意：start_manual_sync 的 Rust 预检仍在任一 active_generations 存在时拒绝启动。
     beforeClose: () => waitForCurrentConversationIdle(stream, session),
   });

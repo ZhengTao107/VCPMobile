@@ -342,6 +342,12 @@ const INDETERMINATE_PHASES = new Set([
   "topic_validation",
   "finalize",
 ]);
+// 这些阶段的 progress 只要 total>0，就说明本轮存在非 SKIP 写入操作（Rust 只为实际操作累加 total）。
+const CHANGE_SIGNAL_PHASES = new Set([
+  "owner_metadata",
+  "topic_metadata",
+  "messages",
+]);
 
 const emptySummary = (): SyncSummary => ({
   successfulTopics: 0,
@@ -395,6 +401,10 @@ export const useSyncSessionStore = defineStore("syncSession", () => {
   let progressLineId: string | null = null;
   // 自动同步的无面板会话；用户打开面板时由 open() 接管并清除。
   const quiet = ref(false);
+  // 自动同步收尾的跳过依据。前端拿不到 Rust 的 modified 话题集合，只能确认“本轮完全无写入”；
+  // 任何写入信号（元数据/消息阶段 total>0、会话事件缓冲溢出）都保守视为有变化。
+  let changeSignalSeen = false;
+  let noChangeConfirmed = false;
 
   const isCurrentView = (generation: number) =>
     isOpen.value && generation === viewGeneration;
@@ -429,6 +439,8 @@ export const useSyncSessionStore = defineStore("syncSession", () => {
     lastLoggedPhase = "";
     lastConnectionStatus = "";
     progressLineId = null;
+    changeSignalSeen = false;
+    noChangeConfirmed = false;
     activeTab.value = "live";
     logs.value = [];
     progressData.value = {
@@ -458,6 +470,12 @@ export const useSyncSessionStore = defineStore("syncSession", () => {
       // STOP_PENDING is a rejection above: accepted writes are still draining.
       // Keep this flag across close/reopen until a real stop receipt is available.
       if (needsReload.value) {
+        if (quietRun && noChangeConfirmed) {
+          // 自动同步已确认本轮无任何写入：跳过整页重载，避免当前话题历史清空重建导致闪烁与滚动跳动。
+          needsReload.value = false;
+          noChangeConfirmed = false;
+          return;
+        }
         try {
           await useDataReload().performFullReload();
           needsReload.value = false;
@@ -567,6 +585,8 @@ export const useSyncSessionStore = defineStore("syncSession", () => {
     }
 
     if (!isCurrentAttempt(generation, attempt)) return;
+    changeSignalSeen = false;
+    noChangeConfirmed = false;
     awaitingSessionId = true;
     bufferedSessionEvents = [];
     try {
@@ -861,6 +881,13 @@ export const useSyncSessionStore = defineStore("syncSession", () => {
         return;
       }
       const nextPhase = reportedPhase;
+      if (
+        CHANGE_SIGNAL_PHASES.has(nextPhase) &&
+        typeof payload.total === "number" &&
+        payload.total > 0
+      ) {
+        changeSignalSeen = true;
+      }
       const indeterminate = INDETERMINATE_PHASES.has(nextPhase);
       const nextTotal = indeterminate
         ? 0
@@ -991,6 +1018,7 @@ export const useSyncSessionStore = defineStore("syncSession", () => {
       return;
     }
     summary.value = completedSummary;
+    noChangeConfirmed = !changeSignalSeen && completedSummary.totalTopics === 0;
     status.value = payload.status;
     canDismiss.value = true;
     needsReload.value = true;
@@ -1018,6 +1046,8 @@ export const useSyncSessionStore = defineStore("syncSession", () => {
       bufferedSessionEvents.push({ kind, payload });
       if (bufferedSessionEvents.length > MAX_BUFFERED_SESSION_EVENTS) {
         bufferedSessionEvents.shift();
+        // 丢弃的早期事件里可能有写入信号，不能再断言“无变化”。
+        changeSignalSeen = true;
       }
     }
   };
