@@ -838,6 +838,7 @@ struct SyncSessionConfig {
     sync_token: String,
     sync_prerender_enabled: bool,
     sync_log_level: String,
+    attachment_blob_sync: bool,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -1368,6 +1369,8 @@ fn build_sync_session_config(
         sync_token: settings.sync_token.clone(),
         sync_prerender_enabled: settings.sync_prerender_enabled,
         sync_log_level: settings.sync_log_level.clone(),
+        attachment_blob_sync:
+            crate::vcp_modules::sync::attachment_blob::attachment_blob_sync_enabled(settings),
     })
 }
 
@@ -1404,6 +1407,7 @@ async fn run_sync_session(
         sync_token,
         sync_prerender_enabled,
         sync_log_level: configured_log_level,
+        attachment_blob_sync,
     } = session_config;
 
     // Sync HTTP operations end on connection/transport failure or explicit session
@@ -1526,6 +1530,16 @@ async fn run_sync_session(
     };
     let write_queue_task = write_queue.clone();
     let sync_logger_task = sync_logger.clone();
+    // 附件本体同步的预算与路由缺失标记按会话共享，跨 attempt 不重置。
+    let attachment_blob = Arc::new(
+        crate::vcp_modules::sync::attachment_blob::AttachmentBlobSync::new(
+            http_client.clone(),
+            http_url.clone(),
+            sync_token.clone(),
+            attachment_blob_sync,
+            Some(sync_logger.clone()),
+        ),
+    );
 
     'session: loop {
         if cancel_token.is_cancelled() {
@@ -2653,6 +2667,7 @@ async fn run_sync_session(
                                         let pending_batches = pending_diff_batches.clone();
                                         let expected_topics = expected_phase3_batch.clone();
                                         let token = sync_token.clone();
+                                        let attachment_blob_batch = attachment_blob.clone();
                                         let prerender_enabled = sync_prerender_enabled;
                                         task_tracker.spawn(async move {
                                             let result = crate::vcp_modules::sync_executor::batch_diff_handler::BatchDiffHandler::handle_diff_batch(
@@ -2669,6 +2684,7 @@ async fn run_sync_session(
                                                 prerender_enabled,
                                                 &expected_topics,
                                                 attempt_id,
+                                                &attachment_blob_batch,
                                             ).await;
                                             let _ = batch_tx.send(SyncCommand::Phase3BatchFinished {
                                                 attempt_id,
@@ -2771,6 +2787,14 @@ async fn run_sync_session(
 
                                         }
                                         let _ = close_ws_with_deadline(&mut ws_stream).await;
+                                        if sync_success {
+                                            // 消息同步已确认完成；附件本体补齐不改变成功判定，停止同步可随时中断。
+                                            tokio::select! {
+                                                biased;
+                                                _ = cancel_token.cancelled() => {}
+                                                _ = attachment_blob.download_for_session(&handle_clone) => {}
+                                            }
+                                        }
                                         break;
                                     },
                                     "SYNC_LOG_EVENT" => {

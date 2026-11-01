@@ -1,4 +1,5 @@
 use crate::vcp_modules::db_write_queue::DbWriteQueue;
+use crate::vcp_modules::sync::attachment_blob::AttachmentBlobSync;
 use crate::vcp_modules::sync_error::{
     decode_wire_sync_error, encode_wire_sync_error, is_attempt_restart_code, WireSyncError,
 };
@@ -362,6 +363,7 @@ impl BatchDiffHandler {
         prerender_enabled: bool,
         expected_batch_topics: &Arc<tokio::sync::Mutex<HashSet<TopicKey>>>,
         attempt_id: u64,
+        attachment_blob: &Arc<AttachmentBlobSync>,
     ) -> Result<(), Phase3ProtocolError> {
         let results = frame.results;
         let keyed_results = {
@@ -534,6 +536,10 @@ impl BatchDiffHandler {
                 // At most one Phase 3 HTTP batch may be in flight. Pull winners are durable
                 // before this whole-topic push reads the merged Mobile view.
                 if has_push {
+                    // 附件本体先于引用它的消息到达桌面；失败只记会话日志，不影响本批 push。
+                    attachment_blob
+                        .upload_for_topics(app_handle, &push_topics)
+                        .await;
                     let push_result = PushExecutor::push_messages_batch(
                         app_handle,
                         http_client,
