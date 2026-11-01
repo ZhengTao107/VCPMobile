@@ -33,6 +33,13 @@ where
     }
 }
 
+/// createdAt 只用于排序展示；桌面端历史数据可能给出 null（ISO 字符串经 CDS 转换失败），按 0 处理，避免整批 untagged 反序列化失败。
+fn deserialize_nullable_created_at<'de, D>(deserializer: D) -> Result<i64, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(Option::<i64>::deserialize(deserializer)?.unwrap_or(0))
+}
 /// =================================================================
 /// vcp_modules/sync_dto.rs - 双端同步标准契约 (The Shared Truth)
 /// =================================================================
@@ -85,6 +92,7 @@ pub struct GroupSyncDTO {
     pub unified_model: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tag_match_mode: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_nullable_created_at")]
     pub created_at: i64,
 }
 
@@ -111,6 +119,7 @@ impl From<&GroupConfig> for GroupSyncDTO {
 pub struct AgentTopicSyncDTO {
     pub id: String,
     pub name: String,
+    #[serde(default, deserialize_with = "deserialize_nullable_created_at")]
     pub created_at: i64,
     pub locked: bool,
     pub unread: bool,
@@ -130,6 +139,7 @@ pub struct AgentTopicSyncDTO {
 pub struct GroupTopicSyncDTO {
     pub id: String,
     pub name: String,
+    #[serde(default, deserialize_with = "deserialize_nullable_created_at")]
     pub created_at: i64,
     pub owner_id: String,
     #[serde(
@@ -244,6 +254,41 @@ mod tests {
 
     const TOPIC_CANONICAL_CONTRACT: &[u8] =
         include_bytes!("fixtures/topic_canonical_contract.json");
+
+    #[test]
+    fn agent_topic_sync_dto_tolerates_null_or_missing_created_at() {
+        let base = |created_at: Option<serde_json::Value>| {
+            let mut value = json!({
+                "id": "topic-1",
+                "name": "Topic",
+                "locked": false,
+                "unread": false,
+                "ownerId": "agent-1",
+                "configHash": "a".repeat(64),
+                "updatedAt": 456
+            });
+            if let Some(created_at) = created_at {
+                value["createdAt"] = created_at;
+            }
+            value
+        };
+        let null_dto: AgentTopicSyncDTO =
+            serde_json::from_value(base(Some(serde_json::Value::Null))).expect("null createdAt");
+        assert_eq!(null_dto.created_at, 0);
+        let missing_dto: AgentTopicSyncDTO =
+            serde_json::from_value(base(None)).expect("missing createdAt");
+        assert_eq!(missing_dto.created_at, 0);
+        let ok_dto: AgentTopicSyncDTO =
+            serde_json::from_value(base(Some(json!(123)))).expect("numeric createdAt");
+        assert_eq!(ok_dto.created_at, 123);
+        assert_eq!(
+            serde_json::to_value(&ok_dto).unwrap()["createdAt"],
+            json!(123)
+        );
+        assert!(
+            serde_json::from_value::<AgentTopicSyncDTO>(base(Some(json!("2026-11-01")))).is_err()
+        );
+    }
 
     #[test]
     fn agent_topic_sync_dto_requires_the_complete_wire_version() {
