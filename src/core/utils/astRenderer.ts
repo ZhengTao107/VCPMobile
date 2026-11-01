@@ -1,5 +1,6 @@
 import { convertFileSrc } from "@tauri-apps/api/core";
 import type { MarkdownNode, InlineNode } from "../types/chat";
+import { currentLocalMediaTargets, rewriteLocalMediaUrl } from "./localMediaRewrite";
 
 const ACTIVE_URL_ATTRIBUTES = new Set([
   "action",
@@ -21,6 +22,7 @@ const ACTIVE_URL_ATTRIBUTES = new Set([
 
 const ACTIVE_DOCUMENT_TAGS = new Set(["applet", "base", "embed", "object", "script"]);
 const PASSIVE_DATA_MEDIA_TAGS = new Set(["audio", "img", "source", "track", "video"]);
+const LOCAL_MEDIA_URL_ATTRIBUTES = new Set(["src", "poster"]);
 const DEFAULT_IFRAME_SANDBOX = "allow-scripts allow-forms allow-modals allow-popups allow-downloads";
 const TRUSTED_INTERNAL_HANDLER = /^(?:window\.)?__(?:vcpFixEmoticon|vcpShowEmoticon)\(\s*this\s*\)\s*;?$/i;
 
@@ -67,6 +69,14 @@ export function filterTrustedRichHtmlUrl(
     if (compactCandidates.some((candidate) => /^(?:javascript|vbscript):/.test(candidate))) {
       return null;
     }
+  }
+
+  // 显示层：主机本地媒体地址（localhost/私网 :6005/:5974）映射到当端远程地址，不触及存储。
+  if (
+    PASSIVE_DATA_MEDIA_TAGS.has(tagName.toLowerCase())
+    && LOCAL_MEDIA_URL_ATTRIBUTES.has(attributeName.toLowerCase())
+  ) {
+    return rewriteLocalMediaUrl(value, currentLocalMediaTargets());
   }
 
   return value;
@@ -126,11 +136,13 @@ function filterElementActiveContent(element: Element): void {
       continue;
     }
 
-    if (
-      (ACTIVE_URL_ATTRIBUTES.has(attributeName) || attributeName === "srcset")
-      && filterTrustedRichHtmlUrl(attribute.value, tagName, attributeName) === null
-    ) {
-      element.removeAttribute(attribute.name);
+    if (ACTIVE_URL_ATTRIBUTES.has(attributeName) || attributeName === "srcset") {
+      const filtered = filterTrustedRichHtmlUrl(attribute.value, tagName, attributeName);
+      if (filtered === null) {
+        element.removeAttribute(attribute.name);
+      } else if (filtered !== attribute.value) {
+        element.setAttribute(attribute.name, filtered);
+      }
     }
   }
 
