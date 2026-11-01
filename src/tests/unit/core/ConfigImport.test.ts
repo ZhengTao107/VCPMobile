@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  CONFIG_PROFILE_FIELDS,
   CONFIG_STRING_FIELDS,
   CONFIG_STRING_PREFIX,
   buildConfigString,
@@ -152,5 +153,159 @@ describe("maskPreview", () => {
     expect(maskSecret("abcd")).toBe("••••");
     expect(maskSecret("")).toBe("••••");
     expect(maskSecret("abcde")).toBe("••••bcde");
+  });
+});
+
+// ------------------------------------------------------------------
+// 连接档案（ptp4g#16）——以下地址与 Key 均为虚构测试值
+// ------------------------------------------------------------------
+
+const localProfile = { name: "本机", vcpServerUrl: "http://192.168.1.5:6005", vcpApiKey: "" };
+const serverProfile = { name: "服务器", vcpServerUrl: "https://vcp.example.com", vcpApiKey: "sk-fake-server-9876" };
+
+/** 读出配置串里的原始 JSON，用来断言外发内容 */
+function decode(text: string): Record<string, unknown> {
+  const b64 = text.slice(CONFIG_STRING_PREFIX.length).replace(/-/g, "+").replace(/_/g, "/");
+  const binary = atob(b64 + "=".repeat((4 - (b64.length % 4)) % 4));
+  return JSON.parse(new TextDecoder().decode(Uint8Array.from(binary, (ch) => ch.charCodeAt(0))));
+}
+
+describe("连接档案", () => {
+  it("合法双档案往返，patch 写入档案与档位", () => {
+    const text = buildConfigString({
+      ...full,
+      connectionProfiles: [localProfile, serverProfile],
+      connectionProfileMode: "local",
+    });
+    const result = parseConfigString(text);
+    expect(result).toEqual({
+      ok: true,
+      config: { ...full, connectionProfiles: [localProfile, serverProfile], connectionProfileMode: "local" },
+    });
+    if (!result.ok) return;
+    const patch = toSettingsPatch(result.config);
+    expect(patch.connectionProfiles).toEqual([localProfile, serverProfile]);
+    expect(patch.connectionProfileMode).toBe("local");
+    expect(patch.connectionProfiles).not.toBe(result.config.connectionProfiles);
+  });
+
+  it("只有档案也能导入；档案项多余键被丢弃", () => {
+    const result = parseConfigString(
+      encode({ v: 1, connectionProfiles: [{ ...serverProfile, junk: 1 }], connectionProfileMode: "server" }),
+    );
+    expect(result).toEqual({
+      ok: true,
+      config: { connectionProfiles: [serverProfile], connectionProfileMode: "server" },
+    });
+    if (result.ok) {
+      expect(Object.keys(toSettingsPatch(result.config)).sort()).toEqual([...CONFIG_PROFILE_FIELDS].sort());
+    }
+  });
+
+  it.each([
+    ["非法名称", [{ ...serverProfile, name: "家里" }], /名称只能是/],
+    ["名称非字符串", [{ ...serverProfile, name: 1 }], /名称只能是/],
+    ["名称重复", [serverProfile, { ...serverProfile }], /重复/],
+    ["超过 2 个", [localProfile, serverProfile, serverProfile], /最多 2 个/],
+    ["不是数组", { ...serverProfile }, /连接档案：类型不正确/],
+    ["档案不是对象", ["https://vcp.example.com"], /档案格式不正确/],
+  ])("%s 整串拒绝", (_name, profiles, pattern) => {
+    expectError(encode({ v: 1, ...full, connectionProfiles: profiles }), pattern);
+  });
+
+  it.each([
+    ["ws 协议", "ws://vcp.example.com", /协议必须是 http/],
+    ["ftp 协议", "ftp://1.2.3.4:6005", /协议必须是 http/],
+    ["非 URL", "not a url", /不是合法的 URL/],
+    ["空地址", "  ", /缺少服务器地址/],
+  ])("档案地址 %s 拒绝", (_name, url, pattern) => {
+    expectError(encode({ v: 1, connectionProfiles: [{ ...serverProfile, vcpServerUrl: url }] }), pattern);
+  });
+
+  it("档案 Key 非字符串拒绝", () => {
+    expectError(encode({ v: 1, connectionProfiles: [{ ...serverProfile, vcpApiKey: 42 }] }), /API Key 类型不正确/);
+  });
+
+  it.each(["auto", "remote", 1])("mode=%s 拒绝", (mode) => {
+    expectError(encode({ v: 1, ...full, connectionProfileMode: mode }), /连接档位：只允许 local \/ server/);
+  });
+
+  it("空档案数组与空档位视为未提供，不覆盖已有设置", () => {
+    const result = parseConfigString(
+      encode({ v: 1, syncToken: "tok-1234", connectionProfiles: [], connectionProfileMode: " " }),
+    );
+    expect(result).toEqual({ ok: true, config: { syncToken: "tok-1234" } });
+    if (result.ok) expect(toSettingsPatch(result.config)).toEqual({ syncToken: "tok-1234" });
+    expectError(encode({ v: 1, connectionProfiles: [], connectionProfileMode: "" }), /没有可导入/);
+  });
+
+  it("server-only 不含本机地址且强制 mode=server", () => {
+    const text = buildConfigString(
+      {
+        ...full,
+        vcpServerUrl: localProfile.vcpServerUrl,
+        vcpApiKey: "sk-fake-local-1111",
+        connectionProfiles: [localProfile, serverProfile],
+        connectionProfileMode: "local",
+      },
+      "朋友版",
+      { profiles: "server-only" },
+    );
+    const raw = decode(text);
+    expect(JSON.stringify(raw)).not.toContain("192.168.1.5");
+    expect(JSON.stringify(raw)).not.toContain("local");
+    expect(raw.connectionProfiles).toEqual([serverProfile]);
+    expect(raw.connectionProfileMode).toBe("server");
+    expect(raw.vcpServerUrl).toBe(serverProfile.vcpServerUrl);
+    expect(raw.vcpApiKey).toBe(serverProfile.vcpApiKey);
+    expect(parseConfigString(text).ok).toBe(true);
+  });
+
+  it("server-only 没有服务器档案时不带档案、档位与顶层 VCP 地址", () => {
+    const raw = decode(
+      buildConfigString(
+        { ...full, vcpServerUrl: localProfile.vcpServerUrl, connectionProfiles: [localProfile] },
+        undefined,
+        { profiles: "server-only" },
+      ),
+    );
+    expect(raw).not.toHaveProperty("connectionProfiles");
+    expect(raw).not.toHaveProperty("connectionProfileMode");
+    expect(raw).not.toHaveProperty("vcpServerUrl");
+    expect(raw).not.toHaveProperty("vcpApiKey");
+  });
+
+  it("导出时跳过 auto 档位与非法档案", () => {
+    const raw = decode(
+      buildConfigString({
+        ...full,
+        connectionProfileMode: "auto",
+        connectionProfiles: [{ name: "家里", vcpServerUrl: "http://10.0.0.2", vcpApiKey: "" }, localProfile, { ...localProfile }],
+      }),
+    );
+    expect(raw).not.toHaveProperty("connectionProfileMode");
+    expect(raw.connectionProfiles).toEqual([localProfile]);
+  });
+
+  it("旧串兼容：不含新字段时解析、patch 与生成结果都不变", () => {
+    expect(parseConfigString(encode({ v: 1, ...full }))).toEqual({ ok: true, config: full });
+    expect(buildConfigString(full)).toBe(encode({ v: 1, ...full }));
+    expect(buildConfigString(full, undefined, { profiles: "all" })).toBe(encode({ v: 1, ...full }));
+    const result = parseConfigString(encode({ v: 1, ...full }));
+    if (result.ok) {
+      expect(toSettingsPatch(result.config)).not.toHaveProperty("connectionProfiles");
+      expect(toSettingsPatch(result.config)).not.toHaveProperty("connectionProfileMode");
+    }
+  });
+
+  it("maskPreview 每个档案一行、Key 只露后 4 位，档位一行", () => {
+    const items = maskPreview({ connectionProfiles: [localProfile, serverProfile], connectionProfileMode: "server" });
+    expect(items).toEqual([
+      { field: "connectionProfiles.本机", label: "连接档案「本机」", value: "http://192.168.1.5:6005 · Key 未设置" },
+      { field: "connectionProfiles.服务器", label: "连接档案「服务器」", value: "https://vcp.example.com · Key ••••9876" },
+      { field: "connectionProfileMode", label: "连接档位", value: "服务器（server）" },
+    ]);
+    expect(JSON.stringify(items)).not.toContain("fake-server");
+    expect(new Set(items.map((i) => i.field)).size).toBe(items.length);
   });
 });
