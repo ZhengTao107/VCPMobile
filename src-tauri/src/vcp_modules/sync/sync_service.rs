@@ -41,7 +41,10 @@ const WS_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const WS_OPERATION_TIMEOUT: Duration = Duration::from_secs(5);
 const PHASE_RESPONSE_TIMEOUT: Duration = Duration::from_secs(60);
 const FINAL_ACK_TIMEOUT: Duration = Duration::from_secs(30);
-const MAX_SYNC_RETRIES: u32 = 3;
+const MAX_SYNC_RETRIES: u32 = 6;
+/// 退避 1→2→4→8→16→30s，总计约 1 分钟，覆盖穿透进程重拉等短时断连。
+const INITIAL_RETRY_DELAY: Duration = Duration::from_secs(1);
+const MAX_RETRY_DELAY: Duration = Duration::from_secs(30);
 // Bound how long a caller waits, not the lifetime of already accepted DB writes.
 // A session which exceeds this budget remains owned until its real drain exits.
 const SYNC_STOP_WAIT: Duration = Duration::from_secs(5);
@@ -468,7 +471,7 @@ fn take_retry_slot(retry_count: &mut u32, retry_delay: &mut Duration) -> Option<
     }
     *retry_count += 1;
     let backoff = *retry_delay;
-    *retry_delay = (*retry_delay * 2).min(Duration::from_secs(5));
+    *retry_delay = (*retry_delay * 2).min(MAX_RETRY_DELAY);
     Some(backoff)
 }
 
@@ -1432,7 +1435,7 @@ async fn run_sync_session(
         }
     };
     let mut retry_count = 0u32;
-    let mut retry_delay = Duration::from_millis(500);
+    let mut retry_delay = INITIAL_RETRY_DELAY;
     let mut next_attempt_id = 0u64;
 
     let db = app_handle.state::<DbState>();
@@ -3061,6 +3064,9 @@ async fn run_sync_session(
 
 /// Phase 3 diff 按消息状态数量分批，并保持单个 Topic 不跨批次。
 const TARGET_MESSAGE_STATES_PER_BATCH: usize = 10_000;
+/// 消息状态数取自 Mobile 本地；首次全量同步时本地为空、计数恒为 0，
+/// 只按条数会把全部 Topic 合成一批。按 Topic 数兜底切批，让每批独立落库、进度可见。
+const MAX_TOPICS_PER_BATCH: usize = 100;
 
 pub(crate) struct Phase3DiffBatch {
     pub batch_index: usize,
@@ -3094,7 +3100,8 @@ fn build_diff_batches(
             messages: state.messages,
         };
         if !current_topics.is_empty()
-            && current_msg_count.saturating_add(msg_count) > TARGET_MESSAGE_STATES_PER_BATCH
+            && (current_msg_count.saturating_add(msg_count) > TARGET_MESSAGE_STATES_PER_BATCH
+                || current_topics.len() >= MAX_TOPICS_PER_BATCH)
         {
             batches.push_back(Phase3DiffBatch {
                 batch_index: 0,
@@ -3741,6 +3748,43 @@ mod tests {
         let app = tauri::test::mock_app();
         assert!(app.manage(test_sync_state(session_id)));
         app
+    }
+
+    #[test]
+    fn build_diff_batches_caps_topics_for_empty_local_state() {
+        use crate::vcp_modules::sync_pipeline::phase3_message::TopicLocalState;
+        use std::collections::{BTreeMap, HashMap};
+
+        let mut states = HashMap::new();
+        for index in 0..250usize {
+            states.insert(
+                TopicKey::new("agent", "agent-a", format!("topic-{index:03}")),
+                TopicLocalState {
+                    content_hash: "h".repeat(64),
+                    messages: BTreeMap::new(),
+                },
+            );
+        }
+        let batches = build_diff_batches(states).expect("build batches");
+        let sizes = batches
+            .iter()
+            .map(|batch| batch.topics.len())
+            .collect::<Vec<_>>();
+        assert_eq!(sizes, vec![MAX_TOPICS_PER_BATCH, MAX_TOPICS_PER_BATCH, 50]);
+        assert!(batches.iter().all(|batch| batch.total_batches == 3));
+        assert_eq!(batches[2].batch_index, 3);
+    }
+
+    #[test]
+    fn retry_slots_back_off_to_thirty_seconds_then_exhaust() {
+        let mut count = 0u32;
+        let mut delay = INITIAL_RETRY_DELAY;
+        let mut seen = Vec::new();
+        while let Some(backoff) = take_retry_slot(&mut count, &mut delay) {
+            seen.push(backoff.as_secs());
+        }
+        assert_eq!(seen, vec![1, 2, 4, 8, 16, 30]);
+        assert_eq!(count, MAX_SYNC_RETRIES);
     }
 
     #[test]
