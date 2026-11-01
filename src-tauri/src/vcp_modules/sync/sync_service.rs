@@ -38,7 +38,7 @@ use tokio_util::sync::CancellationToken;
 
 const VERSION_CHECK_TIMEOUT: Duration = Duration::from_secs(5);
 /// 握手期间允许跳过的桌面广播帧上限：另一台设备同步时桌面会向所有连接广播日志与阶段帧。
-const MAX_HANDSHAKE_SKIPPED_FRAMES: usize = 32;
+const MAX_HANDSHAKE_SKIPPED_FRAMES: usize = 1024;
 const WS_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const WS_OPERATION_TIMEOUT: Duration = Duration::from_secs(5);
 const PHASE_RESPONSE_TIMEOUT: Duration = Duration::from_secs(60);
@@ -277,33 +277,38 @@ async fn perform_version_handshake<R: Runtime>(
     }
     emit_sync_log(app_handle, "info", "正在校验同步兼容性...");
 
+    let mut skipped_total = 0_usize;
+    let mut skipped_by_type = std::collections::BTreeMap::<String, usize>::new();
     let version_result = tokio::select! {
         biased;
         _ = cancel_token.cancelled() => {
+            log_skipped_handshake_broadcasts(app_handle, skipped_total, &skipped_by_type);
             let _ = close_ws_with_deadline(&mut ws_stream).await;
             return Err(VersionHandshakeFailure::Cancelled);
         }
         result = tokio::time::timeout(VERSION_CHECK_TIMEOUT, async {
-            let mut skipped_frames = 0_usize;
             while let Some(result) = ws_stream.next().await {
                 match result {
                     Ok(Message::Text(text)) => {
                         match parse_version_handshake_text(&text)? {
                             VersionHandshakeFrame::Ack(ack) => return Ok(ack),
                             VersionHandshakeFrame::Broadcast(frame_type) => {
-                                skipped_frames += 1;
-                                if skipped_frames > MAX_HANDSHAKE_SKIPPED_FRAMES {
+                                if skipped_total >= MAX_HANDSHAKE_SKIPPED_FRAMES {
                                     return Err(VersionHandshakeError::Protocol(format!(
                                         "Received more than {MAX_HANDSHAKE_SKIPPED_FRAMES} broadcast frames before VERSION_ACK"
                                     )));
                                 }
-                                emit_sync_log(
-                                    app_handle,
-                                    "debug",
-                                    &format!(
-                                        "握手期间跳过桌面广播帧 {frame_type}（{skipped_frames}/{MAX_HANDSHAKE_SKIPPED_FRAMES}）"
-                                    ),
-                                );
+                                skipped_total += 1;
+                                if skipped_total == 1 {
+                                    emit_sync_log(
+                                        app_handle,
+                                        "debug",
+                                        &format!(
+                                            "握手期间收到桌面广播帧 {frame_type}，跳过并继续等待 VERSION_ACK"
+                                        ),
+                                    );
+                                }
+                                *skipped_by_type.entry(frame_type).or_insert(0) += 1;
                             }
                         }
                     }
@@ -331,6 +336,7 @@ async fn perform_version_handshake<R: Runtime>(
             })
         }) => result,
     };
+    log_skipped_handshake_broadcasts(app_handle, skipped_total, &skipped_by_type);
 
     match version_result {
         Ok(Ok(accepted)) => {
@@ -3271,6 +3277,27 @@ pub(crate) fn emit_sync_log<R: Runtime>(app_handle: &AppHandle<R>, level: &str, 
     }
 }
 
+/// 握手结束时把跳过的桌面广播帧汇总成一条 debug，避免逐帧刷屏。
+fn log_skipped_handshake_broadcasts<R: Runtime>(
+    app_handle: &AppHandle<R>,
+    total: usize,
+    by_type: &std::collections::BTreeMap<String, usize>,
+) {
+    if total == 0 {
+        return;
+    }
+    let breakdown = by_type
+        .iter()
+        .map(|(frame_type, count)| format!("{frame_type}={count}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    emit_sync_log(
+        app_handle,
+        "debug",
+        &format!("握手期间共跳过 {total} 个桌面广播帧（{breakdown}）"),
+    );
+}
+
 fn emit_sync_phase_activity<R: Runtime>(app_handle: &AppHandle<R>, session_id: u64, phase: &str) {
     let _ = app_handle.emit(
         "vcp-sync-progress",
@@ -4242,6 +4269,22 @@ mod tests {
             (46, MAX_HANDSHAKE_SKIPPED_FRAMES + 1, false),
         ] {
             let app = mock_sync_app(session_id);
+            let log_dir = tempfile::tempdir().expect("handshake log directory");
+            let logger = Arc::new(std::sync::Mutex::new(SyncLogger::new_session(
+                LogLevel::Debug,
+                Some(log_dir.path().to_path_buf()),
+                session_id,
+            )));
+            let log_path = logger
+                .lock()
+                .expect("lock handshake logger")
+                .log_path()
+                .cloned()
+                .expect("handshake log path");
+            *app.state::<SyncState>()
+                .current_logger
+                .write()
+                .expect("install handshake logger") = Some(logger.clone());
             let status = app.state::<SyncState>().connection_status.clone();
             let cancel_token = CancellationToken::new();
             let (client, mut server) = websocket_pair().await;
@@ -4275,6 +4318,21 @@ mod tests {
                 assert_eq!(failure, VersionHandshakeFailure::Stop);
                 assert_eq!(status.read().await.as_str(), "error");
             }
+
+            let contents = std::fs::read_to_string(&log_path).expect("read handshake log");
+            let skip_logs = contents
+                .lines()
+                .filter(|line| line.contains("[DEBUG] [sync] 握手期间"))
+                .count();
+            assert!(
+                skip_logs <= 2,
+                "{broadcasts} broadcasts produced {skip_logs} debug lines"
+            );
+            assert_eq!(skip_logs, 2, "first-frame line plus one summary");
+            let half = MAX_HANDSHAKE_SKIPPED_FRAMES / 2;
+            assert!(contents.contains(&format!(
+                "握手期间共跳过 {MAX_HANDSHAKE_SKIPPED_FRAMES} 个桌面广播帧（DESKTOP_PHASE_START={half}, SYNC_LOG_EVENT={half}）"
+            )));
         }
     }
 
