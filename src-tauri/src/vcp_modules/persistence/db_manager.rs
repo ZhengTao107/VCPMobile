@@ -1210,7 +1210,7 @@ mod tests {
 
         run_migrations(&pool).await.expect("run migrations");
 
-        // 全部 1..=8 + baseline 记录已 seed，migrator 无事可做
+        // 全部 1..=8 + baseline 记录已 seed；baseline 之后的迁移由 migrator 正常执行
         let versions: Vec<i64> =
             sqlx::query_scalar("SELECT version FROM _sqlx_migrations ORDER BY version")
                 .fetch_all(&pool)
@@ -1218,7 +1218,22 @@ mod tests {
                 .expect("read seeded versions");
         let mut expected: Vec<i64> = (1..=BASELINE_INCREMENTAL_MAX).collect();
         expected.push(BASELINE_VERSION);
+        let mut post_baseline: Vec<i64> = sqlx::migrate!("./migrations")
+            .migrations
+            .iter()
+            .map(|migration| migration.version)
+            .filter(|version| *version > BASELINE_VERSION)
+            .collect();
+        post_baseline.sort_unstable();
+        expected.extend(post_baseline);
         assert_eq!(versions, expected);
+        let has_context_metrics: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('messages') WHERE name = 'context_metrics')",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("inspect context_metrics column");
+        assert!(has_context_metrics, "post-baseline 0101 must add messages.context_metrics");
 
         // FTS 直接是 trigram 终态
         let fts_ddl: String =

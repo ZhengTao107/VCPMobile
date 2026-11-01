@@ -35,6 +35,7 @@ import {
   supportsStreamRevealMotion,
 } from "../../core/utils/streamTextFade";
 import { useMessageStyleInjector } from "../../core/composables/useMessageStyleInjector";
+import { formatMessageUsageParts } from "../../core/utils/contextMetricsDisplay";
 import { Copy, Edit2, RotateCcw, Trash2, StopCircle } from "lucide-vue-next";
 import morphdom from "morphdom";
 
@@ -964,6 +965,13 @@ function formatTime(ts: number) {
   return `${year}-${month}-${day} ${hours}:${minutes}`;
 }
 
+const usageParts = computed(() =>
+  formatMessageUsageParts(
+    props.message.assistantContextMetricRounds,
+    props.message.attachmentTokenEstimate,
+  ),
+);
+
 // === Style Block CSS Injection ===
 const { injectScopedCss, removeScopedCss } = useMessageStyleInjector();
 
@@ -1383,7 +1391,7 @@ onUnmounted(() => {
             <div class="vcp-message-time text-[9px] mt-1.5 px-1 opacity-50 font-mono tracking-tighter w-full"
               :data-bubble-last="bubbleIndex === messageBubbles.length - 1 ? 'true' : 'false'"
               :class="shell.isUser ? 'text-right' : 'text-left'">
-              {{ formatTime(message.timestamp) }}
+              {{ formatTime(message.timestamp) }}<template v-if="!shell.isUser && bubbleIndex === messageBubbles.length - 1 && usageParts.length"> · {{ usageParts.join(" · ") }}</template>
             </div>
           </template>
         </ChatBubble>

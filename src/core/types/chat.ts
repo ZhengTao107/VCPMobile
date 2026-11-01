@@ -208,6 +208,9 @@ export interface ChatMessage {
   attachments?: Attachment[];
   topicId?: string;
   content_hash?: string;
+  // 本端用量遥测（get_topic_context_metrics 旁路读取；不进同步 DTO/指纹）
+  assistantContextMetricRounds?: import("../utils/contextMetricsDisplay").ContextMetricsRound[];
+  attachmentTokenEstimate?: number;
 
   // 以下为纯前端运行时 UI 状态 (Ephemeral)，绝不进行持久化
   tailContent?: string;      // Aurora: 尾随区 Markdown (高频变动)

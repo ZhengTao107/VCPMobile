@@ -9,6 +9,7 @@ import { useTopicStore } from "./topicListManager";
 import { useChatHistoryStore } from "./chatHistoryStore";
 import { useNotificationStore } from "./notification";
 import { requestAutoSync } from "../sync/autoSyncTrigger";
+import { applyTopicContextMetrics, type MessageContextMetricsPayload } from "../utils/contextMetricsDisplay";
 import type {
   ActiveGenerationDto,
   AuroraRecoverySnapshot,
@@ -1101,6 +1102,16 @@ export const useChatStreamStore = defineStore("chatStream", () => {
       if (typeof event.content === "string") msg!.content = event.content;
 
       if (finishReason) msg!.finishReason = finishReason;
+      // metrics 已在 finalize 前写入 context_metrics 列；旁路刷新，不阻塞终结。
+      if (msg) {
+        const metricsTarget = msg;
+        void Promise.resolve()
+          .then(() => invoke<Record<string, MessageContextMetricsPayload>>("get_topic_context_metrics", {
+            ownerId, ownerType, topicId,
+          }))
+          .then((metrics) => applyTopicContextMetrics([metricsTarget], metrics))
+          .catch(() => {});
+      }
 
       if (streamingMessageKey.value === messageKey)
         streamingMessageKey.value = null;

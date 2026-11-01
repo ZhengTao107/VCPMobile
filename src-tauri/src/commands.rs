@@ -170,6 +170,7 @@ macro_rules! app_command_handler {
                 delete_message_attachment,
                 delete_messages,
                 fetch_raw_message_content,
+                crate::vcp_modules::chat::context_metrics::get_topic_context_metrics,
                 handle_agent_chat_message,
                 load_chat_history,
                 load_chat_history_around,

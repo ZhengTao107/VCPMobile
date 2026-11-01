@@ -210,6 +210,7 @@ class SseProxyService : Service() {
         @Volatile var terminalError: String? = null,
         var activeConnection: ClientConnection? = null,
         val contextJson: JSONObject? = null,
+        val contextMetricsRounds: java.util.TreeMap<Int, JSONObject> = java.util.TreeMap(),
     ) {
         @Synchronized
         internal fun complete(reason: String, error: String? = null): Boolean {
@@ -597,6 +598,7 @@ class SseProxyService : Service() {
                         put("completed", completed)
                         put("finishReason", finishReason)
                         put("error", error)
+                        put("contextMetricsRounds", org.json.JSONArray(session.contextMetricsRounds.values))
                     }.toString())
                 }
             }
@@ -714,6 +716,26 @@ class SseProxyService : Service() {
             val error = payload.get("error")
             val message = (error as? JSONObject)?.opt("message") as? String ?: error.toString()
             completeSession(session, "error", message)
+            return
+        }
+        if (payload.optString("object") == "vcp.context.metrics") {
+            val metrics = payload.optJSONObject("contextMetrics") ?: return
+            val roundIndex = metrics.optDouble("roundIndex", 0.0)
+                .let { if (it.isFinite() && it >= 0) it.toInt() else 0 }
+            var metricsFailedConnection: ClientConnection? = null
+            synchronized(session) {
+                if (!isCurrentSession(session) || session.isCompleted) return
+                if (session.contextMetricsRounds.size < 64 || session.contextMetricsRounds.containsKey(roundIndex)) {
+                    session.contextMetricsRounds[roundIndex] = metrics
+                }
+                session.activeConnection?.let { connection ->
+                    val frame = sessionEvent(session, "context_metrics").put("contextMetrics", metrics)
+                    if (!connection.enqueue(frame.toString()) && session.detachConnection(connection)) {
+                        metricsFailedConnection = connection
+                    }
+                }
+            }
+            metricsFailedConnection?.close()
             return
         }
         val choice = payload.optJSONArray("choices")?.optJSONObject(0) ?: return

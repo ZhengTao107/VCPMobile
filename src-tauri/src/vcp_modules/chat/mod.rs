@@ -2,6 +2,7 @@ pub mod ast_diff;
 pub mod aurora_pipeline;
 pub mod chat_manager;
 pub mod content_parser;
+pub mod context_metrics;
 pub mod context_assembler;
 pub mod context_injection;
 pub mod context_sanitizer;
