@@ -2,13 +2,11 @@
 import { computed, onUnmounted, ref, watch } from 'vue';
 import { invoke } from '@tauri-apps/api/core';
 import {
-  LOCAL_PROFILE_NAME,
-  SERVER_PROFILE_NAME,
+  connectionProfileFromSettings,
+  connectionProfilePatch,
   type AppSettings,
   type ChatEndpointMode,
   type ConnectionProfile,
-  type ConnectionProfileMode,
-  type ConnectionProfileName,
 } from '../../../core/stores/settings';
 import SettingsTextField from '../../../components/settings/SettingsTextField.vue';
 import SettingsActionWithStatus from '../../../components/settings/SettingsActionWithStatus.vue';
@@ -78,49 +76,52 @@ onUnmounted(() => {
   previewGeneration += 1;
 });
 
-// ── 连接档案（ptp4g#5）：本机 / 服务器两档 + 档位；null 表示单一地址 ──
-// auto（自动探测回退）已停用：不再供主动选择，仅在现值仍为 auto 时作为旧设置显示，
-// 避免老用户看到无选中项；选到其他档位后该项随之消失。
-const currentProfileMode = computed(() => props.settings.connectionProfileMode ?? null);
-
-const allProfileModes: ReadonlyArray<{
-  value: ConnectionProfileMode | null;
-  title: string;
-  description: string;
-}> = [
-  { value: null, title: '单一地址', description: '使用上方 Chat 服务器 URL 与 API Key（默认）' },
-  { value: 'local', title: '本机', description: '固定使用「本机」档案' },
-  { value: 'server', title: '服务器', description: '固定使用「服务器」档案' },
-  { value: 'auto', title: '自动（旧设置）', description: '优先本机，不可达时临时使用服务器；已停用，改选其他档位后不再显示' },
-];
-
-const profileModes = computed(() =>
-  allProfileModes.filter((option) => option.value !== 'auto' || currentProfileMode.value === 'auto'),
+// ── 连接档案：只是填字段的快捷预设（VCPChat 同一范式），不参与任何请求解析 ──
+// 选用 = 把档案的非空字段写进下面那组正在用的字段并保存；存为 = 把当前字段拷成档案。
+const profiles = computed<ConnectionProfile[]>(() =>
+  Array.isArray(props.settings.connectionProfiles) ? props.settings.connectionProfiles : [],
 );
+const selectedProfileId = ref<string | null>(null);
+const selectedProfile = computed(
+  () => profiles.value.find((profile) => profile.id === selectedProfileId.value) ?? null,
+);
+const newProfileName = ref('');
+const profileStatus = ref('');
 
-const selectProfileMode = (mode: ConnectionProfileMode | null) => {
-  props.settings.connectionProfileMode = mode;
+const applyProfile = () => {
+  const profile = selectedProfile.value;
+  if (!profile) return;
+  Object.assign(props.settings, connectionProfilePatch(profile));
+  profileStatus.value = `已选用「${profile.name}」`;
+  emit('save-request');
 };
 
-const profileList = (): ConnectionProfile[] =>
-  Array.isArray(props.settings.connectionProfiles) ? props.settings.connectionProfiles : [];
+// 同名即覆盖该档案（保留 id），否则新增
+const saveAsProfile = () => {
+  const name = newProfileName.value.trim();
+  if (!name) {
+    profileStatus.value = '请先填写档案名称';
+    return;
+  }
+  const created = connectionProfileFromSettings(props.settings, name);
+  const existing = profiles.value.find((profile) => profile.name === name);
+  props.settings.connectionProfiles = existing
+    ? profiles.value.map((profile) => (profile.id === existing.id ? { ...created, id: existing.id } : profile))
+    : [...profiles.value, created];
+  selectedProfileId.value = existing?.id ?? created.id;
+  newProfileName.value = '';
+  profileStatus.value = existing ? `已更新档案「${name}」` : `已存为档案「${name}」`;
+  emit('save-request');
+};
 
-// 只读渲染不创建档案；首次输入时才写入，避免打开设置页就产生保存补丁。
-const profileField = (name: ConnectionProfileName, field: 'vcpServerUrl' | 'vcpApiKey') =>
-  computed<string>({
-    get: () => profileList().find((profile) => profile.name === name)?.[field] ?? '',
-    set: (value) => {
-      const profiles = profileList();
-      props.settings.connectionProfiles = profiles.some((profile) => profile.name === name)
-        ? profiles.map((profile) => (profile.name === name ? { ...profile, [field]: value } : profile))
-        : [...profiles, { name, vcpServerUrl: '', vcpApiKey: '', [field]: value }];
-    },
-  });
-
-const localUrl = profileField(LOCAL_PROFILE_NAME, 'vcpServerUrl');
-const localKey = profileField(LOCAL_PROFILE_NAME, 'vcpApiKey');
-const serverUrl = profileField(SERVER_PROFILE_NAME, 'vcpServerUrl');
-const serverKey = profileField(SERVER_PROFILE_NAME, 'vcpApiKey');
+const deleteProfile = () => {
+  const profile = selectedProfile.value;
+  if (!profile) return;
+  props.settings.connectionProfiles = profiles.value.filter((item) => item.id !== profile.id);
+  selectedProfileId.value = null;
+  profileStatus.value = `已删除档案「${profile.name}」`;
+  emit('save-request');
+};
 
 interface VcpConnectionTestResult {
   success: boolean;
@@ -164,6 +165,49 @@ const testVcpConnection = async () => {
 
 <template>
   <div class="space-y-5 px-1">
+    <fieldset>
+      <legend class="text-[11px] font-black uppercase tracking-[0.12em] opacity-50 px-0">档案</legend>
+      <div v-if="profiles.length" class="mt-2 divide-y divide-black/5 dark:divide-white/5" role="radiogroup" aria-label="连接档案">
+        <button
+          v-for="profile in profiles"
+          :key="profile.id"
+          type="button"
+          role="radio"
+          :aria-checked="selectedProfileId === profile.id"
+          class="relative w-full py-3 pl-3 pr-2 text-left transition-colors active:bg-black/5 dark:active:bg-white/5"
+          @click="selectedProfileId = profile.id"
+        >
+          <span class="absolute left-0 top-2 bottom-2 w-0.5 bg-blue-500 transition-opacity"
+            :class="selectedProfileId === profile.id ? 'opacity-100' : 'opacity-0'"></span>
+          <span class="block text-sm font-semibold">{{ profile.name }}</span>
+          <span class="mt-0.5 block break-all text-[11px] leading-4 opacity-50">{{ profile.vcpServerUrl || '未填写 Chat URL' }}</span>
+        </button>
+      </div>
+      <p v-else class="mt-2 text-[11px] leading-4 opacity-45">还没有档案。填好下面的连接字段后，可以存为档案以便快速切换。</p>
+      <div class="mt-2 flex gap-2">
+        <button type="button" data-profile-action="apply" :disabled="!selectedProfile"
+          class="flex-1 rounded-lg bg-blue-500 py-2 text-sm font-semibold text-white disabled:opacity-35"
+          @click="applyProfile">选用</button>
+        <button type="button" data-profile-action="delete" :disabled="!selectedProfile"
+          class="rounded-lg border border-black/10 px-4 py-2 text-sm font-semibold text-red-500 disabled:opacity-35 dark:border-white/10"
+          @click="deleteProfile">删除</button>
+      </div>
+      <div class="mt-3 flex items-end gap-2">
+        <div class="min-w-0 flex-1">
+          <SettingsTextField v-model="newProfileName" label="档案名称" placeholder="如：家里 / 公司 / 服务器" />
+        </div>
+        <button type="button" data-profile-action="save"
+          class="shrink-0 rounded-lg border border-black/10 px-3 py-2 text-sm font-semibold dark:border-white/10"
+          @click="saveAsProfile">存为档案</button>
+      </div>
+      <p v-if="profileStatus" class="mt-2 text-[11px] leading-4 opacity-60" data-profile-status>{{ profileStatus }}</p>
+      <p class="mt-2 text-[10px] leading-4 opacity-45">
+        档案只是预设：选用会把档案里非空的字段填进下面正在用的设置并保存，之后所有请求只看下面这组字段。
+      </p>
+    </fieldset>
+
+    <div class="border-t border-black/5 dark:border-white/5 pt-2"></div>
+
     <SettingsTextField v-model="settings.vcpServerUrl" label="Chat 服务器 URL (HTTP/HTTPS)"
       placeholder="https://vcp-endpoint.com" />
 
@@ -210,43 +254,6 @@ const testVcpConnection = async () => {
     </div>
 
     <SettingsTextField v-model="settings.vcpApiKey" is-secure label="API Key" placeholder="输入 API Key" />
-
-    <fieldset class="border-t border-black/5 dark:border-white/5 pt-3">
-      <legend class="text-[11px] font-black uppercase tracking-[0.12em] opacity-50 px-0">连接档案</legend>
-      <div class="mt-2 divide-y divide-black/5 dark:divide-white/5" role="radiogroup" aria-label="连接档案">
-        <button
-          v-for="option in profileModes"
-          :key="option.value ?? 'single'"
-          type="button"
-          role="radio"
-          :aria-checked="currentProfileMode === option.value"
-          class="relative w-full py-3 pl-3 pr-2 text-left transition-colors active:bg-black/5 dark:active:bg-white/5"
-          @click="selectProfileMode(option.value)"
-        >
-          <span class="absolute left-0 top-2 bottom-2 w-0.5 bg-blue-500 transition-opacity"
-            :class="currentProfileMode === option.value ? 'opacity-100' : 'opacity-0'"></span>
-          <span class="flex items-center justify-between gap-3">
-            <span class="min-w-0">
-              <span class="block text-sm font-semibold">{{ option.title }}</span>
-              <span class="mt-0.5 block text-[11px] leading-4 opacity-50">{{ option.description }}</span>
-            </span>
-            <span class="h-3.5 w-3.5 shrink-0 rounded-full border"
-              :class="currentProfileMode === option.value
-                ? 'border-blue-500 bg-blue-500'
-                : 'border-black/20 dark:border-white/25'"></span>
-          </span>
-        </button>
-      </div>
-      <div class="mt-3 space-y-3">
-        <SettingsTextField v-model="localUrl" label="本机 Chat URL" placeholder="http://192.168.1.5:6005" mono />
-        <SettingsTextField v-model="localKey" is-secure label="本机 API Key" placeholder="输入本机 API Key" />
-        <SettingsTextField v-model="serverUrl" label="服务器 Chat URL" placeholder="https://vcp-endpoint.com" mono />
-        <SettingsTextField v-model="serverKey" is-secure label="服务器 API Key" placeholder="输入服务器 API Key" />
-      </div>
-      <p class="mt-2 text-[10px] leading-4 opacity-45">
-        档案影响聊天、模型、表情包、日记、论坛等 VCP 请求，数据同步地址不随之切换；所选档案未填写 URL 时回退到上方单一地址。
-      </p>
-    </fieldset>
 
     <div class="border-t border-black/5 dark:border-white/5 pt-2"></div>
 
