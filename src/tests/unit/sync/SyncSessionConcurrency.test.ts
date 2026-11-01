@@ -227,7 +227,7 @@ describe("sync session ownership", () => {
     await store.close();
   });
 
-  it("keeps a connected sync page mounted when system back is pressed", async () => {
+  it("collapses a connected sync page to background on system back without stopping", async () => {
     const overlay = useOverlayStore();
     const store = useSyncSessionStore();
     overlay.openSyncSession();
@@ -245,11 +245,19 @@ describe("sync session ownership", () => {
 
     window.dispatchEvent(new PopStateEvent("popstate", { state: { vcpMain: true } }));
 
+    expect(overlay.isSyncSessionOpen).toBe(false);
     expect(store.isOpen).toBe(true);
-    expect(overlay.isSyncSessionOpen).toBe(true);
+    expect(store.backgrounded).toBe(true);
+    expect(store.status).toBe("connected");
     expect(
       invokeMock.mock.calls.some(([command]) => command === "stop_sync"),
     ).toBe(false);
+
+    overlay.openSyncSession();
+    expect(overlay.isSyncSessionOpen).toBe(true);
+    expect(store.backgrounded).toBe(false);
+    expect(store.activeSessionId).toBe(11);
+    expect(store.status).toBe("connected");
 
     statusRegistration?.[1]({
       payload: {
@@ -259,6 +267,189 @@ describe("sync session ownership", () => {
       },
     });
     await overlay.closeSyncSession();
+  });
+
+  it("backgrounds a connecting page while start_manual_sync is pending and finalizes on terminal", async () => {
+    const pendingStart = deferred<number>();
+    mockInvoke("plugin:vcp-mobile|get_battery_status", () => ({
+      level: 80,
+      isPowerSaveMode: false,
+    }));
+    mockInvoke("start_manual_sync", () => pendingStart.promise);
+    const add = vi.spyOn(useNotificationStore(), "addNotification");
+
+    const overlay = useOverlayStore();
+    const store = useSyncSessionStore();
+    overlay.openSyncSession();
+    const starting = store.startSync();
+
+    await vi.waitFor(() =>
+      expect(
+        invokeMock.mock.calls.some(
+          ([command]) => command === "start_manual_sync",
+        ),
+      ).toBe(true),
+    );
+    expect(store.status).toBe("connecting");
+    expect(store.canDismiss).toBe(false);
+
+    window.dispatchEvent(
+      new PopStateEvent("popstate", { state: { vcpMain: true } }),
+    );
+
+    expect(overlay.isSyncSessionOpen).toBe(false);
+    expect(store.isOpen).toBe(true);
+    expect(store.backgrounded).toBe(true);
+    expect(
+      invokeMock.mock.calls.some(([command]) => command === "stop_sync"),
+    ).toBe(false);
+
+    emitTauriEvent("vcp-sync-status", { sessionId: 23, status: "open" });
+    expect(store.status).toBe("connecting");
+    pendingStart.resolve(23);
+    await starting;
+    expect(store.status).toBe("connected");
+    expect(
+      invokeMock.mock.calls.some(([command]) => command === "stop_sync"),
+    ).toBe(false);
+
+    emitTauriEvent("vcp-sync-status", {
+      sessionId: 23,
+      status: "error",
+      error: syncError("TEST"),
+    });
+    await vi.waitFor(() => expect(store.isOpen).toBe(false));
+    expect(store.backgrounded).toBe(false);
+    expect(
+      invokeMock.mock.calls.some(([command]) => command === "stop_sync"),
+    ).toBe(true);
+    expect(add).toHaveBeenCalledWith(
+      expect.objectContaining({ id: "sync_background_failed" }),
+    );
+  });
+
+  const startConnectedPanelSync = async (sessionId = 7) => {
+    mockInvoke("start_manual_sync", () => sessionId);
+    const overlay = useOverlayStore();
+    const store = useSyncSessionStore();
+    overlay.openSyncSession();
+    await store.startSync();
+    expect(store.activeSessionId).toBe(sessionId);
+    emitTauriEvent("vcp-sync-status", { sessionId, status: "open" });
+    expect(store.status).toBe("connected");
+    return { overlay, store };
+  };
+  const stopCalls = () =>
+    invokeMock.mock.calls.filter(([command]) => command === "stop_sync").length;
+
+  it("closing the panel during a running sync does not call stop_sync", async () => {
+    const { overlay, store } = await startConnectedPanelSync();
+
+    await overlay.closeSyncSession();
+
+    expect(overlay.isSyncSessionOpen).toBe(false);
+    expect(store.isOpen).toBe(true);
+    expect(store.backgrounded).toBe(true);
+    await Promise.resolve();
+    expect(stopCalls()).toBe(0);
+  });
+
+  it("reopening the panel takes over the backgrounded session with its progress and logs", async () => {
+    const { overlay, store } = await startConnectedPanelSync();
+    emitTauriEvent("vcp-sync-progress", { sessionId: 7, phase: "messages", total: 10, completed: 3 });
+    await overlay.closeSyncSession();
+    const logsBefore = store.logs.length;
+
+    emitTauriEvent("vcp-sync-progress", { sessionId: 7, phase: "messages", total: 10, completed: 6 });
+    expect(store.progressData).toEqual({ phase: "messages", total: 10, completed: 6 });
+
+    overlay.openSyncSession();
+    expect(store.backgrounded).toBe(false);
+    expect(store.activeSessionId).toBe(7);
+    expect(store.status).toBe("connected");
+    expect(store.progressData.completed).toBe(6);
+    expect(store.logs.length).toBeGreaterThanOrEqual(logsBefore);
+    const wrapper = mount(SyncSessionView);
+    expect(wrapper.text()).toContain("6/10");
+    expect(wrapper.text()).toContain("取消同步");
+    expect(stopCalls()).toBe(0);
+  });
+
+  it("only an explicitly confirmed cancel calls stop_sync", async () => {
+    const { overlay, store } = await startConnectedPanelSync();
+
+    const declined = overlay.cancelSyncSession();
+    expect(overlay.confirmConfig).toBeTruthy();
+    overlay.confirmConfig?.onCancel?.();
+    await expect(declined).resolves.toBe(false);
+    expect(store.isOpen).toBe(true);
+    expect(stopCalls()).toBe(0);
+
+    const confirmed = overlay.cancelSyncSession();
+    overlay.confirmConfig?.onConfirm?.();
+    await expect(confirmed).resolves.toBe(true);
+    expect(store.isOpen).toBe(false);
+    expect(overlay.isSyncSessionOpen).toBe(false);
+    expect(stopCalls()).toBe(1);
+  });
+
+  it("refuses to cancel before start_manual_sync returns a session id", async () => {
+    const pendingStart = deferred<number>();
+    mockInvoke("start_manual_sync", () => pendingStart.promise);
+    const store = useSyncSessionStore();
+    store.open();
+    const starting = store.startSync();
+    await vi.waitFor(() =>
+      expect(invokeMock.mock.calls.some(([command]) => command === "start_manual_sync")).toBe(true),
+    );
+
+    await expect(store.cancel()).resolves.toBe(false);
+    expect(store.isOpen).toBe(true);
+    expect(stopCalls()).toBe(0);
+
+    pendingStart.resolve(9);
+    await starting;
+    emitTauriEvent("vcp-sync-status", { sessionId: 9, status: "error", error: syncError("TEST") });
+    await store.close();
+  });
+
+  it("finalizes a backgrounded sync on completion and holds the Android notice only while running", async () => {
+    const { overlay, store } = await startConnectedPanelSync();
+    await vi.waitFor(() =>
+      expect(
+        invokeMock.mock.calls.some(
+          ([command, args]) =>
+            command === "plugin:vcp-mobile|acquire_foreground" &&
+            (args as Record<string, unknown>)?.tag === "sync:ui",
+        ),
+      ).toBe(true),
+    );
+    await overlay.closeSyncSession();
+
+    emitTauriEvent("vcp-sync-completed", {
+      sessionId: 7,
+      status: "completed",
+      summary: {
+        successfulTopics: 0,
+        totalTopics: 0,
+        failedTopics: 0,
+        legacyAttachmentWarnings: 0,
+        failedTopicIds: [],
+      },
+    });
+
+    await vi.waitFor(() => expect(store.isOpen).toBe(false));
+    expect(store.backgrounded).toBe(false);
+    expect(stopCalls()).toBe(1);
+    await vi.waitFor(() =>
+      expect(
+        invokeMock.mock.calls.some(
+          ([command, args]) =>
+            command === "plugin:vcp-mobile|release_foreground" &&
+            (args as Record<string, unknown>)?.tag === "sync:ui",
+        ),
+      ).toBe(true),
+    );
   });
 
   it("shows desktop backend info only for the current connected session", async () => {
@@ -294,52 +485,6 @@ describe("sync session ownership", () => {
       status: "connecting",
     });
     expect(store.desktopInfo).toBeNull();
-  });
-
-  it("keeps a connecting sync page mounted while start_manual_sync is pending", async () => {
-    const pendingStart = deferred<number>();
-    mockInvoke("plugin:vcp-mobile|get_battery_status", () => ({
-      level: 80,
-      isPowerSaveMode: false,
-    }));
-    mockInvoke("start_manual_sync", () => pendingStart.promise);
-
-    const overlay = useOverlayStore();
-    const store = useSyncSessionStore();
-    overlay.openSyncSession();
-    const starting = store.startSync();
-
-    await vi.waitFor(() =>
-      expect(
-        invokeMock.mock.calls.some(
-          ([command]) => command === "start_manual_sync",
-        ),
-      ).toBe(true),
-    );
-    expect(store.status).toBe("connecting");
-    expect(store.canDismiss).toBe(false);
-
-    window.dispatchEvent(
-      new PopStateEvent("popstate", { state: { vcpMain: true } }),
-    );
-
-    expect(store.isOpen).toBe(true);
-    expect(overlay.isSyncSessionOpen).toBe(true);
-    expect(
-      invokeMock.mock.calls.some(([command]) => command === "stop_sync"),
-    ).toBe(false);
-
-    emitTauriEvent("vcp-sync-status", { sessionId: 23, status: "open" });
-    expect(store.status).toBe("connecting");
-    pendingStart.resolve(23);
-    await starting;
-    expect(store.status).toBe("connected");
-    emitTauriEvent("vcp-sync-status", {
-      sessionId: 23,
-      status: "error",
-      error: syncError("TEST"),
-    });
-    await overlay.closeSyncSession();
   });
 
   it.each(["idle", "error", "completed", "completed_with_warnings"] as const)(

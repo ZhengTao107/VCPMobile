@@ -1,5 +1,5 @@
 import { defineStore } from "pinia";
-import { ref } from "vue";
+import { ref, watch } from "vue";
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { useDataReload } from "../composables/useDataReload";
@@ -7,6 +7,7 @@ import { waitUntil } from "../sync/autoSyncTrigger";
 import { useNotificationStore } from "./notification";
 import { isAndroid, isIOS } from "../utils/platform";
 import type { BatteryStatusDto } from "../types/native";
+import { createSyncForegroundNotice, formatSyncNoticeLabel } from "../sync/syncForegroundNotice";
 
 type SyncStatus =
   | "idle"
@@ -401,6 +402,8 @@ export const useSyncSessionStore = defineStore("syncSession", () => {
   let progressLineId: string | null = null;
   // 自动同步的无面板会话；用户打开面板时由 open() 接管并清除。
   const quiet = ref(false);
+  // 手动同步运行中被收起的会话：面板已出栈，会话、监听器与进度照常推进；终态后自动收尾。
+  const backgrounded = ref(false);
   // 自动同步收尾的跳过依据。前端拿不到 Rust 的 modified 话题集合，只能确认“本轮完全无写入”；
   // 任何写入信号（元数据/消息阶段 total>0、会话事件缓冲溢出）都保守视为有变化。
   let changeSignalSeen = false;
@@ -418,9 +421,10 @@ export const useSyncSessionStore = defineStore("syncSession", () => {
     status.value === "completed_with_warnings";
 
   const open = () => {
-    if (isOpen.value && quiet.value) {
-      // 后台自动同步进行中：面板接管当前会话继续展示，不重置状态。
+    if (isOpen.value && (quiet.value || backgrounded.value)) {
+      // 后台会话进行中（自动同步或被收起的手动同步）：面板接管当前会话继续展示，不重置状态。
       quiet.value = false;
+      backgrounded.value = false;
       return;
     }
     const generation = ++viewGeneration;
@@ -461,7 +465,7 @@ export const useSyncSessionStore = defineStore("syncSession", () => {
     setTerminalError(localTerminalError(code, detail));
   };
 
-  const stopAndReload = (quietRun = false): Promise<void> => {
+  const stopAndReload = (quietRun = false, skipUnchanged = quietRun): Promise<void> => {
     if (settlement) return settlement;
     shutdownPending = true;
     const work = (async () => {
@@ -470,8 +474,8 @@ export const useSyncSessionStore = defineStore("syncSession", () => {
       // STOP_PENDING is a rejection above: accepted writes are still draining.
       // Keep this flag across close/reopen until a real stop receipt is available.
       if (needsReload.value) {
-        if (quietRun && noChangeConfirmed) {
-          // 自动同步已确认本轮无任何写入：跳过整页重载，避免当前话题历史清空重建导致闪烁与滚动跳动。
+        if (skipUnchanged && noChangeConfirmed) {
+          // 无人值守的同步（自动或被收起）已确认本轮无任何写入：跳过整页重载，避免当前话题历史清空重建导致闪烁与滚动跳动。
           needsReload.value = false;
           noChangeConfirmed = false;
           return;
@@ -677,10 +681,13 @@ export const useSyncSessionStore = defineStore("syncSession", () => {
     cleanupListeners();
     listenerSetup = null;
     const quietRun = quiet.value;
+    // 无人值守（自动同步或被收起的手动同步）收尾时沿用无写入短路；面板前手动关闭仍整页刷新。
+    const unattended = quietRun || backgrounded.value;
     quiet.value = false;
+    backgrounded.value = false;
 
     try {
-      await stopAndReload(quietRun);
+      await stopAndReload(quietRun, unattended);
     } catch (e) {
       console.warn("[SyncSession] Failed to stop backend sync session:", e);
       if (quietRun) return;
@@ -693,6 +700,30 @@ export const useSyncSessionStore = defineStore("syncSession", () => {
         toastOnly: false,
       });
     }
+  };
+
+  /**
+   * 收起面板但不打断同步：会话转为后台，监听器与状态保持不变，终态后由下方 watch 收尾。
+   * 只在会话不可直接关闭（运行中）时生效并返回 true；可关闭时调用方应走 close()。
+   */
+  const hide = () => {
+    if (!isOpen.value || quiet.value || canDismiss.value) return false;
+    backgrounded.value = true;
+    return true;
+  };
+
+  /**
+   * 显式取消：运行中唯一会调用 stop_sync 的入口（二次确认由调用方负责）。
+   * start_manual_sync 返回会话号之前不允许取消，避免 Rust 侧随后建立无人认领的会话。
+   */
+  const cancel = async () => {
+    if (!isOpen.value || quiet.value) return false;
+    if (status.value !== "connecting" && status.value !== "connected") return false;
+    if (activeSessionId.value === null) return false;
+    pushLog("warning", "已取消同步");
+    canDismiss.value = true;
+    await close();
+    return true;
   };
 
   /**
@@ -732,6 +763,49 @@ export const useSyncSessionStore = defineStore("syncSession", () => {
     if (owned() && canDismiss.value) await close();
     return outcome;
   };
+
+  // 被收起的手动同步到达终态即收尾（stop + 按需刷新），失败也不例外：
+  // 残留 isOpen 会让 runAutoSync 一直 skipped。失败详情保留在同步历史日志中。
+  watch(status, (next) => {
+    if (!backgrounded.value || !isOpen.value || !isTerminal()) return;
+    const notifications = useNotificationStore();
+    if (next === "error") {
+      notifications.addNotification({
+        id: "sync_background_failed",
+        type: "error",
+        title: "同步未完成",
+        message: `${terminalError.value?.message ?? "同步未能完成"} 已写入的数据已保留；打开同步面板可重新同步，详情见历史日志。`,
+        toastOnly: false,
+      });
+      void close();
+      return;
+    }
+    notifications.addNotification({
+      id: "sync_background_completed",
+      type: next === "completed_with_warnings" ? "warning" : "success",
+      title: "同步已完成",
+      message: next === "completed_with_warnings"
+        ? `消息已同步，${summary.value.legacyAttachmentWarnings} 项旧附件信息无法安全识别已跳过；请在电脑端重新发送这些附件后再同步。`
+        : `已同步 ${summary.value.successfulTopics} 个话题。`,
+      toastOnly: next !== "completed_with_warnings",
+    });
+    void close();
+  });
+
+  // Android 通知栏进度：只为用户发起的同步挂文案（自动同步不打扰）；离开运行态即释放。
+  const foregroundNotice = createSyncForegroundNotice();
+  watch(
+    () => {
+      if (!isAndroid || !isOpen.value || quiet.value) return null;
+      if (status.value !== "connecting" && status.value !== "connected") return null;
+      const { phase, completed, total } = progressData.value;
+      return formatSyncNoticeLabel(PHASE_LABELS[phase] ?? "同步处理", completed, total);
+    },
+    (label) => {
+      if (label === null) foregroundNotice.hide();
+      else foregroundNotice.show(label);
+    },
+  );
 
   const readSummary = (value: unknown): SyncSummary | null => {
     if (!value || typeof value !== "object" || Array.isArray(value)) return null;
@@ -1115,6 +1189,7 @@ export const useSyncSessionStore = defineStore("syncSession", () => {
 
   return {
     isOpen,
+    backgrounded,
     canDismiss,
     status,
     activeSessionId,
@@ -1128,6 +1203,8 @@ export const useSyncSessionStore = defineStore("syncSession", () => {
     activeTab,
     open,
     close,
+    hide,
+    cancel,
     startSync,
     retrySync,
     runAutoSync,
