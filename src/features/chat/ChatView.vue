@@ -9,13 +9,14 @@ import { useOverlayStore } from "../../core/stores/overlay";
 import { useAppLifecycleStore } from "../../core/stores/appLifecycle";
 import { useLayoutStore } from "../../core/stores/layout";
 import { useNotificationStore } from "../../core/stores/notification";
+import { useSyncSessionStore } from "../../core/stores/syncSession";
 import MessageRenderer from "./MessageRenderer.vue";
 import InputEnhancer from "./InputEnhancer.vue";
 import TarvenSelector from "./components/TarvenSelector.vue";
 import OpenTabsBar from "./components/OpenTabsBar.vue";
 import VcpAvatar from "../../components/ui/VcpAvatar.vue";
 import CoreStatusIndicator from "../../components/ui/CoreStatusIndicator.vue";
-import { ArrowDown } from "lucide-vue-next";
+import { ArrowDown, RefreshCw } from "lucide-vue-next";
 import { useAttachmentStore } from "../../core/stores/attachmentStore";
 import { useKeyboardInsets } from "../../core/composables/useKeyboardInsets";
 import { useChatScroll } from "../../core/composables/useChatScroll";
@@ -31,6 +32,7 @@ const lifecycleStore = useAppLifecycleStore();
 const layoutStore = useLayoutStore();
 const notificationStore = useNotificationStore();
 const overlayStore = useOverlayStore();
+const syncStore = useSyncSessionStore();
 const { keyboardHeight, forceRecalculate } = useKeyboardInsets();
 
 // 跟踪输入增强组件底部的扩展菜单状态
@@ -283,6 +285,13 @@ onUnmounted(() => {
             <line x1="4.22" y1="19.78" x2="5.64" y2="18.36"></line>
             <line x1="18.36" y1="5.64" x2="19.78" y2="4.22"></line>
           </svg>
+        </button>
+        <!-- 后台同步指示：手动同步被收起后出现，点按重新打开同步面板（接管进行中的会话） -->
+        <button v-if="syncStore.backgrounded" @click="overlayStore.openSyncSession()"
+          class="w-10 h-10 flex items-center justify-center rounded-xl bg-black/5 dark:bg-white/10 active:scale-90 transition-all border border-black/5 dark:border-white/5 relative"
+          aria-label="同步进行中，打开同步面板">
+          <RefreshCw :size="16" class="text-blue-400 animate-spin" />
+          <div class="absolute top-1.5 right-1.5 w-2 h-2 rounded-full border-2 border-[var(--secondary-bg)] bg-blue-500"></div>
         </button>
         <!-- 通知中心按钮 -->
         <button @click="layoutStore.toggleRightDrawer()"

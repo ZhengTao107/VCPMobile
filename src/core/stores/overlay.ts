@@ -127,25 +127,51 @@ export const useOverlayStore = defineStore('overlay', () => {
     const modalId = 'Page:syncSession';
     pageStack.value.push({ type: 'syncSession', id: undefined, modalId });
     registerModal(modalId, () => {
-      // connecting / connected 期间由 sync store 持有不可卸载权；
-      // registerModal 是同步回调，因此必须直接返回 canDismiss 门禁结果。
-      if (!syncStore.canDismiss) return false;
+      // 运行中（不可直接关闭）时系统返回只收起页面，会话转后台继续；registerModal 是同步回调。
+      if (!syncStore.canDismiss) {
+        if (!syncStore.hide()) return false;
+        popPageInternal();
+        return true;
+      }
       void syncStore.close();
       popPageInternal();
       return true;
     });
   };
 
-  const closeSyncSession = async () => {
-    if (!isSyncSessionOpen.value) return;
-    const syncStore = useSyncSessionStore();
-    if (!syncStore.canDismiss) return;
-    await syncStore.close();
+  const popSyncSessionPage = () => {
     const top = pageStack.value[pageStack.value.length - 1];
     if (top?.type === 'syncSession') {
       unregisterModal(top.modalId);
       pageStack.value.pop();
     }
+  };
+
+  const closeSyncSession = async () => {
+    if (!isSyncSessionOpen.value) return;
+    const syncStore = useSyncSessionStore();
+    if (!syncStore.canDismiss) {
+      // 运行中关闭 = 收起：不 stop_sync，终态后由 sync store 自行收尾刷新。
+      if (syncStore.hide()) popSyncSessionPage();
+      return;
+    }
+    await syncStore.close();
+    popSyncSessionPage();
+  };
+
+  // 显式取消运行中的同步：唯一会中断会话的界面入口，二次确认后才 stop_sync。
+  const cancelSyncSession = async () => {
+    if (!isSyncSessionOpen.value) return false;
+    const syncStore = useSyncSessionStore();
+    const ok = await showConfirm({
+      title: '取消同步',
+      message: '已写入的数据会保留，下次同步会跳过已完成的话题。确认取消本次同步？',
+      isDanger: true,
+    });
+    if (!ok) return false;
+    if (!(await syncStore.cancel())) return false;
+    popSyncSessionPage();
+    return true;
   };
 
   // --- Rebuild Session ---
@@ -415,6 +441,7 @@ export const useOverlayStore = defineStore('overlay', () => {
     openGroupSettings,
     closeGroupSettings,
     openSyncSession,
+    cancelSyncSession,
     closeSyncSession,
     openRebuildSession,
     closeRebuildSession,

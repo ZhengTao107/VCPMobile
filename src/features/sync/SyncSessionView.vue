@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed, ref, watch, nextTick } from 'vue';
-import { X, Play, RotateCcw, Copy, Check } from 'lucide-vue-next';
+import { X, Play, RotateCcw, Copy, Check, ChevronDown, Square } from 'lucide-vue-next';
 import SlidePage from '../../components/ui/SlidePage.vue';
 import SyncLogBrowserCore from '../../features/settings/components/SyncLogBrowserCore.vue';
 import { useSyncSessionStore } from '../../core/stores/syncSession';
@@ -136,8 +136,16 @@ const logColor = (level: string) => {
   }
 };
 
+// 运行中点关闭 = 收起到后台（同步继续）；可关闭时照常关闭并刷新。
 const handleClose = async () => {
   await overlayStore.closeSyncSession();
+};
+
+// 取消只在拿到会话号后可用：start 在途时 stop_sync 会让随后建立的会话无人认领。
+const canCancel = computed(() => isSyncing.value && store.activeSessionId !== null);
+const handleCancel = async () => {
+  if (!canCancel.value) return;
+  await overlayStore.cancelSyncSession();
 };
 
 import SettingsSwitch from '../../components/settings/SettingsSwitch.vue';
@@ -250,13 +258,13 @@ const handlePrerenderToggle = async (val: boolean) => {
             </nav>
           </div>
           <button
-            v-if="store.canDismiss"
             type="button"
-            aria-label="关闭同步面板"
+            :aria-label="store.canDismiss ? '关闭同步面板' : '收起同步面板，同步在后台继续'"
             class="-mr-2 flex h-11 w-11 shrink-0 items-center justify-center text-gray-400 transition-colors active:text-white"
             @click="handleClose()"
           >
-            <X :size="20" />
+            <X v-if="store.canDismiss" :size="20" />
+            <ChevronDown v-else :size="20" />
           </button>
         </div>
       </header>
@@ -477,12 +485,22 @@ const handlePrerenderToggle = async (val: boolean) => {
         <div class="text-[9px] opacity-30 font-bold tracking-[0.2em] uppercase">
           <span v-if="store.status === 'idle'">选择上方操作以继续</span>
           <span v-else-if="store.status === 'connecting'">正在建立神经同步通道...</span>
-          <span v-else-if="store.status === 'connected'">同步进行中</span>
+          <span v-else-if="store.status === 'connected'">同步进行中 · 可收起到后台</span>
           <span v-else-if="store.status === 'completed'">同步已完成</span>
           <span v-else-if="store.status === 'completed_with_warnings'">同步完成，部分附件信息需处理</span>
           <span v-else-if="store.status === 'error'">同步未完成</span>
         </div>
         <div v-if="store.activeTab === 'live'" class="flex items-center gap-2">
+          <button
+            v-if="isSyncing"
+            type="button"
+            :disabled="!canCancel"
+            @click="handleCancel()"
+            class="flex items-center gap-1 border-l-2 border-red-400 px-2 py-1 text-[10px] text-red-300 disabled:opacity-30"
+          >
+            <Square :size="11" />
+            取消同步
+          </button>
           <button
             v-if="canRetry"
             :disabled="store.retryInFlight"
@@ -492,18 +510,6 @@ const handlePrerenderToggle = async (val: boolean) => {
             <RotateCcw :size="12" :class="{ 'animate-spin': store.retryInFlight }" />
             {{ retryLabel }}
           </button>
-        </div>
-      </div>
-
-      <!-- 全局遮罩层（连接成功后激活，阻止误触） -->
-      <div v-if="store.status === 'connected'"
-           class="absolute inset-0 bg-black/20 z-10 flex flex-col justify-end pointer-events-auto"
-           style="touch-action: none;">
-        <div class="pb-8 text-center">
-          <div class="inline-flex items-center gap-2 px-4 py-2 rounded-full bg-black/60 text-white/90 text-xs font-bold tracking-wider">
-            <div class="w-1.5 h-1.5 rounded-full bg-blue-400 animate-pulse"></div>
-            同步进行中 — 请勿退出
-          </div>
         </div>
       </div>
     </div>
