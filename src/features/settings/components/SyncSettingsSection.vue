@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref } from "vue";
+import { computed, ref } from "vue";
 import { invoke } from "@tauri-apps/api/core";
 import type { AppSettings } from "../../../core/stores/settings";
 import { useOverlayStore } from "../../../core/stores/overlay";
@@ -7,10 +7,20 @@ import SettingsTextField from "../../../components/settings/SettingsTextField.vu
 import SettingsActionButton from "../../../components/settings/SettingsActionButton.vue";
 import SettingsActionWithStatus from "../../../components/settings/SettingsActionWithStatus.vue";
 import SettingsRow from "../../../components/settings/SettingsRow.vue";
+import SettingsSwitch from "../../../components/settings/SettingsSwitch.vue";
 
-defineProps<{
+const props = defineProps<{
   settings: AppSettings;
 }>();
+
+// 与 autoSyncTrigger.isAutoSyncReady 同口径：缺省视为开启，只有显式 false 关闭。
+// 只读渲染不写字段，避免打开设置页就产生保存补丁。
+const autoSyncEnabled = computed<boolean>({
+  get: () => props.settings.autoSync !== false,
+  set: (value) => {
+    props.settings.autoSync = value;
+  },
+});
 
 const overlayStore = useOverlayStore();
 
@@ -67,6 +77,15 @@ const rebuildEmoticonLibrary = async () => {
       mono
     />
 
+    <SettingsRow
+      title="自动同步"
+      description="消息完成、回到前台或联网后自动同步；需已填写同步地址与 Token"
+      data-setting="autoSync"
+    >
+      <template #action>
+        <SettingsSwitch v-model="autoSyncEnabled" />
+      </template>
+    </SettingsRow>
     <div class="border-t border-black/5 dark:border-white/5 pt-2 space-y-4">
       <SettingsTextField
         v-model="settings.fileKey"
