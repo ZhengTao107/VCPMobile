@@ -46,6 +46,8 @@ interface SystemSnapshotDto {
 
 const CONNECT_TIMEOUT_MS = 15000;
 const NOTIFICATION_INTRO_KEY = 'vcp_ios_notification_intro_v1';
+// [fork ptp4g#9] Android 权限引导"稍后再说"的记忆，仅记录用户选择，不代表系统授权。
+const ANDROID_PERMISSION_SKIP_KEY = 'vcp_android_permission_skip_v1';
 
 export const useAppLifecycleStore = defineStore('appLifecycle', () => {
   const state = ref<AppState>('BOOTING');
@@ -73,6 +75,7 @@ export const useAppLifecycleStore = defineStore('appLifecycle', () => {
   let coreReadyUnlisten: (() => void) | null = null;
   let connectTimeoutId: ReturnType<typeof setTimeout> | null = null;
   let optionalNotificationIntroDismissed = false;
+  let androidPermissionGateSkipped = false;
 
   const hasSeenNotificationIntroduction = () => {
     if (optionalNotificationIntroDismissed) return true;
@@ -80,6 +83,24 @@ export const useAppLifecycleStore = defineStore('appLifecycle', () => {
       return localStorage.getItem(NOTIFICATION_INTRO_KEY) === 'seen';
     } catch {
       return false;
+    }
+  };
+
+  const hasSkippedAndroidPermissionGate = () => {
+    if (androidPermissionGateSkipped) return true;
+    try {
+      return localStorage.getItem(ANDROID_PERMISSION_SKIP_KEY) === 'skipped';
+    } catch {
+      return false;
+    }
+  };
+
+  const clearAndroidPermissionSkip = () => {
+    androidPermissionGateSkipped = false;
+    try {
+      localStorage.removeItem(ANDROID_PERMISSION_SKIP_KEY);
+    } catch {
+      // 存储不可用时只影响下次是否再次展示引导页
     }
   };
 
@@ -367,13 +388,25 @@ export const useAppLifecycleStore = defineStore('appLifecycle', () => {
             const listenerRes = await invoke<ListenerPermissionDto>('plugin:vcp-mobile|check_notification_listener_permission');
             bootMark('fe:permissions_done');
             if (!pStatus.notification || !pStatus.battery || !listenerRes.enabled) {
-              console.log('[Lifecycle] Missing keep-alive critical permissions, entering permission gate');
-              // 仅在确认缺失权限时才将状态设为 PERMISSIONS，避免权限完整时引导页一闪而过
-              setState('PERMISSIONS', '权限缺失，展示引导界面');
-              // 清除 Promise，以便用户在引导页点击“激活并进入应用”时能重新触发
-              bootstrapPromise = null;
-              isBootstrapping.value = false;
-              return;
+              if (!hasSkippedAndroidPermissionGate()) {
+                console.log('[Lifecycle] Missing keep-alive critical permissions, entering permission gate');
+                // 仅在确认缺失权限时才将状态设为 PERMISSIONS，避免权限完整时引导页一闪而过
+                setState('PERMISSIONS', '权限缺失，展示引导界面');
+                // 清除 Promise，以便用户在引导页点击“激活并进入应用”或“稍后再说”时能重新触发
+                bootstrapPromise = null;
+                isBootstrapping.value = false;
+                return;
+              }
+              // [fork ptp4g#9] 用户已选择稍后再说：放行，常驻提示后台保活未就绪。
+              notificationStore.addNotification({
+                id: 'startup_permission_skipped',
+                title: '后台保活权限未开启',
+                message: '已跳过权限引导，前台可正常使用；切到后台时 AI 回复可能中断。需要时请在系统设置中为 VCP 开启通知、通知访问与电池无限制。',
+                type: 'warning',
+                duration: 0,
+              });
+            } else {
+              clearAndroidPermissionSkip();
             }
           } catch (e) {
             // 权限检查异常时仍允许前台使用，以常驻通知说明后台能力尚未确认。
@@ -436,6 +469,15 @@ export const useAppLifecycleStore = defineStore('appLifecycle', () => {
         localStorage.setItem(NOTIFICATION_INTRO_KEY, 'seen');
       } catch (cause) {
         console.warn('[Lifecycle] Could not remember notification introduction:', cause);
+      }
+    }
+    if (isAndroid) {
+      // [fork ptp4g#9] 记录用户已选择进入；权限仍缺失时以后启动不再拦门，只常驻提示。
+      androidPermissionGateSkipped = true;
+      try {
+        localStorage.setItem(ANDROID_PERMISSION_SKIP_KEY, 'skipped');
+      } catch (cause) {
+        console.warn('[Lifecycle] Could not remember Android permission skip:', cause);
       }
     }
     return bootstrap(true);
