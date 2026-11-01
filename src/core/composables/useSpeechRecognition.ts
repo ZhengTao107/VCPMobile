@@ -1,5 +1,5 @@
 import { ref, computed } from 'vue';
-import { useSettingsStore } from '../stores/settings';
+import { getEffectiveVcpConnection } from '../utils/effectiveVcpConnection';
 import { useAudioRecorder } from './useAudioRecorder';
 import { isAndroid } from '../utils/platform';
 
@@ -120,7 +120,6 @@ export async function transcribeViaBackend(blob: Blob, opts: BackendTranscribeOp
 }
 
 export function useSpeechRecognition() {
-  const settingsStore = useSettingsStore();
   const { isRecording, startRecording, stopRecording, cancelRecording } = useAudioRecorder();
 
   const isListening = ref(false);
@@ -254,8 +253,9 @@ export function useSpeechRecognition() {
     const recordResult = await stopRecording();
     if (!recordResult) return { ok: false, error: '未获取到录音数据，请重试' };
 
-    const serverUrl = settingsStore.settings?.vcpServerUrl;
-    const apiKey = settingsStore.settings?.vcpApiKey;
+    const connection = await getEffectiveVcpConnection();
+    const serverUrl = connection?.vcpServerUrl;
+    const apiKey = connection?.vcpApiKey;
     if (!serverUrl || !apiKey) {
       console.warn('[SpeechRecognition] Server settings missing for backend transcription.');
       return { ok: false, error: '未配置 VCP 服务器地址或 API 密钥，无法完成识别' };

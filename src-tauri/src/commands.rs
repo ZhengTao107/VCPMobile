@@ -122,6 +122,9 @@ macro_rules! app_command_handler {
             get_active_generations, interruptGroupTurn, interruptRequest, preview_chat_endpoint,
             recover_active_generation, sendToVCP, test_vcp_connection,
         };
+        use crate::vcp_modules::infra::connection_resolver::{
+            get_effective_vcp_connection, refresh_connection_probe,
+        };
         use crate::vcp_modules::vcp_info_service::{
             clear_vcp_info, get_vcp_info_connection_status, get_vcp_info_metadata_list,
             get_vcp_info_payload, init_vcp_info_connection,
@@ -189,6 +192,9 @@ macro_rules! app_command_handler {
                 recover_active_generation,
                 sendToVCP,
                 test_vcp_connection,
+                // ── 连接档案（connection_resolver）──
+                get_effective_vcp_connection,
+                refresh_connection_probe,
                 // ── 话题（topic_service）──
                 create_topic,
                 delete_topic,

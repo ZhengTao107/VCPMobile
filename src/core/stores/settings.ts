@@ -5,11 +5,27 @@ import { useNotificationStore } from "./notification";
 
 export type ChatEndpointMode = "standard" | "vcpTools" | "raw";
 
+/** 连接档案档位；缺失或 null 时沿用 vcpServerUrl / vcpApiKey（单一地址）。 */
+export type ConnectionProfileMode = "local" | "server" | "auto";
+export type ConnectionProfileName = "本机" | "服务器";
+export const LOCAL_PROFILE_NAME: ConnectionProfileName = "本机";
+export const SERVER_PROFILE_NAME: ConnectionProfileName = "服务器";
+
+/** 与桌面端 connectionProfiles.js 同名字段；手机端固定「本机」「服务器」两档。 */
+export interface ConnectionProfile {
+  name: string;
+  vcpServerUrl: string;
+  vcpApiKey: string;
+}
+
 export interface AppSettings {
   userName: string;
   vcpServerUrl: string;
   chatEndpointMode: ChatEndpointMode;
   vcpApiKey: string;
+  /** 由 Rust connection_resolver 解析为当前生效端点；同步地址不受影响。 */
+  connectionProfileMode?: ConnectionProfileMode | null;
+  connectionProfiles?: ConnectionProfile[];
   vcpLogUrl: string;
   vcpLogKey: string;
   syncServerUrl: string;

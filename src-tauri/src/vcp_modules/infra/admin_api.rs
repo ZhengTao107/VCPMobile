@@ -12,7 +12,7 @@ use reqwest::{Method, RequestBuilder, Url};
 
 /// 校验 admin_api 所需的配置齐备（Server URL + 管理员凭据）。
 pub fn ensure_admin_config(settings: &Settings, feature_label: &str) -> Result<(), String> {
-    normalize_server_base(&settings.vcp_server_url)?;
+    normalize_server_base(&super::connection_resolver::resolve_vcp_connection(settings).0)?;
     if settings.admin_username.trim().is_empty() || settings.admin_password.is_empty() {
         return Err(format!(
             "{feature_label}需要管理员用户名与密码，请在 设置 → 用户档案 或 设置 → 数据同步 中填写"
@@ -67,7 +67,8 @@ pub fn append_url_segments(url: &mut Url, segments: &[&str]) -> Result<(), Strin
 
 /// 构造指向 `/admin_api/<suffix...>` 的 URL。
 pub fn admin_url(settings: &Settings, suffix: &[&str]) -> Result<Url, String> {
-    let mut url = normalize_server_base(&settings.vcp_server_url)?;
+    let mut url =
+        normalize_server_base(&super::connection_resolver::resolve_vcp_connection(settings).0)?;
     append_url_segments(&mut url, &["admin_api"])?;
     append_url_segments(&mut url, suffix)?;
     Ok(url)
