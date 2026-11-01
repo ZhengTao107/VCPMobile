@@ -434,7 +434,7 @@ async fn finalize_high_speed_upload<R: Runtime>(
     .await
 }
 
-async fn install_verified_upload(
+pub(crate) async fn install_verified_upload(
     temp_path: &std::path::Path,
     dest_path: &std::path::Path,
     expected_size: u64,
