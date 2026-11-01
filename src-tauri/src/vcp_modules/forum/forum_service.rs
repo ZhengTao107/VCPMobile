@@ -123,7 +123,9 @@ async fn settings_of<R: Runtime>(
     app_handle: AppHandle<R>,
     settings_state: State<'_, SettingsState>,
 ) -> Result<Settings, String> {
-    let settings = read_settings(app_handle, settings_state).await?;
+    let settings = crate::vcp_modules::infra::connection_resolver::resolved_settings(
+        read_settings(app_handle, settings_state).await?,
+    );
     admin_api::ensure_admin_config(&settings, "VCP 论坛")?;
     Ok(settings)
 }

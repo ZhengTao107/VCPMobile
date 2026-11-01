@@ -1,7 +1,15 @@
 <script setup lang="ts">
-import { onUnmounted, ref, watch } from 'vue';
+import { computed, onUnmounted, ref, watch } from 'vue';
 import { invoke } from '@tauri-apps/api/core';
-import type { AppSettings, ChatEndpointMode } from '../../../core/stores/settings';
+import {
+  LOCAL_PROFILE_NAME,
+  SERVER_PROFILE_NAME,
+  type AppSettings,
+  type ChatEndpointMode,
+  type ConnectionProfile,
+  type ConnectionProfileMode,
+  type ConnectionProfileName,
+} from '../../../core/stores/settings';
 import SettingsTextField from '../../../components/settings/SettingsTextField.vue';
 import SettingsActionWithStatus from '../../../components/settings/SettingsActionWithStatus.vue';
 
@@ -69,6 +77,43 @@ onUnmounted(() => {
   if (previewTimer) clearTimeout(previewTimer);
   previewGeneration += 1;
 });
+
+// ── 连接档案（ptp4g#5）：本机 / 服务器两档 + 档位；null 表示单一地址 ──
+const profileModes: ReadonlyArray<{
+  value: ConnectionProfileMode | null;
+  title: string;
+  description: string;
+}> = [
+  { value: null, title: '单一地址', description: '使用上方 Chat 服务器 URL 与 API Key（默认）' },
+  { value: 'local', title: '本机', description: '固定使用「本机」档案' },
+  { value: 'server', title: '服务器', description: '固定使用「服务器」档案' },
+  { value: 'auto', title: '自动', description: '优先本机；本机不可达时临时使用服务器' },
+];
+
+const currentProfileMode = computed(() => props.settings.connectionProfileMode ?? null);
+const selectProfileMode = (mode: ConnectionProfileMode | null) => {
+  props.settings.connectionProfileMode = mode;
+};
+
+const profileList = (): ConnectionProfile[] =>
+  Array.isArray(props.settings.connectionProfiles) ? props.settings.connectionProfiles : [];
+
+// 只读渲染不创建档案；首次输入时才写入，避免打开设置页就产生保存补丁。
+const profileField = (name: ConnectionProfileName, field: 'vcpServerUrl' | 'vcpApiKey') =>
+  computed<string>({
+    get: () => profileList().find((profile) => profile.name === name)?.[field] ?? '',
+    set: (value) => {
+      const profiles = profileList();
+      props.settings.connectionProfiles = profiles.some((profile) => profile.name === name)
+        ? profiles.map((profile) => (profile.name === name ? { ...profile, [field]: value } : profile))
+        : [...profiles, { name, vcpServerUrl: '', vcpApiKey: '', [field]: value }];
+    },
+  });
+
+const localUrl = profileField(LOCAL_PROFILE_NAME, 'vcpServerUrl');
+const localKey = profileField(LOCAL_PROFILE_NAME, 'vcpApiKey');
+const serverUrl = profileField(SERVER_PROFILE_NAME, 'vcpServerUrl');
+const serverKey = profileField(SERVER_PROFILE_NAME, 'vcpApiKey');
 
 interface VcpConnectionTestResult {
   success: boolean;
@@ -158,6 +203,43 @@ const testVcpConnection = async () => {
     </div>
 
     <SettingsTextField v-model="settings.vcpApiKey" is-secure label="API Key" placeholder="输入 API Key" />
+
+    <fieldset class="border-t border-black/5 dark:border-white/5 pt-3">
+      <legend class="text-[11px] font-black uppercase tracking-[0.12em] opacity-50 px-0">连接档案</legend>
+      <div class="mt-2 divide-y divide-black/5 dark:divide-white/5" role="radiogroup" aria-label="连接档案">
+        <button
+          v-for="option in profileModes"
+          :key="option.value ?? 'single'"
+          type="button"
+          role="radio"
+          :aria-checked="currentProfileMode === option.value"
+          class="relative w-full py-3 pl-3 pr-2 text-left transition-colors active:bg-black/5 dark:active:bg-white/5"
+          @click="selectProfileMode(option.value)"
+        >
+          <span class="absolute left-0 top-2 bottom-2 w-0.5 bg-blue-500 transition-opacity"
+            :class="currentProfileMode === option.value ? 'opacity-100' : 'opacity-0'"></span>
+          <span class="flex items-center justify-between gap-3">
+            <span class="min-w-0">
+              <span class="block text-sm font-semibold">{{ option.title }}</span>
+              <span class="mt-0.5 block text-[11px] leading-4 opacity-50">{{ option.description }}</span>
+            </span>
+            <span class="h-3.5 w-3.5 shrink-0 rounded-full border"
+              :class="currentProfileMode === option.value
+                ? 'border-blue-500 bg-blue-500'
+                : 'border-black/20 dark:border-white/25'"></span>
+          </span>
+        </button>
+      </div>
+      <div class="mt-3 space-y-3">
+        <SettingsTextField v-model="localUrl" label="本机 Chat URL" placeholder="http://192.168.1.5:6005" mono />
+        <SettingsTextField v-model="localKey" is-secure label="本机 API Key" placeholder="输入本机 API Key" />
+        <SettingsTextField v-model="serverUrl" label="服务器 Chat URL" placeholder="https://vcp-endpoint.com" mono />
+        <SettingsTextField v-model="serverKey" is-secure label="服务器 API Key" placeholder="输入服务器 API Key" />
+      </div>
+      <p class="mt-2 text-[10px] leading-4 opacity-45">
+        档案影响聊天、模型、表情包、日记、论坛等 VCP 请求，数据同步地址不随之切换；所选档案未填写 URL 时回退到上方单一地址。
+      </p>
+    </fieldset>
 
     <div class="border-t border-black/5 dark:border-white/5 pt-2"></div>
 

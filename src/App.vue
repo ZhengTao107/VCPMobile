@@ -19,6 +19,7 @@ import { useAutoUpdate } from "./core/composables/useAutoUpdate";
 import { useChatSessionStore } from "./core/stores/chatSessionStore";
 import { useAssistantStore } from "./core/stores/assistant";
 import { useAppLifecycle } from "./core/composables/useAppLifecycle";
+import { useConnectionProbe } from "./core/composables/useConnectionProbe";
 import { retainNativeInsetsBridge } from "./core/composables/useKeyboardInsets";
 import { LatestIntentOwner } from "./core/utils/latestIntentOwner";
 import {
@@ -30,6 +31,8 @@ import type { AgentListItemDto, TopicDto } from "./core/types/assistant";
 
 // 初始化应用生命周期监听
 useAppLifecycle();
+// 连接档案 auto 档：触发本机探测并在回退到服务器时提示一次
+useConnectionProbe();
 // 根组件持有唯一的原生 Insets 桥，确保编辑器尚未挂载时四边安全区也已生效。
 const releaseNativeInsetsBridge = retainNativeInsetsBridge();
 

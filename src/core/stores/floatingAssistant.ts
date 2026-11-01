@@ -2,6 +2,7 @@ import { defineStore } from "pinia";
 import { ref } from "vue";
 import type { ChatMessage, StreamEventDto } from "../types/chat";
 import type { AppSettings } from "./settings";
+import { getEffectiveVcpConnection } from "../utils/effectiveVcpConnection";
 
 interface Toast {
   id: string;
@@ -271,7 +272,9 @@ export const useFloatingAssistantStore = defineStore("floatingAssistant", () => 
       return;
     }
 
-    if (!settings.vcpServerUrl || !settings.vcpApiKey) {
+    // 主应用内按生效端点判断；浮窗模式经 WS 交给主应用，只能看到下发的单一地址
+    const connection = isFloatingMode.value ? settings : await getEffectiveVcpConnection();
+    if (!connection?.vcpServerUrl || !connection?.vcpApiKey) {
       addToast("error", "VCP 连接未配置", "请在主应用设置中填写服务器地址和 API Key");
       return;
     }

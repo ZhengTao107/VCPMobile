@@ -186,7 +186,9 @@ pub async fn refresh_emoticon_library_internal<R: Runtime>(
 
     // 1. 获取配置
     let settings_state = app_handle.state::<SettingsState>();
-    let settings = read_settings(app_handle.clone(), settings_state).await?;
+    let settings = crate::vcp_modules::infra::connection_resolver::resolved_settings(
+        read_settings(app_handle.clone(), settings_state).await?,
+    );
     let vcp_server_url = settings.vcp_server_url;
     let admin_user = settings.admin_username;
     let admin_pass = settings.admin_password;

@@ -214,16 +214,18 @@ pub fn freeze_chat_connection(
     settings: &Settings,
     purpose: ChatRequestPurpose,
 ) -> Result<ChatConnectionSnapshot, String> {
-    if settings.vcp_server_url.is_empty() {
+    let (vcp_server_url, vcp_api_key) =
+        super::connection_resolver::resolve_vcp_connection(settings);
+    if vcp_server_url.is_empty() {
         return Err("VCP Server URL is not configured.".to_string());
     }
     Ok(ChatConnectionSnapshot {
         endpoint_url: resolve_chat_endpoint(
-            &settings.vcp_server_url,
+            &vcp_server_url,
             settings.chat_endpoint_mode,
             purpose,
         )?,
-        api_key: settings.vcp_api_key.clone(),
+        api_key: vcp_api_key,
     })
 }
 
@@ -1879,7 +1881,10 @@ async fn handle_streaming_request<R: Runtime>(
                 .header(AUTHORIZATION, format!("Bearer {api_key}"))
                 .header(CONTENT_TYPE, "application/json")
                 .json(&request_body)
-                .send() => response.map_err(|error| error.to_string())?,
+                .send() => response.map_err(|error| {
+                    super::connection_resolver::report_connect_failure(final_url, &error);
+                    error.to_string()
+                })?,
         };
         if !response.status().is_success() {
             return Err(format!("VCP Error: {}", response.status()).into());
@@ -2154,6 +2159,7 @@ async fn handle_non_streaming_request(
             match res {
                 Ok(resp) => resp,
                 Err(e) => {
+                    super::connection_resolver::report_connect_failure(final_url, &e);
                     let err_msg = format!("VCP请求失败: {}", e);
                     return Err(err_msg);
                 }
