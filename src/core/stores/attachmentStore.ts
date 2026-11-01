@@ -38,8 +38,10 @@ const checkImageDimensions = (file: File): Promise<{ width: number; height: numb
   });
 };
 
-/** 原生多选默认上限；Kotlin/Rust 另有 16 的硬上限 */
-export const NATIVE_PICK_MAX_ITEMS = 9;
+/** 原生多选上限；与 Kotlin/Rust MAX_PICK_FILES 一致（Android 13+ 照片选择器另受系统上限约束） */
+export const NATIVE_PICK_MAX_ITEMS = 100;
+/** 一次导入超过该数量时提示 token 消耗，不拦截发送 */
+export const NATIVE_PICK_TOKEN_HINT_THRESHOLD = 20;
 /**
  * 原生 picker 空闲熔断：每收到一个原生事件即续期。
  * Kotlin 转码阶段最长 300s 且期间不发进度事件，因此留出余量。
@@ -586,6 +588,14 @@ export const useAttachmentStore = defineStore("attachment", () => {
             type: "warning",
             title: "已达选择上限",
             message: `单次最多 ${pickArgs.maxItems ?? NATIVE_PICK_MAX_ITEMS} 个，已忽略 ${pickResult.skipped} 个`,
+            toastOnly: true,
+          });
+        }
+        if (pickResult.files.length > NATIVE_PICK_TOKEN_HINT_THRESHOLD) {
+          notificationStore.addNotification({
+            type: "info",
+            title: "附件较多",
+            message: `本次选择了 ${pickResult.files.length} 个，图片较多，token 消耗会明显增加`,
             toastOnly: true,
           });
         }

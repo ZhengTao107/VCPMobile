@@ -1,7 +1,12 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { createPinia, setActivePinia } from "pinia";
 import { mockInvoke } from "../../mocks/tauri";
-import { nativePickArgs, useAttachmentStore } from "../../../core/stores/attachmentStore";
+import {
+  NATIVE_PICK_MAX_ITEMS,
+  NATIVE_PICK_TOKEN_HINT_THRESHOLD,
+  nativePickArgs,
+  useAttachmentStore,
+} from "../../../core/stores/attachmentStore";
 
 const { addNotification } = vi.hoisted(() => ({ addNotification: vi.fn() }));
 
@@ -74,7 +79,7 @@ describe("attachmentStore native multi-pick", () => {
     const store = useAttachmentStore();
     await store.handleAttachment("gallery");
 
-    expect(pickArgs).toEqual({ mode: "gallery", multiple: true, maxItems: 9 });
+    expect(pickArgs).toEqual({ mode: "gallery", multiple: true, maxItems: NATIVE_PICK_MAX_ITEMS });
     expect(store.stagedAttachments).toHaveLength(3);
     expect(new Set(store.stagedAttachments.map((a) => a.id)).size).toBe(3);
     expect(store.stagedAttachments.every((a) => a.status === "done")).toBe(true);
@@ -180,6 +185,7 @@ describe("attachmentStore native multi-pick", () => {
     const { title, message, toastOnly } = addNotification.mock.calls[0][0];
     expect(title).toBe("已达选择上限");
     expect(String(message)).toContain("已忽略 3 个");
+    expect(String(message)).toContain(`单次最多 ${NATIVE_PICK_MAX_ITEMS} 个`);
     expect(toastOnly).toBe(true);
   });
 
@@ -204,7 +210,7 @@ describe("attachmentStore native multi-pick", () => {
   it("never requests multi-select for avatar or camera", () => {
     expect(nativePickArgs("avatar")).toEqual({ mode: "avatar" });
     expect(nativePickArgs("camera")).toEqual({ mode: "camera" });
-    expect(nativePickArgs("file")).toEqual({ mode: "file", multiple: true, maxItems: 9 });
+    expect(nativePickArgs("file")).toEqual({ mode: "file", multiple: true, maxItems: NATIVE_PICK_MAX_ITEMS });
   });
 
   it("drops staged cards silently when the picker is cancelled", async () => {
@@ -216,6 +222,50 @@ describe("attachmentStore native multi-pick", () => {
     await store.handleAttachment("gallery");
 
     expect(store.stagedAttachments).toHaveLength(0);
+    expect(addNotification).not.toHaveBeenCalled();
+  });
+
+  it("defaults multi-pick to the shared native cap of 100", () => {
+    expect(NATIVE_PICK_MAX_ITEMS).toBe(100);
+    expect(nativePickArgs("gallery")).toEqual({ mode: "gallery", multiple: true, maxItems: 100 });
+  });
+
+  const manyEntries = (n: number) =>
+    Array.from({ length: n }, (_, i): [string, string] => [`t${i}`, `p${i}.png`]);
+
+  it("hints token cost above the threshold without blocking staging", async () => {
+    const entries = manyEntries(NATIVE_PICK_TOKEN_HINT_THRESHOLD + 1);
+    mockInvoke(PICK, () => {
+      startAll(entries);
+      return batch(entries.map(([t, n]) => picked(t, n)));
+    });
+    mockInvoke("register_local_file", async (args) => registered(args));
+
+    const store = useAttachmentStore();
+    await store.handleAttachment("gallery");
+
+    expect(store.stagedAttachments).toHaveLength(entries.length);
+    expect(store.stagedAttachments.every((a) => a.status === "done")).toBe(true);
+    expect(addNotification).toHaveBeenCalledTimes(1);
+    const { type, message, toastOnly } = addNotification.mock.calls[0][0];
+    expect(type).toBe("info");
+    expect(String(message)).toContain(`${entries.length} 个`);
+    expect(String(message)).toContain("token 消耗会明显增加");
+    expect(toastOnly).toBe(true);
+  });
+
+  it("stays quiet at exactly the token hint threshold", async () => {
+    const entries = manyEntries(NATIVE_PICK_TOKEN_HINT_THRESHOLD);
+    mockInvoke(PICK, () => {
+      startAll(entries);
+      return batch(entries.map(([t, n]) => picked(t, n)));
+    });
+    mockInvoke("register_local_file", async (args) => registered(args));
+
+    const store = useAttachmentStore();
+    await store.handleAttachment("gallery");
+
+    expect(store.stagedAttachments).toHaveLength(entries.length);
     expect(addNotification).not.toHaveBeenCalled();
   });
 });
