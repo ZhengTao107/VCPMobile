@@ -12,6 +12,7 @@ import { useNotificationStore } from "../../core/stores/notification";
 import MessageRenderer from "./MessageRenderer.vue";
 import InputEnhancer from "./InputEnhancer.vue";
 import TarvenSelector from "./components/TarvenSelector.vue";
+import OpenTabsBar from "./components/OpenTabsBar.vue";
 import VcpAvatar from "../../components/ui/VcpAvatar.vue";
 import CoreStatusIndicator from "../../components/ui/CoreStatusIndicator.vue";
 import { ArrowDown } from "lucide-vue-next";
@@ -301,6 +302,9 @@ onUnmounted(() => {
         </button>
       </div>
     </header>
+
+    <!-- 1.5 已打开话题标签栏（仅多于 1 个标签时显示） -->
+    <OpenTabsBar />
 
     <!-- 2. 消息展示区 (确保 flex-1 撑开) -->
     <div ref="messageListRef" class="flex-1 overflow-y-auto relative no-rubber-band">
