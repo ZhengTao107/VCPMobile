@@ -46,7 +46,6 @@ pub fn run() {
             app.manage(vcp_modules::emoticon_manager::EmoticonManagerState::default());
             app.manage(MobileCliRuntimeState::new());
             app.manage(UpdateSession::new());
-            vcp_modules::infra::connection_resolver::install(app.handle().clone());
 
             let handle = app.handle().clone();
 

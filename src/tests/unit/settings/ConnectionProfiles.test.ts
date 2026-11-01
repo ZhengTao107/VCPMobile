@@ -1,16 +1,7 @@
-import { beforeEach, describe, expect, it, vi } from 'vitest';
-import { createPinia, setActivePinia } from 'pinia';
-import { defineComponent, h, reactive } from 'vue';
+import { describe, expect, it, vi } from 'vitest';
+import { reactive } from 'vue';
 import { flushPromises, mount } from '@vue/test-utils';
-import { emitTauriEvent, invokeMock, mockInvoke } from '../../mocks/tauri';
-import { getEffectiveVcpConnection } from '@/core/utils/effectiveVcpConnection';
-import {
-  CONNECTION_FALLBACK_EVENT,
-  CONNECTION_FALLBACK_MESSAGE,
-  useConnectionProbe,
-} from '@/core/composables/useConnectionProbe';
-import { diffSettingsPatch, useSettingsStore, type AppSettings } from '@/core/stores/settings';
-import { useNotificationStore } from '@/core/stores/notification';
+import { diffSettingsPatch, type AppSettings } from '@/core/stores/settings';
 import VcpCoreSettingsSection from '@/features/settings/components/VcpCoreSettingsSection.vue';
 
 const baseSettings = (): AppSettings => ({
@@ -40,132 +31,79 @@ const baseSettings = (): AppSettings => ({
   distributedDeviceName: '',
 });
 
-const probeCalls = () => invokeMock.mock.calls.filter(([command]) => command === 'refresh_connection_probe');
-
-describe('getEffectiveVcpConnection', () => {
-  it('returns the Rust-resolved endpoint', async () => {
-    mockInvoke('get_effective_vcp_connection', () => ({
-      vcpServerUrl: 'https://vcp.example.com',
-      vcpApiKey: 'server-key',
-      source: 'server',
-    }));
-    await expect(getEffectiveVcpConnection()).resolves.toEqual({
-      vcpServerUrl: 'https://vcp.example.com',
-      vcpApiKey: 'server-key',
-      source: 'server',
-    });
-  });
-
-  it('returns null when resolution fails', async () => {
-    mockInvoke('get_effective_vcp_connection', () => Promise.reject(new Error('not ready')));
-    vi.spyOn(console, 'warn').mockImplementation(() => undefined);
-    await expect(getEffectiveVcpConnection()).resolves.toBeNull();
-  });
-});
-
-describe('useConnectionProbe', () => {
-  beforeEach(() => setActivePinia(createPinia()));
-
-  const mountProbe = () =>
-    mount(defineComponent({
-      setup() {
-        useConnectionProbe();
-        return () => h('div');
-      },
-    }));
-
-  it('does not probe outside auto mode', async () => {
-    useSettingsStore().settings = { ...baseSettings(), connectionProfileMode: 'local' };
-    mountProbe();
-    window.dispatchEvent(new Event('online'));
-    await flushPromises();
-    expect(probeCalls()).toHaveLength(0);
-  });
-
-  it('probes on startup and when the device comes online in auto mode', async () => {
-    useSettingsStore().settings = { ...baseSettings(), connectionProfileMode: 'auto' };
-    const wrapper = mountProbe();
-    await flushPromises();
-    expect(probeCalls()).toHaveLength(1);
-
-    window.dispatchEvent(new Event('online'));
-    emitTauriEvent('vcp-network-changed', { connected: true });
-    await flushPromises();
-    expect(probeCalls()).toHaveLength(3);
-
-    wrapper.unmount();
-    window.dispatchEvent(new Event('online'));
-    expect(probeCalls()).toHaveLength(3);
-  });
-
-  it('shows one toast per fallback event', async () => {
-    useSettingsStore().settings = { ...baseSettings(), connectionProfileMode: 'auto' };
-    const notify = vi.spyOn(useNotificationStore(), 'addNotification').mockImplementation(() => undefined as never);
-    mountProbe();
-    await flushPromises();
-    emitTauriEvent(CONNECTION_FALLBACK_EVENT, { from: 'local', to: 'server' });
-    expect(notify).toHaveBeenCalledTimes(1);
-    expect(notify).toHaveBeenCalledWith(expect.objectContaining({
-      message: CONNECTION_FALLBACK_MESSAGE,
-      toastOnly: true,
-    }));
-  });
-});
-
 describe('VcpCoreSettingsSection connection profiles', () => {
   const field = (wrapper: ReturnType<typeof mount>, label: string) =>
     wrapper.findAll('.settings-field').find((item) => item.text().includes(label))!.find('input');
+  const action = (wrapper: ReturnType<typeof mount>, name: string) =>
+    wrapper.find(`[data-profile-action="${name}"]`);
+  const pick = async (wrapper: ReturnType<typeof mount>, name: string) =>
+    wrapper.findAll('[aria-label="连接档案"] [role="radio"]').find((b) => b.text().includes(name))!.trigger('click');
 
-  it('rendering leaves legacy settings untouched', async () => {
+  it('rendering leaves settings untouched and shows only the single upstream field group', async () => {
     const settings = reactive(baseSettings());
     const wrapper = mount(VcpCoreSettingsSection, { props: { settings } });
     await flushPromises();
     expect(diffSettingsPatch(baseSettings(), settings)).toEqual({});
-    expect(wrapper.find('[aria-label="连接档案"] [role="radio"][aria-checked="true"]').text()).toContain('单一地址');
+    expect(wrapper.text()).not.toContain('单一地址');
+    expect(wrapper.text()).not.toContain('本机 Chat URL');
+    expect(wrapper.text()).not.toContain('服务器 Chat URL');
+    expect(action(wrapper, 'apply').attributes('disabled')).toBeDefined();
   });
 
-  it('edits profiles and mode without touching legacy or sync fields', async () => {
+  it('存为档案 copies the in-use fields into a new named profile and saves', async () => {
     const settings = reactive(baseSettings());
-    const wrapper = mount(VcpCoreSettingsSection, { props: { settings } });
-    await field(wrapper, '本机 Chat URL').setValue('http://192.168.1.5:6005');
-    await field(wrapper, '服务器 API Key').setValue('server-key');
-    const server = wrapper
-      .findAll('[aria-label="连接档案"] [role="radio"]')
-      .find((button) => button.text().includes('固定使用「服务器」档案'))!;
-    await server.trigger('click');
+    const onSaveRequest = vi.fn();
+    const wrapper = mount(VcpCoreSettingsSection, { props: { settings, onSaveRequest } });
+    await field(wrapper, '档案名称').setValue('公司');
+    await action(wrapper, 'save').trigger('click');
 
-    expect(diffSettingsPatch(baseSettings(), settings)).toEqual({
-      connectionProfileMode: 'server',
-      connectionProfiles: [
-        { name: '本机', vcpServerUrl: 'http://192.168.1.5:6005', vcpApiKey: '' },
-        { name: '服务器', vcpServerUrl: '', vcpApiKey: 'server-key' },
-      ],
+    expect(settings.connectionProfiles).toHaveLength(1);
+    expect(settings.connectionProfiles![0]).toMatchObject({
+      name: '公司',
+      vcpServerUrl: 'https://legacy.example',
+      vcpApiKey: 'legacy-key',
+      syncToken: 'sync-token',
     });
-
-    const single = wrapper.findAll('[role="radio"]').find((button) => button.text().includes('单一地址'))!;
-    await single.trigger('click');
-    expect(settings.connectionProfileMode).toBeNull();
+    expect(onSaveRequest).toHaveBeenCalledTimes(1);
   });
 
-  it('does not offer auto for active selection', async () => {
+  it('选用 writes the non-empty profile fields into the in-use group; 删除 removes it', async () => {
+    const settings = reactive({
+      ...baseSettings(),
+      connectionProfiles: [{
+        id: 'p-home', name: '家里',
+        vcpServerUrl: 'http://192.168.1.5:6005', chatEndpointMode: 'vcpTools', vcpApiKey: 'sk-fake-home-1111',
+        vcpLogUrl: 'ws://192.168.1.5:6005', vcpLogKey: '', fileKey: '',
+        syncHttpUrl: '', syncServerUrl: '', syncToken: '',
+      }],
+    });
+    const onSaveRequest = vi.fn();
+    const wrapper = mount(VcpCoreSettingsSection, { props: { settings, onSaveRequest } });
+    await pick(wrapper, '家里');
+    await action(wrapper, 'apply').trigger('click');
+
+    expect(settings.vcpServerUrl).toBe('http://192.168.1.5:6005');
+    expect(settings.chatEndpointMode).toBe('vcpTools');
+    expect(settings.vcpLogUrl).toBe('ws://192.168.1.5:6005');
+    expect(settings.syncToken).toBe('sync-token');
+    expect(onSaveRequest).toHaveBeenCalledTimes(1);
+
+    await pick(wrapper, '家里');
+    await action(wrapper, 'delete').trigger('click');
+    expect(settings.connectionProfiles).toEqual([]);
+    expect(settings.vcpServerUrl).toBe('http://192.168.1.5:6005');
+  });
+
+  it('同名存为档案覆盖原档案，不新增', async () => {
     const settings = reactive(baseSettings());
     const wrapper = mount(VcpCoreSettingsSection, { props: { settings } });
-    const titles = wrapper.findAll('[aria-label="连接档案"] [role="radio"]').map((button) => button.text());
-    expect(titles).toHaveLength(3);
-    expect(titles.some((text) => text.includes('自动'))).toBe(false);
-  });
-
-  it('keeps a legacy auto value visible and selected until another mode is chosen', async () => {
-    const settings = reactive({ ...baseSettings(), connectionProfileMode: 'auto' as const });
-    const wrapper = mount(VcpCoreSettingsSection, { props: { settings } });
-    expect(wrapper.find('[aria-label="连接档案"] [role="radio"][aria-checked="true"]').text()).toContain('自动（旧设置）');
-
-    const local = wrapper
-      .findAll('[aria-label="连接档案"] [role="radio"]')
-      .find((button) => button.text().includes('固定使用「本机」档案'))!;
-    await local.trigger('click');
-    expect(settings.connectionProfileMode).toBe('local');
-    const titles = wrapper.findAll('[aria-label="连接档案"] [role="radio"]').map((button) => button.text());
-    expect(titles.some((text) => text.includes('自动'))).toBe(false);
+    await field(wrapper, '档案名称').setValue('公司');
+    await action(wrapper, 'save').trigger('click');
+    const firstId = settings.connectionProfiles![0].id;
+    settings.vcpServerUrl = 'https://new.example';
+    await field(wrapper, '档案名称').setValue('公司');
+    await action(wrapper, 'save').trigger('click');
+    expect(settings.connectionProfiles).toHaveLength(1);
+    expect(settings.connectionProfiles![0]).toMatchObject({ id: firstId, vcpServerUrl: 'https://new.example' });
   });
 });

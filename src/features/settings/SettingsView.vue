@@ -296,7 +296,9 @@ watch(() => props.isOpen, syncFluidActive);
       >
         正在加载设置...
       </div>
-      <div v-else class="flex-1 overflow-y-auto relative no-rubber-band">
+      <!-- 子页层与主页滚动容器是兄弟：子页层若在滚动容器内，主页滚下去后点进的子页会贴在滚动内容顶部，可视区只剩空白 -->
+      <div v-else class="flex-1 relative min-h-0">
+        <div class="absolute inset-0 overflow-y-auto no-rubber-band" data-settings-scroller>
         <!-- 主页 -->
         <div class="px-3 pt-6 pb-safe min-h-full flex flex-col gap-6">
           <template v-for="group in SETTINGS_GROUPS" :key="group.id">
@@ -345,6 +347,7 @@ watch(() => props.isOpen, syncFluidActive);
           <div class="mt-auto text-center opacity-15 text-[8px] py-8 pb-12 font-mono uppercase tracking-[0.25em] select-none">
             VCP MOBILE // PROJECT AVATAR // 2026.04.07
           </div>
+        </div>
         </div>
 
         <!-- 子页面层 -->

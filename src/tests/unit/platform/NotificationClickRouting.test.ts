@@ -17,7 +17,6 @@ vi.mock('../../../core/utils/platform', () => ({
   get nativePlatform() { return native.ios ? 'ios' : 'android'; },
 }));
 vi.mock('../../../core/composables/useAppLifecycle', () => ({ useAppLifecycle: () => {} }));
-vi.mock('../../../core/composables/useConnectionProbe', () => ({ useConnectionProbe: () => {} }));
 vi.mock('../../../core/composables/useKeyboardInsets', () => ({ retainNativeInsetsBridge: () => () => {} }));
 vi.mock('../../../core/composables/useSidebarSwipe', () => ({ useSidebarSwipe: () => {} }));
 vi.mock('../../../core/composables/useEmoticonFixer', () => ({ useEmoticonFixer: () => ({ initGlobalFixer: () => {} }) }));

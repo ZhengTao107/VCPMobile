@@ -26,9 +26,7 @@ pub async fn summarize_topic(
     topic_id: String,
     agent_name: String,
 ) -> Result<String, String> {
-    let settings = crate::vcp_modules::infra::connection_resolver::resolved_settings(
-        read_settings(app_handle.clone(), settings_state).await?,
-    );
+    let settings = read_settings(app_handle.clone(), settings_state).await?;
     if settings.vcp_server_url.is_empty() || settings.vcp_api_key.is_empty() {
         return Err("VCP settings are missing".to_string());
     }
