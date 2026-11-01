@@ -48,9 +48,12 @@ const connectionFieldsDisabled = computed(() =>
   !connectionSettingsReady.value || connectionSettingsLoading.value ||
   connectionSaving.value || status.value.state !== "disconnected",
 );
+// 分布式地址 / Key 留空时沿用 VCPLog 那组（同一台 VCP 的 WS 入口）；输入框不回显，只在连接时取值。
+const effectiveWsUrl = computed(() => wsUrl.value.trim() || (settingsStore.settings?.vcpLogUrl ?? "").trim());
+const effectiveVcpKey = computed(() => vcpKey.value.trim() || (settingsStore.settings?.vcpLogKey ?? "").trim());
 const canSaveConnection = computed(() =>
   props.isOpen && !connectionFieldsDisabled.value &&
-  Boolean(wsUrl.value.trim() && vcpKey.value.trim()),
+  Boolean(effectiveWsUrl.value && effectiveVcpKey.value),
 );
 
 // Interface types
@@ -491,8 +494,8 @@ const handleConnect = async () => {
   connectionSaving.value = true;
   try {
     await settingsStore.updateSettings({
-      distributedWsUrl: wsUrl.value,
-      distributedVcpKey: vcpKey.value,
+      distributedWsUrl: effectiveWsUrl.value,
+      distributedVcpKey: effectiveVcpKey.value,
       distributedDeviceName: deviceName.value,
       distributedEnabled: true,
     });
