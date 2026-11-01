@@ -1,16 +1,7 @@
-import { beforeEach, describe, expect, it, vi } from 'vitest';
-import { createPinia, setActivePinia } from 'pinia';
-import { defineComponent, h, reactive } from 'vue';
+import { describe, expect, it } from 'vitest';
+import { reactive } from 'vue';
 import { flushPromises, mount } from '@vue/test-utils';
-import { emitTauriEvent, invokeMock, mockInvoke } from '../../mocks/tauri';
-import { getEffectiveVcpConnection } from '@/core/utils/effectiveVcpConnection';
-import {
-  CONNECTION_FALLBACK_EVENT,
-  CONNECTION_FALLBACK_MESSAGE,
-  useConnectionProbe,
-} from '@/core/composables/useConnectionProbe';
-import { diffSettingsPatch, useSettingsStore, type AppSettings } from '@/core/stores/settings';
-import { useNotificationStore } from '@/core/stores/notification';
+import { diffSettingsPatch, type AppSettings } from '@/core/stores/settings';
 import VcpCoreSettingsSection from '@/features/settings/components/VcpCoreSettingsSection.vue';
 
 const baseSettings = (): AppSettings => ({
@@ -38,78 +29,6 @@ const baseSettings = (): AppSettings => ({
   distributedWsUrl: '',
   distributedVcpKey: '',
   distributedDeviceName: '',
-});
-
-const probeCalls = () => invokeMock.mock.calls.filter(([command]) => command === 'refresh_connection_probe');
-
-describe('getEffectiveVcpConnection', () => {
-  it('returns the Rust-resolved endpoint', async () => {
-    mockInvoke('get_effective_vcp_connection', () => ({
-      vcpServerUrl: 'https://vcp.example.com',
-      vcpApiKey: 'server-key',
-      source: 'server',
-    }));
-    await expect(getEffectiveVcpConnection()).resolves.toEqual({
-      vcpServerUrl: 'https://vcp.example.com',
-      vcpApiKey: 'server-key',
-      source: 'server',
-    });
-  });
-
-  it('returns null when resolution fails', async () => {
-    mockInvoke('get_effective_vcp_connection', () => Promise.reject(new Error('not ready')));
-    vi.spyOn(console, 'warn').mockImplementation(() => undefined);
-    await expect(getEffectiveVcpConnection()).resolves.toBeNull();
-  });
-});
-
-describe('useConnectionProbe', () => {
-  beforeEach(() => setActivePinia(createPinia()));
-
-  const mountProbe = () =>
-    mount(defineComponent({
-      setup() {
-        useConnectionProbe();
-        return () => h('div');
-      },
-    }));
-
-  it('does not probe outside auto mode', async () => {
-    useSettingsStore().settings = { ...baseSettings(), connectionProfileMode: 'local' };
-    mountProbe();
-    window.dispatchEvent(new Event('online'));
-    await flushPromises();
-    expect(probeCalls()).toHaveLength(0);
-  });
-
-  it('probes on startup and when the device comes online in auto mode', async () => {
-    useSettingsStore().settings = { ...baseSettings(), connectionProfileMode: 'auto' };
-    const wrapper = mountProbe();
-    await flushPromises();
-    expect(probeCalls()).toHaveLength(1);
-
-    window.dispatchEvent(new Event('online'));
-    emitTauriEvent('vcp-network-changed', { connected: true });
-    await flushPromises();
-    expect(probeCalls()).toHaveLength(3);
-
-    wrapper.unmount();
-    window.dispatchEvent(new Event('online'));
-    expect(probeCalls()).toHaveLength(3);
-  });
-
-  it('shows one toast per fallback event', async () => {
-    useSettingsStore().settings = { ...baseSettings(), connectionProfileMode: 'auto' };
-    const notify = vi.spyOn(useNotificationStore(), 'addNotification').mockImplementation(() => undefined as never);
-    mountProbe();
-    await flushPromises();
-    emitTauriEvent(CONNECTION_FALLBACK_EVENT, { from: 'local', to: 'server' });
-    expect(notify).toHaveBeenCalledTimes(1);
-    expect(notify).toHaveBeenCalledWith(expect.objectContaining({
-      message: CONNECTION_FALLBACK_MESSAGE,
-      toastOnly: true,
-    }));
-  });
 });
 
 describe('VcpCoreSettingsSection connection profiles', () => {

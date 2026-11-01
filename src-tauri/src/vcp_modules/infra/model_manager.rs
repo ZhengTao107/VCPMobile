@@ -103,9 +103,7 @@ pub async fn refresh_models<R: Runtime>(
     settings_state: State<'_, SettingsState>,
 ) -> Result<Vec<ModelInfo>, String> {
     let _refresh_guard = state.refresh_lifecycle.lock().await;
-    let settings = crate::vcp_modules::infra::connection_resolver::resolved_settings(
-        read_settings(app.clone(), settings_state).await?,
-    );
+    let settings = read_settings(app.clone(), settings_state).await?;
     let models_url = resolve_model_discovery_endpoint(
         &settings.vcp_server_url,
         settings.chat_endpoint_mode,

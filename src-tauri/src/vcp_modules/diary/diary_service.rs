@@ -1747,7 +1747,6 @@ async fn settings_snapshot<R: Runtime>(
     }
     read_settings(app_handle, settings_state)
         .await
-        .map(crate::vcp_modules::infra::connection_resolver::resolved_settings)
         .map_err(|_| {
             DiaryError::new(DiaryErrorCode::ServiceUnavailable, "无法读取应用设置").command_string()
         })
