@@ -386,9 +386,12 @@ watch(input, () => {
 const isGenerating = computed(() => streamStore.activeStreamingIds.size > 0);
 
 // 是否有内容可发送
-const hasContent = computed(() => input.value.trim() !== '' || attachmentStore.stagedAttachments.length > 0);
+// failed 卡片发送时会被跳过：不算可发送内容，也不阻塞发送
+const hasContent = computed(() =>
+  input.value.trim() !== '' || attachmentStore.stagedAttachments.some(attachment => attachment.status !== 'failed'),
+);
 const attachmentsReady = computed(() =>
-  attachmentStore.stagedAttachments.every(attachment => attachment.status === 'done'),
+  attachmentStore.stagedAttachments.every(attachment => attachment.status === 'done' || attachment.status === 'failed'),
 );
 const canSend = computed(() => hasContent.value && attachmentsReady.value && !props.disabled);
 

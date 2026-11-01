@@ -1,6 +1,7 @@
 <template>
   <div class="attachment-preview-base relative flex items-center bg-black/5 dark:bg-white/5 border border-black/10 dark:border-white/10 rounded-xl transition-all"
-       :class="[sizeClass, { 'hover:bg-black/10 dark:hover:bg-white/10': !isLoading && !isProcessing }]">
+       :class="[sizeClass, { 'hover:bg-black/10 dark:hover:bg-white/10': !isLoading && !isProcessing && !isFailed, 'ring-2 ring-red-500/80': isFailed }]"
+       :title="isFailed ? `${file.name}：${failReasonText}` : undefined">
     <!-- Default slot for content -->
     <slot />
     
@@ -43,11 +44,46 @@
         class="text-[9px] text-white/80 font-mono select-none"
       >解析中...</span>
     </div>
+
+    <!-- Failed Overlay：点击展开原因与移除 -->
+    <div
+      v-if="isFailed"
+      data-testid="attachment-failed"
+      role="button"
+      tabindex="0"
+      :aria-expanded="reasonOpen"
+      :aria-label="`${file.name} 导入失败，点击查看原因`"
+      class="absolute inset-0 bg-red-950/60 rounded-xl flex flex-col items-center justify-center z-10 gap-0.5 p-1 text-white"
+      @click.stop="reasonOpen = !reasonOpen"
+      @keydown.enter.prevent="reasonOpen = !reasonOpen"
+    >
+      <span v-if="!reasonOpen" class="text-[9px] font-bold select-none">失败</span>
+      <template v-else>
+        <span
+          data-testid="attachment-fail-reason"
+          class="flex-1 min-h-0 w-full overflow-y-auto text-[8px] leading-tight break-all text-center"
+        >{{ failReasonText }}</span>
+        <button
+          type="button"
+          data-testid="attachment-fail-remove"
+          class="shrink-0 text-[9px] font-bold px-1.5 rounded bg-white/90 text-red-700 active:scale-95"
+          @click.stop="emit('remove', index)"
+        >移除</button>
+      </template>
+    </div>
+
+    <!-- 红色角标 -->
+    <span
+      v-if="isFailed"
+      data-testid="attachment-failed-badge"
+      aria-hidden="true"
+      class="absolute -top-1.5 -left-1.5 w-4 h-4 rounded-full bg-red-500 text-white text-[10px] font-bold flex items-center justify-center shadow-lg border border-white/40 z-20"
+    >!</span>
   </div>
 </template>
 
 <script setup lang="ts">
-import { computed } from "vue";
+import { computed, ref } from "vue";
 import type { Attachment } from "../../../core/types/chat";
 
 interface Props {
@@ -66,6 +102,9 @@ const emit = defineEmits<{ (e: "remove", index: number): void }>();
 
 const isLoading = computed(() => props.file.status === "loading");
 const isProcessing = computed(() => props.file.status === "processing");
+const isFailed = computed(() => props.file.status === "failed");
+const failReasonText = computed(() => props.file.failReason || "处理失败");
+const reasonOpen = ref(false);
 
 const sizeClass = computed(() => {
   switch (props.size) {
