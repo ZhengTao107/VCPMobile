@@ -79,7 +79,11 @@ onUnmounted(() => {
 });
 
 // ── 连接档案（ptp4g#5）：本机 / 服务器两档 + 档位；null 表示单一地址 ──
-const profileModes: ReadonlyArray<{
+// auto（自动探测回退）已停用：不再供主动选择，仅在现值仍为 auto 时作为旧设置显示，
+// 避免老用户看到无选中项；选到其他档位后该项随之消失。
+const currentProfileMode = computed(() => props.settings.connectionProfileMode ?? null);
+
+const allProfileModes: ReadonlyArray<{
   value: ConnectionProfileMode | null;
   title: string;
   description: string;
@@ -87,10 +91,13 @@ const profileModes: ReadonlyArray<{
   { value: null, title: '单一地址', description: '使用上方 Chat 服务器 URL 与 API Key（默认）' },
   { value: 'local', title: '本机', description: '固定使用「本机」档案' },
   { value: 'server', title: '服务器', description: '固定使用「服务器」档案' },
-  { value: 'auto', title: '自动', description: '优先本机；本机不可达时临时使用服务器' },
+  { value: 'auto', title: '自动（旧设置）', description: '优先本机，不可达时临时使用服务器；已停用，改选其他档位后不再显示' },
 ];
 
-const currentProfileMode = computed(() => props.settings.connectionProfileMode ?? null);
+const profileModes = computed(() =>
+  allProfileModes.filter((option) => option.value !== 'auto' || currentProfileMode.value === 'auto'),
+);
+
 const selectProfileMode = (mode: ConnectionProfileMode | null) => {
   props.settings.connectionProfileMode = mode;
 };

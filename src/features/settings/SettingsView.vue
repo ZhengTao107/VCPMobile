@@ -13,7 +13,10 @@ import SlidePage from "../../components/ui/SlidePage.vue";
 // 首次打开不再解析 UserProfile/Theme/ModelSelector/About 等与主页无关的代码
 import SettingsCard from "../../components/settings/SettingsCard.vue";
 import SettingsRow from "../../components/settings/SettingsRow.vue";
+import SettingsSection from "../../components/settings/SettingsSection.vue";
+import SettingsDisclosure from "../../components/settings/SettingsDisclosure.vue";
 import FluidBackground from "../../components/ui/WebGLFluidBackground.vue";
+import { SETTINGS_GROUPS, findSettingsPage } from "./settingsGroups";
 const UserProfileSection = defineAsyncComponent(() => import("./components/UserProfileSection.vue"));
 const SyncSettingsSection = defineAsyncComponent(() => import("./components/SyncSettingsSection.vue"));
 const ConfigBackupSection = defineAsyncComponent(() => import("./components/ConfigBackupSection.vue"));
@@ -89,19 +92,8 @@ watch(showSummaryModelSelector, (open) => {
 const currentSubPage = ref<string | null>(null);
 const visibleSubPage = ref<string | null>(null);
 
-const categories = [
-  { id: "identity", title: "用户身份", description: "头像、用户名与管理员账号" },
-  { id: "connection", title: "服务器连接", description: "VCP Server API 与数据同步" },
-  { id: "theme", title: "主题切换", description: "主题预览与切换" },
-  { id: "rendering", title: "消息渲染", description: "排版模式、内容宽度及后续渲染选项" },
-  { id: "advanced", title: "高级功能", description: "话题总结与数据维护" },
-  { id: "guide", title: "帮助与指引", description: "交互教学与功能指引回放" },
-  { id: "about", title: "关于", description: "版本与更新" },
-];
-
-const subPageTitle = computed(() => {
-  return categories.find((c) => c.id === currentSubPage.value)?.title || "";
-});
+// 分组与顺序见 settingsGroups.ts（连接 → 同步 → 聊天 → 外观 → 高级）
+const subPageTitle = computed(() => findSettingsPage(currentSubPage.value)?.title || "");
 
 const onSummaryModelSelect = (modelId: string) => {
   settings.value.topicSummaryModel = modelId;
@@ -306,19 +298,48 @@ watch(() => props.isOpen, syncFluidActive);
       </div>
       <div v-else class="flex-1 overflow-y-auto relative no-rubber-band">
         <!-- 主页 -->
-        <div class="px-3 pt-8 pb-safe min-h-full flex flex-col">
-          <SettingsCard>
-            <div class="divide-y divide-black/5 dark:divide-white/5">
-              <SettingsRow
-                v-for="cat in categories"
-                :key="cat.id"
-                :title="cat.title"
-                :description="cat.description"
-                clickable
-                @click="currentSubPage = cat.id"
-              />
-            </div>
-          </SettingsCard>
+        <div class="px-3 pt-6 pb-safe min-h-full flex flex-col gap-6">
+          <template v-for="group in SETTINGS_GROUPS" :key="group.id">
+            <!-- 低频分组整组折叠，默认收起 -->
+            <SettingsDisclosure
+              v-if="group.collapsed"
+              :title="group.title"
+              :description="group.description"
+              :data-settings-group="group.id"
+            >
+              <div class="divide-y divide-black/5 dark:divide-white/5">
+                <SettingsRow
+                  v-for="page in group.pages"
+                  :key="page.id"
+                  :title="page.title"
+                  :description="page.description"
+                  :data-settings-page="page.id"
+                  clickable
+                  @click="currentSubPage = page.id"
+                />
+              </div>
+            </SettingsDisclosure>
+            <SettingsSection
+              v-else
+              :title="group.title"
+              :description="group.description"
+              :data-settings-group="group.id"
+            >
+              <SettingsCard>
+                <div class="divide-y divide-black/5 dark:divide-white/5">
+                  <SettingsRow
+                    v-for="page in group.pages"
+                    :key="page.id"
+                    :title="page.title"
+                    :description="page.description"
+                    :data-settings-page="page.id"
+                    clickable
+                    @click="currentSubPage = page.id"
+                  />
+                </div>
+              </SettingsCard>
+            </SettingsSection>
+          </template>
 
           <!-- Footer -->
           <div class="mt-auto text-center opacity-15 text-[8px] py-8 pb-12 font-mono uppercase tracking-[0.25em] select-none">
@@ -339,87 +360,80 @@ watch(() => props.isOpen, syncFluidActive);
                 ? 'overflow-hidden flex flex-col min-h-0'
                 : 'overflow-y-auto px-3 pt-6 space-y-6 no-rubber-band pb-[calc(var(--vcp-safe-bottom,48px))]'"
             >
-              <!-- 用户身份 -->
+              <!-- 连接 · 服务器连接 -->
+              <template v-if="visibleSubPage === 'connection'">
+                <SettingsCard>
+                  <VcpCoreSettingsSection
+                    :settings="settings"
+                    @save-request="saveSettings"
+                  />
+                </SettingsCard>
+              </template>
+
+              <!-- 连接 · 配置串与备份 -->
+              <template v-if="visibleSubPage === 'configBackup'">
+                <SettingsCard>
+                  <ConfigBackupSection
+                    :settings="settings"
+                    @save-request="saveSettings"
+                    @config-imported="onConfigImported"
+                  />
+                </SettingsCard>
+              </template>
+
+              <!-- 同步 · 数据同步 -->
+              <template v-if="visibleSubPage === 'sync'">
+                <SettingsCard>
+                  <SyncSettingsSection
+                    :settings="settings"
+                    @save-request="saveSettings"
+                  />
+                </SettingsCard>
+              </template>
+
+              <!-- 聊天 · 用户身份 -->
               <template v-if="visibleSubPage === 'identity'">
                 <UserProfileSection :settings="settings" />
               </template>
 
-              <!-- 服务器连接 -->
-              <template v-if="visibleSubPage === 'connection'">
-                <div class="space-y-6">
-                  <div>
-                    <h3 class="text-[11px] font-black uppercase tracking-[0.15em] opacity-50 mb-3 px-1">核心连接</h3>
-                    <SettingsCard>
-                      <VcpCoreSettingsSection
-                        :settings="settings"
-                        @save-request="saveSettings"
-                      />
-                    </SettingsCard>
-                  </div>
-                  <div>
-                    <h3 class="text-[11px] font-black uppercase tracking-[0.15em] opacity-50 mb-3 px-1">数据同步</h3>
-                    <SettingsCard>
-                      <SyncSettingsSection
-                        :settings="settings"
-                        @save-request="saveSettings"
-                      />
-                    </SettingsCard>
-                  </div>
-                  <div>
-                    <h3 class="text-[11px] font-black uppercase tracking-[0.15em] opacity-50 mb-3 px-1">配置备份</h3>
-                    <SettingsCard>
-                      <ConfigBackupSection
-                        :settings="settings"
-                        @save-request="saveSettings"
-                        @config-imported="onConfigImported"
-                      />
-                    </SettingsCard>
-                  </div>
-                </div>
+              <!-- 聊天 · 话题总结 -->
+              <template v-if="visibleSubPage === 'topicSummary'">
+                <SettingsCard>
+                  <TopicSummarySection
+                    :settings="settings"
+                    @open-model-selector="showSummaryModelSelector = true"
+                    @save-request="saveSettings"
+                  />
+                </SettingsCard>
               </template>
 
-              <!-- 主题切换 -->
+              <!-- [SUSPENDED BETA] 划词悬浮助手功能当前已暂停使用，相关组件与设置代码保留，入口已关闭；
+                   恢复时放入「聊天」组：
+              <template v-if="visibleSubPage === 'assistant'">
+                <SettingsCard>
+                  <AssistantSettingsSection :settings="settings" @save-request="saveSettings" />
+                </SettingsCard>
+              </template>
+              -->
+
+              <!-- 外观 · 主题切换 -->
               <template v-if="visibleSubPage === 'theme'">
                 <ThemePicker key="theme" section="theme" />
               </template>
 
-              <!-- 消息渲染 -->
+              <!-- 外观 · 消息渲染 -->
               <template v-if="visibleSubPage === 'rendering'">
                 <ThemePicker key="rendering" section="rendering" />
               </template>
 
-              <!-- 高级功能 -->
-              <template v-if="visibleSubPage === 'advanced'">
-                <div class="space-y-6">
-                  <!-- [SUSPENDED BETA] 划词悬浮助手功能当前已暂停使用，相关组件与设置代码保留，入口已关闭 -->
-                  <!--
-                  <div>
-                    <h3 class="text-[11px] font-black uppercase tracking-[0.15em] opacity-50 mb-3 px-1">划词悬浮助手</h3>
-                    <SettingsCard>
-                      <AssistantSettingsSection :settings="settings" @save-request="saveSettings" />
-                    </SettingsCard>
-                  </div>
-                  -->
-                  <div>
-                    <h3 class="text-[11px] font-black uppercase tracking-[0.15em] opacity-50 mb-3 px-1">话题总结</h3>
-                    <SettingsCard>
-                      <TopicSummarySection
-                        :settings="settings"
-                        @open-model-selector="showSummaryModelSelector = true"
-                        @save-request="saveSettings"
-                      />
-                    </SettingsCard>
-                  </div>
-                  <div>
-                    <h3 class="text-[11px] font-black uppercase tracking-[0.15em] opacity-50 mb-3 px-1">数据维护</h3>
-                    <SettingsCard>
-                      <MaintenanceSection />
-                    </SettingsCard>
-                  </div>
-                </div>
+              <!-- 高级 · 数据维护 -->
+              <template v-if="visibleSubPage === 'maintenance'">
+                <SettingsCard>
+                  <MaintenanceSection />
+                </SettingsCard>
               </template>
 
-              <!-- 帮助与指引 -->
+              <!-- 高级 · 帮助与指引 -->
               <template v-if="visibleSubPage === 'guide'">
                 <GuideCenterSection />
               </template>
