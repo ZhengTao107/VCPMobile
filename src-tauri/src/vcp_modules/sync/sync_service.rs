@@ -835,6 +835,41 @@ struct SyncSessionHandle {
     join_handle: JoinHandle<Result<(), String>>,
 }
 
+/// Log-safe form of a sync token: only the last 4 characters survive (`***abcd`). Tokens of 4
+/// characters or fewer are fully masked so the suffix can never be the whole secret.
+fn mask_sync_token(token: &str) -> String {
+    let chars: Vec<char> = token.chars().collect();
+    if chars.len() <= 4 {
+        return "***".to_string();
+    }
+    let suffix: String = chars[chars.len() - 4..].iter().collect();
+    format!("***{suffix}")
+}
+
+/// Log-safe form of the session WebSocket URL with every `token` query value masked. Only used
+/// for logging; the connection keeps the original URL.
+fn redact_sync_ws_url(ws_url: &str) -> String {
+    let Ok(mut url) = url::Url::parse(ws_url) else {
+        return "<unparseable ws url>".to_string();
+    };
+    if url.query().is_none() {
+        return url.to_string();
+    }
+    let pairs: Vec<(String, String)> = url
+        .query_pairs()
+        .map(|(key, value)| {
+            let value = if key == "token" {
+                mask_sync_token(&value)
+            } else {
+                value.into_owned()
+            };
+            (key.into_owned(), value)
+        })
+        .collect();
+    url.query_pairs_mut().clear().extend_pairs(pairs);
+    url.to_string()
+}
+
 struct SyncSessionConfig {
     ws_url: String,
     http_url: String,
@@ -1447,16 +1482,31 @@ async fn run_sync_session(
         .app_log_dir()
         .ok()
         .map(|d| d.join("sync_logs"));
-    let sync_logger = Arc::new(std::sync::Mutex::new(SyncLogger::new_session(
+    // Release builds are not debuggable, so `run-as` cannot read app_log_dir. Mirror the session
+    // log into getExternalFilesDir(null)/logs/sync_logs, which adb can pull without root.
+    #[cfg(target_os = "android")]
+    let log_mirror_dir = app_handle
+        .path()
+        .document_dir()
+        .ok()
+        .and_then(|dir| crate::vcp_modules::sync_logger::android_external_sync_log_dir(&dir));
+    #[cfg(not(target_os = "android"))]
+    let log_mirror_dir: Option<std::path::PathBuf> = None;
+    let sync_logger = Arc::new(std::sync::Mutex::new(SyncLogger::new_session_with_mirror(
         sync_log_level,
         log_dir,
+        log_mirror_dir,
         session_id,
     )));
     if let Ok(mut logger) = sync_logger.lock() {
         logger.log_direct(
             LogLevel::Info,
             "config",
-            &format!("ws_url={ws_url} http_url={http_url} sync_token={sync_token}"),
+            &format!(
+                "ws_url={} http_url={http_url} sync_token={}",
+                redact_sync_ws_url(&ws_url),
+                mask_sync_token(&sync_token)
+            ),
         );
     }
     let (log_path, log_initialization_error) = {
@@ -3741,6 +3791,43 @@ mod tests {
     use std::sync::atomic::AtomicBool;
     use tokio::net::TcpListener;
     use tokio_tungstenite::tungstenite::protocol::{frame::coding::CloseCode, CloseFrame};
+
+    #[test]
+    fn mask_sync_token_keeps_only_the_last_four_characters() {
+        assert_eq!(mask_sync_token("example-token-abcd"), "***abcd");
+        assert_eq!(mask_sync_token("令牌示例的尾巴四字"), "***尾巴四字");
+        assert_eq!(mask_sync_token("abcd"), "***");
+        assert_eq!(mask_sync_token(""), "***");
+    }
+
+    #[test]
+    fn redact_sync_ws_url_masks_only_the_token_query_value() {
+        let redacted =
+            redact_sync_ws_url("wss://192.168.1.10:5975/ws-sync?token=example-secret-9876");
+        assert_eq!(redacted, "wss://192.168.1.10:5975/ws-sync?token=***9876");
+        assert!(!redacted.contains("example-secret"));
+
+        let settings = Settings {
+            sync_token: "example token +/?wxyz".to_string(),
+            ..valid_sync_settings()
+        };
+        let config = build_sync_session_config(&settings, true)
+            .unwrap_or_else(|error| panic!("valid sync configuration rejected: {}", error.detail));
+        let redacted = redact_sync_ws_url(&config.ws_url);
+        assert!(!redacted.contains("example"));
+        assert!(redacted.ends_with("token=***wxyz"));
+        // The connection URL itself is untouched.
+        assert!(url::Url::parse(&config.ws_url)
+            .expect("validated WebSocket URL")
+            .query_pairs()
+            .any(|(key, value)| key == "token" && value == "example token +/?wxyz"));
+
+        assert_eq!(
+            redact_sync_ws_url("wss://192.168.1.10:5975/ws-sync"),
+            "wss://192.168.1.10:5975/ws-sync"
+        );
+        assert_eq!(redact_sync_ws_url("not a url"), "<unparseable ws url>");
+    }
 
     type TestServerWebSocket = WebSocketStream<tokio::net::TcpStream>;
 
