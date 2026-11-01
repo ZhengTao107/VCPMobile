@@ -1068,6 +1068,8 @@ pub struct Phase3Tracker {
     pub attempt_id: u64,
     pub completed: tokio::sync::Mutex<HashSet<TopicKey>>,
     pub modified: tokio::sync::Mutex<HashSet<TopicKey>>,
+    pub pulled: tokio::sync::Mutex<HashSet<TopicKey>>,
+    pub pushed: tokio::sync::Mutex<HashSet<TopicKey>>,
     pub failed: tokio::sync::Mutex<HashSet<TopicKey>>,
     pub legacy_attachment_warnings: std::sync::atomic::AtomicUsize,
     pub total: std::sync::atomic::AtomicUsize,
@@ -1078,6 +1080,18 @@ impl Phase3Tracker {
     pub async fn mark_modified(&self, topic: &TopicKey) {
         let mut modified = self.modified.lock().await;
         modified.insert(topic.clone());
+    }
+
+    /// 标记某个 topic 本轮从桌面拉回并已落库（同时计入 modified）
+    pub async fn mark_pulled(&self, topic: &TopicKey) {
+        self.pulled.lock().await.insert(topic.clone());
+        self.mark_modified(topic).await;
+    }
+
+    /// 标记某个 topic 本轮已推送到桌面（同时计入 modified）
+    pub async fn mark_pushed(&self, topic: &TopicKey) {
+        self.pushed.lock().await.insert(topic.clone());
+        self.mark_modified(topic).await;
     }
 
     pub async fn mark_failed(&self, topic: &TopicKey) {
@@ -1097,12 +1111,19 @@ impl Phase3Tracker {
             .map(|topic| topic.topic_id.clone())
             .collect::<Vec<_>>();
         failed_topic_ids.sort();
+        let (pulled_topics, pulled_truncated) =
+            capped_topic_list(&*self.pulled.lock().await, MAX_SUMMARY_TOPICS);
+        let (pushed_topics, pushed_truncated) =
+            capped_topic_list(&*self.pushed.lock().await, MAX_SUMMARY_TOPICS);
         SyncCompletionSummary {
             successful_topics,
             total_topics: self.total.load(Ordering::SeqCst),
             failed_topics: failed.len(),
             legacy_attachment_warnings: self.legacy_attachment_warnings.load(Ordering::SeqCst),
             failed_topic_ids,
+            pulled_topics,
+            pushed_topics,
+            topics_truncated: pulled_truncated || pushed_truncated,
         }
     }
 
@@ -1404,6 +1425,58 @@ struct SyncCompletionSummary {
     failed_topics: usize,
     legacy_attachment_warnings: usize,
     failed_topic_ids: Vec<String>,
+    /// 本轮从桌面拉回并落库的话题；前端据此决定是否重载当前历史
+    pulled_topics: Vec<TopicKey>,
+    /// 本轮推送到桌面的话题；本地已是最新，前端无需重载
+    pushed_topics: Vec<TopicKey>,
+    /// 任一集合超过 MAX_SUMMARY_TOPICS 被截断时为 true，前端应退回全量重载
+    topics_truncated: bool,
+}
+
+const MAX_SUMMARY_TOPICS: usize = 2000;
+
+fn capped_topic_list(set: &HashSet<TopicKey>, cap: usize) -> (Vec<TopicKey>, bool) {
+    let mut topics = set.iter().cloned().collect::<Vec<_>>();
+    topics.sort();
+    let truncated = topics.len() > cap;
+    topics.truncate(cap);
+    (topics, truncated)
+}
+
+#[cfg(test)]
+mod completion_summary_tests {
+    use super::*;
+
+    #[test]
+    fn capped_topic_list_sorts_and_flags_truncation() {
+        let mut set = HashSet::new();
+        for i in 0..5 {
+            set.insert(TopicKey::new("agent", "a", &format!("t{i}")));
+        }
+        let (topics, truncated) = capped_topic_list(&set, 3);
+        assert_eq!(topics.len(), 3);
+        assert!(truncated);
+        assert_eq!(topics[0].topic_id, "t0");
+        let (all, not_truncated) = capped_topic_list(&set, 10);
+        assert_eq!(all.len(), 5);
+        assert!(!not_truncated);
+    }
+
+    #[test]
+    fn completion_summary_serializes_topic_sets_in_camel_case() {
+        let summary = SyncCompletionSummary {
+            pulled_topics: vec![TopicKey::new("agent", "a", "t1")],
+            topics_truncated: true,
+            ..Default::default()
+        };
+        let value = serde_json::to_value(&summary).unwrap();
+        assert_eq!(value["pulledTopics"][0]["topicId"], "t1");
+        assert_eq!(value["pulledTopics"][0]["ownerType"], "agent");
+        assert_eq!(value["pulledTopics"][0]["ownerId"], "a");
+        assert_eq!(value["pushedTopics"], serde_json::json!([]));
+        assert_eq!(value["topicsTruncated"], true);
+        assert_eq!(value["failedTopicIds"], serde_json::json!([]));
+    }
 }
 
 pub fn init_sync_service(_app_handle: AppHandle) -> SyncState {
@@ -1825,6 +1898,8 @@ async fn run_sync_session(
                     attempt_id,
                     completed: tokio::sync::Mutex::new(HashSet::new()),
                     modified: tokio::sync::Mutex::new(HashSet::new()),
+                    pulled: tokio::sync::Mutex::new(HashSet::new()),
+                    pushed: tokio::sync::Mutex::new(HashSet::new()),
                     failed: tokio::sync::Mutex::new(HashSet::new()),
                     legacy_attachment_warnings: std::sync::atomic::AtomicUsize::new(0),
                     total: std::sync::atomic::AtomicUsize::new(0),
@@ -3324,6 +3399,16 @@ pub(crate) fn emit_phase3_batch_log<R: Runtime>(
     };
     emit_sync_log(app_handle, "warning", &message);
     emit_operator_sync_log(app_handle, session_id, "warning", &message);
+    let _ = app_handle.emit(
+        "vcp-sync-progress",
+        json!({
+            "sessionId": session_id,
+            "phase": "message_batch",
+            "batchIndex": batch_index,
+            "batchTotal": total_batches,
+            "topicsInBatch": topics_in_batch,
+        }),
+    );
 }
 
 pub(crate) fn emit_sync_log<R: Runtime>(app_handle: &AppHandle<R>, level: &str, message: &str) {

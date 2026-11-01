@@ -21,6 +21,9 @@ export const formatSyncNoticeLabel = (
     ? `VCP 正在同步 · ${phaseLabel} ${completed}/${total}`
     : `VCP 正在同步 · ${phaseLabel}`;
 
+export const formatSyncBatchNoticeLabel = (batchIndex: number, batchTotal: number): string =>
+  `VCP 正在同步 · 第 ${batchIndex}/${batchTotal} 批`;
+
 export function createSyncForegroundNotice(throttleMs = SYNC_NOTICE_THROTTLE_MS) {
   let active = false;
   let sentLabel = "";

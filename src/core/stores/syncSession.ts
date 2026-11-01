@@ -7,7 +7,8 @@ import { waitUntil } from "../sync/autoSyncTrigger";
 import { useNotificationStore } from "./notification";
 import { isAndroid, isIOS } from "../utils/platform";
 import type { BatteryStatusDto } from "../types/native";
-import { createSyncForegroundNotice, formatSyncNoticeLabel } from "../sync/syncForegroundNotice";
+import { createSyncForegroundNotice, formatSyncBatchNoticeLabel, formatSyncNoticeLabel } from "../sync/syncForegroundNotice";
+import { readSyncTopicSets, type SyncTopicSets } from "../sync/incrementalReload";
 
 type SyncStatus =
   | "idle"
@@ -23,6 +24,8 @@ interface SyncSummary {
   failedTopics: number;
   legacyAttachmentWarnings: number;
   failedTopicIds: string[];
+  /** 完成事件携带的话题集合；旧版本不带或解析失败时为 null，收尾退回全量重载 */
+  topicSets?: SyncTopicSets | null;
 }
 
 interface DesktopSyncInfo {
@@ -408,6 +411,10 @@ export const useSyncSessionStore = defineStore("syncSession", () => {
   // 任何写入信号（元数据/消息阶段 total>0、会话事件缓冲溢出）都保守视为有变化。
   let changeSignalSeen = false;
   let noChangeConfirmed = false;
+  // 元数据阶段（owner/topic）有实际写入：话题集合只覆盖消息，此时增量刷新会漏掉列表变化，收尾必须全量。
+  let metadataChangeSeen = false;
+  // Rust 每批开始时下发的结构化批次进度（phase=message_batch），供通知栏显示「第 x/y 批」。
+  const batchProgress = ref<{ index: number; total: number } | null>(null);
 
   const isCurrentView = (generation: number) =>
     isOpen.value && generation === viewGeneration;
@@ -445,6 +452,8 @@ export const useSyncSessionStore = defineStore("syncSession", () => {
     progressLineId = null;
     changeSignalSeen = false;
     noChangeConfirmed = false;
+    metadataChangeSeen = false;
+    batchProgress.value = null;
     activeTab.value = "live";
     logs.value = [];
     progressData.value = {
@@ -481,7 +490,14 @@ export const useSyncSessionStore = defineStore("syncSession", () => {
           return;
         }
         try {
-          await useDataReload().performFullReload();
+          const reload = useDataReload();
+          const incremental =
+            skipUnchanged &&
+            (await reload.performIncrementalReload(
+              summary.value.topicSets ?? null,
+              metadataChangeSeen,
+            ));
+          if (!incremental) await reload.performFullReload();
           needsReload.value = false;
         } catch (error) {
           console.error("[SyncSession] Failed to reload synchronized data:", error);
@@ -591,6 +607,8 @@ export const useSyncSessionStore = defineStore("syncSession", () => {
     if (!isCurrentAttempt(generation, attempt)) return;
     changeSignalSeen = false;
     noChangeConfirmed = false;
+    metadataChangeSeen = false;
+    batchProgress.value = null;
     awaitingSessionId = true;
     bufferedSessionEvents = [];
     try {
@@ -799,6 +817,10 @@ export const useSyncSessionStore = defineStore("syncSession", () => {
       if (!isAndroid || !isOpen.value || quiet.value) return null;
       if (status.value !== "connecting" && status.value !== "connected") return null;
       const { phase, completed, total } = progressData.value;
+      const batch = batchProgress.value;
+      if (phase === "messages" && batch && batch.total > 1) {
+        return formatSyncBatchNoticeLabel(batch.index, batch.total);
+      }
       return formatSyncNoticeLabel(PHASE_LABELS[phase] ?? "同步处理", completed, total);
     },
     (label) => {
@@ -846,6 +868,7 @@ export const useSyncSessionStore = defineStore("syncSession", () => {
       failedTopics,
       legacyAttachmentWarnings,
       failedTopicIds: allFailedTopicIds,
+      topicSets: readSyncTopicSets(source),
     };
   };
 
@@ -947,6 +970,21 @@ export const useSyncSessionStore = defineStore("syncSession", () => {
 
     if (kind === "progress") {
       if (isTerminal()) return;
+      if (payload.phase === "message_batch") {
+        const index = payload.batchIndex;
+        const total = payload.batchTotal;
+        if (
+          typeof index === "number" &&
+          typeof total === "number" &&
+          Number.isSafeInteger(index) &&
+          Number.isSafeInteger(total) &&
+          index >= 1 &&
+          total >= index
+        ) {
+          batchProgress.value = { index, total };
+        }
+        return;
+      }
       const reportedPhase =
         typeof payload.phase === "string"
           ? payload.phase
@@ -961,6 +999,7 @@ export const useSyncSessionStore = defineStore("syncSession", () => {
         payload.total > 0
       ) {
         changeSignalSeen = true;
+        if (nextPhase !== "messages") metadataChangeSeen = true;
       }
       const indeterminate = INDETERMINATE_PHASES.has(nextPhase);
       const nextTotal = indeterminate
