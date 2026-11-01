@@ -11,8 +11,9 @@ use tauri::{AppHandle, Runtime};
 
 #[cfg(target_os = "android")]
 const TEMP_FILE_MAX_BYTES: usize = 20 * 1024 * 1024;
+// 与 Kotlin ShareIntentHandler.MAX_SHARE_FILES 保持一致
 #[cfg(target_os = "android")]
-const MAX_SHARED_FILES: usize = 16;
+const MAX_SHARED_FILES: usize = 100;
 
 #[cfg(any(target_os = "android", test))]
 fn safe_leaf_name(file_name: &str) -> Result<&str, String> {
@@ -409,11 +410,13 @@ pub struct PickedFileInfo {
     pub staging_ticket: Option<String>,
 }
 
-/// 单次 picker 多选硬上限；与 Kotlin `VcpMobilePlugin.MAX_PICK_FILES` 保持一致。
+/// 单次 picker 多选硬上限；与 Kotlin `VcpMobilePlugin.MAX_PICK_FILES`、前端 `NATIVE_PICK_MAX_ITEMS` 保持一致。
+/// Android 13+ 照片选择器在 Kotlin 侧另与系统 `getPickImagesMaxLimit()` 取小。
 #[cfg(any(target_os = "android", test))]
-const MAX_PICK_FILES: u32 = 16;
+const MAX_PICK_FILES: u32 = 100;
+/// 未传 maxItems 时的默认值：等于硬上限，实际能选多少由系统选择器决定。
 #[cfg(any(target_os = "android", test))]
-const DEFAULT_PICK_ITEMS: u32 = 9;
+const DEFAULT_PICK_ITEMS: u32 = MAX_PICK_FILES;
 
 #[cfg(any(target_os = "android", test))]
 fn pick_limit(requested: Option<u32>) -> u32 {
@@ -539,9 +542,11 @@ mod pick_file_shape_tests {
 
     #[test]
     fn pick_limit_clamps() {
-        assert_eq!(pick_limit(None), 9);
+        assert_eq!(MAX_PICK_FILES, 100);
+        assert_eq!(pick_limit(None), MAX_PICK_FILES);
         assert_eq!(pick_limit(Some(0)), 1);
-        assert_eq!(pick_limit(Some(99)), 16);
+        assert_eq!(pick_limit(Some(9)), 9);
+        assert_eq!(pick_limit(Some(999)), MAX_PICK_FILES);
     }
 
     #[test]

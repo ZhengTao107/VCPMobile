@@ -254,8 +254,9 @@ class VcpMobilePlugin(private val activity: Activity) : Plugin(activity) {
 
     companion object {
         const val TAG = "VcpMobilePlugin"
-        // 单次 picker 多选上限；与 Rust system.rs MAX_PICK_FILES 保持一致
-        private const val MAX_PICK_FILES = 16
+        // 单次 picker 多选上限；与 Rust system.rs MAX_PICK_FILES、前端 NATIVE_PICK_MAX_ITEMS 保持一致。
+        // Android 13+ 照片选择器另与 MediaStore.getPickImagesMaxLimit() 取小，不会超过系统上限。
+        private const val MAX_PICK_FILES = 100
         // 下载目录导出上限：设置备份（JSON + base64 头像）正常远低于此值
         private const val MAX_DOWNLOAD_EXPORT_BYTES = 8 * 1024 * 1024
         private var instanceRef: java.lang.ref.WeakReference<VcpMobilePlugin>? = null
@@ -1573,6 +1574,8 @@ class VcpMobilePlugin(private val activity: Activity) : Plugin(activity) {
 
     private fun launchMultiImagePicker(invoke: Invoke, limit: Int) {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            // EXTRA_PICK_IMAGES_MAX 超过系统上限会抛 IllegalArgumentException。limit 已与前端/Rust 对齐为 100，
+            // 取小即跟随系统，也不让用户选出 collectPickedUris 会截掉的项。
             val maxAllowed = min(limit, MediaStore.getPickImagesMaxLimit())
             if (maxAllowed > 1) {
                 val intent = Intent(MediaStore.ACTION_PICK_IMAGES).apply {
@@ -3164,7 +3167,7 @@ class VerifyApkSignatureArgs {
 class PickFileArgs {
     var mode: String = "file"
     var multiple: Boolean = false
-    var maxItems: Int = 9
+    var maxItems: Int = 100
 }
 
 @InvokeArg

@@ -125,7 +125,8 @@ class ShareIntentHandler(
 
     companion object {
         private const val TAG = "ShareIntentHandler"
-        private const val MAX_SHARE_FILES = 16
+        // 与 Rust system.rs MAX_SHARED_FILES 保持一致；单个/总大小仍受 ShareCopyBudget 约束
+        private const val MAX_SHARE_FILES = 100
         private const val MAX_TEXT_CHARS = 1_000_000
         private const val MIN_FREE_BYTES = 64L * 1024 * 1024
     }
