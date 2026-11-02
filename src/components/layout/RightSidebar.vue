@@ -16,6 +16,7 @@ import {
   Bot,
   MessageSquareText,
   Mail,
+  PenLine,
 } from 'lucide-vue-next';
 import { useNotificationStore } from '../../core/stores/notification';
 import { useNotificationProcessor } from '../../core/composables/useNotificationProcessor';
@@ -24,6 +25,7 @@ import NotificationStatusBar from '../../features/notification/NotificationStatu
 import NotificationList from '../../features/notification/NotificationList.vue';
 import { useOverlayStore } from '../../core/stores/overlay';
 import { isAndroid } from '../../core/utils/platform';
+import { useRouter } from 'vue-router';
 
 const props = defineProps<{ isOpen: boolean }>();
 
@@ -34,6 +36,7 @@ const emit = defineEmits<{
 const store = useNotificationStore();
 const { processPayload } = useNotificationProcessor();
 const overlayStore = useOverlayStore();
+const router = useRouter();
 
 const openDistributedView = () => {
   overlayStore.openDistributed();
@@ -96,6 +99,15 @@ const moreTools = [
     label: 'VCP CLI',
     icon: SquareTerminal,
     open: () => overlayStore.openCliManifest(),
+  },
+  {
+    id: 'canvas',
+    label: 'Canvas',
+    icon: PenLine,
+    open: () => {
+      emit('close');
+      void router.push('/canvas');
+    },
   },
   {
     id: 'sync',
