@@ -1,10 +1,12 @@
 <script setup lang="ts">
-import { ref, watch, onUnmounted } from 'vue';
+import { computed, ref, watch, onUnmounted } from 'vue';
 import { useModalHistory } from '../../../core/composables/useModalHistory';
 import { useNotificationStore } from '../../../core/stores/notification';
 import { useThemeStore } from '../../../core/stores/theme';
-import { isAndroid } from '../../../core/utils/platform';
-import { saveImageToGallery } from 'tauri-plugin-vcp-mobile';
+import { isAndroid, isIOS } from '../../../core/utils/platform';
+import { saveBlobToGallery } from '../../../core/utils/temporaryExport';
+import { exportSvg, serializeSvgWithTheme } from '../../../core/utils/renderedImageExport';
+import { instantiateMermaidSvg } from '../utils/mermaidRenderer';
 
 const props = defineProps<{
   visible: boolean;
@@ -30,8 +32,12 @@ const isDragging = ref(false);
 
 const fullscreenViewportRef = ref<HTMLElement | null>(null);
 const fullscreenCanvasRef = ref<HTMLElement | null>(null);
+const surfaceRef = ref<HTMLElement | null>(null);
+const instanceSvg = computed(() => props.svgHtml ? instantiateMermaidSvg(props.svgHtml) : '');
 
 const isCopyDropdownVisible = ref(false);
+const isExporting = ref(false);
+let exportController: AbortController | null = null;
 
 const toggleCopyDropdown = (e: MouseEvent) => {
   e.stopPropagation();
@@ -46,7 +52,7 @@ watch(() => props.visible, (newVal) => {
   if (newVal) {
     registerModal(modalId, () => {
       emit('close');
-    });
+    }, () => surfaceRef.value);
     // Reset transform on open to default 100% size
     scale.value = 1;
     translateX.value = 0;
@@ -54,13 +60,17 @@ watch(() => props.visible, (newVal) => {
     
     window.addEventListener('click', closeCopyDropdown);
   } else {
+    exportController?.abort();
     unregisterModal(modalId);
     window.removeEventListener('click', closeCopyDropdown);
     isCopyDropdownVisible.value = false;
   }
-});
+}, { immediate: true });
+
+watch(() => props.svgHtml, () => exportController?.abort());
 
 onUnmounted(() => {
+  exportController?.abort();
   unregisterModal(modalId);
   window.removeEventListener('click', closeCopyDropdown);
 });
@@ -98,7 +108,9 @@ const handlePointerDown = (e: PointerEvent) => {
   
   try {
     fullscreenViewportRef.value.setPointerCapture(e.pointerId);
-  } catch (err) {}
+  } catch {
+    // The pointer may already have ended; viewport events still handle the gesture.
+  }
   
   activePointers.set(e.pointerId, { clientX: e.clientX, clientY: e.clientY });
   const pointerList = Array.from(activePointers.values());
@@ -144,7 +156,9 @@ const handlePointerUp = (e: PointerEvent) => {
   if (fullscreenViewportRef.value) {
     try {
       fullscreenViewportRef.value.releasePointerCapture(e.pointerId);
-    } catch (err) {}
+    } catch {
+      // Capture may already be released by the browser or pointer cancellation.
+    }
   }
   
   activePointers.delete(e.pointerId);
@@ -195,7 +209,8 @@ const copySource = async () => {
 
 const copySvg = async () => {
   try {
-    await navigator.clipboard.writeText(props.svgHtml);
+    const svg = fullscreenCanvasRef.value?.querySelector('svg');
+    await navigator.clipboard.writeText(svg ? serializeSvgWithTheme(svg) : props.svgHtml);
     notificationStore.addNotification({
       type: 'success',
       title: '复制成功',
@@ -209,81 +224,46 @@ const copySvg = async () => {
 };
 
 
-const exportToGallery = () => {
-  if (!fullscreenCanvasRef.value) return;
+const exportToGallery = async () => {
+  if (isExporting.value || !props.visible || !fullscreenCanvasRef.value) return;
   const svg = fullscreenCanvasRef.value.querySelector('svg');
   if (!svg) return;
 
-  const clonedSvg = svg.cloneNode(true) as SVGElement;
-  clonedSvg.setAttribute('xmlns', 'http://www.w3.org/2000/svg');
-  
-  const svgWidth = svg.getBBox?.().width || svg.viewBox?.baseVal?.width || svg.clientWidth || 600;
-  const svgHeight = svg.getBBox?.().height || svg.viewBox?.baseVal?.height || svg.clientHeight || 400;
-  
-  clonedSvg.setAttribute('width', String(svgWidth));
-  clonedSvg.setAttribute('height', String(svgHeight));
-
-  const svgString = new XMLSerializer().serializeToString(clonedSvg);
-  // 100% 规避 Android WebView 下 URL.createObjectURL(Blob) 造成的 Canvas 污损 (Tainted Canvas) 安全异常，
-  // 使用 inline Base64 Data URL 方案。使用 unescape(encodeURIComponent) 兼容中文及特殊字符编码。
-  const base64Svg = window.btoa(unescape(encodeURIComponent(svgString)));
-  const dataUrlSrc = `data:image/svg+xml;base64,${base64Svg}`;
-
-  const img = new Image();
-  img.onload = () => {
-    const canvas = document.createElement('canvas');
-    const scaleFactor = Math.min(2.5, Math.max(1.0, 2048 / Math.max(svgWidth, svgHeight)));
-    
-    canvas.width = svgWidth * scaleFactor;
-    canvas.height = svgHeight * scaleFactor;
-    
-    const ctx = canvas.getContext('2d');
-    if (ctx) {
-      ctx.fillStyle = themeStore.isDarkResolved ? '#0d1117' : '#ffffff';
-      ctx.fillRect(0, 0, canvas.width, canvas.height);
-      ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
-      
-      try {
-        const dataUrl = canvas.toDataURL('image/png');
-        saveImageToGallery(dataUrl, `mermaid_${Date.now()}.png`).then(() => {
-          notificationStore.addNotification({
-            type: 'success',
-            title: '保存成功',
-            message: '图表已作为高清 PNG 图片保存到系统相册',
-            toastOnly: true
-          });
-        }).catch((err) => {
-          console.error('Save image to gallery failed:', err);
-          notificationStore.addNotification({
-            type: 'error',
-            title: '保存失败',
-            message: '保存失败：' + String(err),
-            toastOnly: true
-          });
-        });
-      } catch (err) {
-        console.error('Canvas serialization failed:', err);
-        notificationStore.addNotification({
-          type: 'error',
-          title: '保存失败',
-          message: '保存失败：Canvas 序列化受限',
-          toastOnly: true
-        });
-      }
-    }
-  };
-  
-  img.onerror = (e) => {
-    console.error('Image load failed', e);
-    notificationStore.addNotification({
-      type: 'error',
-      title: '导出失败',
-      message: '图表图像加载失败，无法渲染',
-      toastOnly: true
+  isExporting.value = true;
+  const controller = new AbortController();
+  exportController = controller;
+  let submitted = false;
+  try {
+    // The shared pixel queue ends after encoding; native presentation owns its file separately.
+    const png = await exportSvg(svg, controller.signal, {
+      preferredScale: 2.5,
+      background: themeStore.isDarkResolved ? '#0d1117' : '#ffffff',
     });
-  };
-  
-  img.src = dataUrlSrc;
+    submitted = true;
+    await saveBlobToGallery(png, `mermaid_${Date.now()}.png`, controller.signal);
+    // 原生保存已提交后，关闭预览不意味着取消；按实际结果提示。
+    notificationStore.addNotification({
+      type: 'success',
+      title: '保存成功',
+      message: '图表已作为 PNG 图片保存到系统相册',
+      toastOnly: true,
+    });
+  } catch (err) {
+    if (!(err instanceof DOMException && err.name === 'AbortError') && (submitted || !controller.signal.aborted)) {
+      console.error('Export image to gallery failed:', err);
+      notificationStore.addNotification({
+        type: 'error',
+        title: '保存失败',
+        message: '保存失败：' + String(err),
+        toastOnly: true,
+      });
+    }
+  } finally {
+    if (exportController === controller) {
+      exportController = null;
+      isExporting.value = false;
+    }
+  }
 };
 </script>
 
@@ -297,7 +277,7 @@ const exportToGallery = () => {
       leave-from-class="translate-y-0 opacity-100"
       leave-to-class="translate-y-10 opacity-0"
     >
-      <div v-if="visible" class="vcp-safe-inline fixed inset-0 z-viewer flex flex-col select-none overflow-hidden pb-[var(--vcp-safe-bottom,0px)]"
+      <div v-if="visible" ref="surfaceRef" class="vcp-viewport-surface vcp-safe-inline fixed inset-0 z-viewer flex flex-col select-none overflow-hidden pb-[var(--vcp-safe-bottom,0px)]"
         :class="themeStore.isDarkResolved ? 'bg-[#0d1117] text-gray-200' : 'bg-[#f8fafc] text-gray-800'">
         
         <!-- Header -->
@@ -339,10 +319,10 @@ const exportToGallery = () => {
             </div>
 
             <!-- 保存到相册按钮（改用下载图标，文字按钮样式） -->
-            <button v-if="isAndroid" @click="exportToGallery" class="flex items-center gap-1.5 px-3 py-1.5 rounded-lg border text-xs active:scale-95 transition-all"
+            <button v-if="isAndroid || isIOS" @click="exportToGallery" :disabled="isExporting" :aria-busy="isExporting" class="flex items-center gap-1.5 px-3 py-1.5 rounded-lg border text-xs active:scale-95 transition-all disabled:opacity-50"
               :class="themeStore.isDarkResolved ? 'border-white/10 bg-white/5 text-gray-400' : 'border-black/10 bg-black/5 text-gray-600'">
               <div class="i-ph:download-simple-bold w-3.5 h-3.5"></div>
-              <span>保存到相册</span>
+              <span>{{ isExporting ? '正在保存…' : '保存到相册' }}</span>
             </button>
           </div>
         </div>
@@ -364,15 +344,17 @@ const exportToGallery = () => {
           @wheel="handleWheel"
           @dblclick="handleDblClick"
         >
+          <!-- eslint-disable vue/no-v-html -- SVG comes from strict-mode Mermaid or guarded message HTML; instanceSvg only rebases identifiers. -->
           <div 
             ref="fullscreenCanvasRef"
-            class="inline-flex items-center justify-center min-w-full min-h-full p-8 box-border origin-center"
+            class="mermaid-fullscreen-canvas inline-flex items-center justify-center min-w-full min-h-full p-8 box-border origin-center"
             :style="{
               transform: `translate(${translateX}px, ${translateY}px) scale(${scale})`,
               transition: isDragging ? 'none' : 'transform 0.1s ease-out'
             }"
-            v-html="svgHtml"
+            v-html="instanceSvg"
           ></div>
+          <!-- eslint-enable vue/no-v-html -->
         </div>
         
         <!-- Floating Control Bar (No Backdrop Blur, Solid background) -->
@@ -407,8 +389,8 @@ const exportToGallery = () => {
 </template>
 
 <style scoped>
-/* Ensure custom SVGs are responsive inside canvas */
-:deep(svg) {
+/* Resize only the diagram root; KaTeX's nested SVGs own their symbol heights. */
+.mermaid-fullscreen-canvas :deep(> svg) {
   max-width: none !important;
   height: auto !important;
 }

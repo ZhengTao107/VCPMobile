@@ -17,6 +17,11 @@ const COMMANDS: &[&str] = &[
     "check_auto_start_permission",
     "get_free_disk_space",
     "pick_file",
+    "prepare_file_operation",
+    "cancel_file_operation",
+    "get_webview_geometry",
+    "connect_webview_resume",
+    "complete_webview_resume",
     "get_battery_status",
     "get_network_status",
     "open_file_native",
@@ -44,6 +49,7 @@ const COMMANDS: &[&str] = &[
     "open_unknown_sources_settings",
     "acquire_ota_keepalive",
     "release_ota_keepalive",
+    "trigger_haptic_feedback",
 ];
 
 fn main() {
@@ -51,4 +57,26 @@ fn main() {
         .android_path("android")
         .ios_path("ios")
         .build();
+
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("ios") {
+        // swift-rs links the plugin's SwiftPM static product, which does not
+        // absorb binaryTarget archives. Link the custom ORT core explicitly.
+        let runtime = std::path::PathBuf::from(
+            std::env::var_os("CARGO_MANIFEST_DIR").expect("Cargo sets CARGO_MANIFEST_DIR"),
+        )
+        .join("ios/Runtime");
+        let archive = runtime.join("libonnxruntime.a");
+        assert!(
+            archive.is_file(),
+            "Build the custom iOS voice runtime with runtime-assets/voice/build_runtime.py ios before Cargo"
+        );
+        println!("cargo:rerun-if-changed={}", archive.display());
+        println!("cargo:rustc-link-search=native={}", runtime.display());
+        println!("cargo:rustc-link-lib=static=onnxruntime");
+        // CPU MLAS uses its own kernels. The upstream CPU build needs
+        // Foundation and libc++; no Accelerate/CoreML provider is enabled.
+        println!("cargo:rustc-link-lib=c++");
+        println!("cargo:rustc-link-lib=objc");
+        println!("cargo:rustc-link-lib=framework=Foundation");
+    }
 }

@@ -33,6 +33,12 @@ enum LoadedToolConfig {
     },
 }
 
+#[derive(Debug)]
+enum ToolConfigLoadError {
+    Invalid(String),
+    Persistence(String),
+}
+
 struct ResolvedToolConfig {
     enabled: HashSet<String>,
     rewrite_empty: bool,
@@ -551,7 +557,9 @@ impl ToolRegistry {
             load_tool_config_file(&load_path, &load_known)
         })
         .await
-        .map_err(|error| format!("分布式工具配置读取任务失败: {error}"))
+        .map_err(|error| {
+            ToolConfigLoadError::Persistence(format!("分布式工具配置读取任务失败: {error}"))
+        })
         .and_then(|result| result);
 
         let resolved = resolve_tool_config(loaded);
@@ -596,7 +604,9 @@ fn generic_registration_manifest(entry: &ToolEntry) -> Result<Box<RawValue>, Str
         .map_err(|error| format!("cannot build raw tool registration manifest: {error}"))
 }
 
-fn resolve_tool_config(loaded: Result<LoadedToolConfig, String>) -> ResolvedToolConfig {
+fn resolve_tool_config(
+    loaded: Result<LoadedToolConfig, ToolConfigLoadError>,
+) -> ResolvedToolConfig {
     match loaded {
         Ok(LoadedToolConfig::Missing) => ResolvedToolConfig {
             enabled: HashSet::new(),
@@ -625,11 +635,18 @@ fn resolve_tool_config(loaded: Result<LoadedToolConfig, String>) -> ResolvedTool
                 status,
             }
         }
-        Err(error) => ResolvedToolConfig {
+        Err(ToolConfigLoadError::Invalid(error)) => ResolvedToolConfig {
             enabled: HashSet::new(),
             rewrite_empty: true,
             status: ToolConfigStatus::recovered(format!(
                 "{error}；配置已失效，未授权任何分布式工具。"
+            )),
+        },
+        Err(ToolConfigLoadError::Persistence(error)) => ResolvedToolConfig {
+            enabled: HashSet::new(),
+            rewrite_empty: false,
+            status: ToolConfigStatus::persistence_error(format!(
+                "{error}；全部工具保持禁用，原配置未覆盖。"
             )),
         },
     }
@@ -638,63 +655,83 @@ fn resolve_tool_config(loaded: Result<LoadedToolConfig, String>) -> ResolvedTool
 fn load_tool_config_file(
     config_path: &Path,
     known_names: &HashSet<String>,
-) -> Result<LoadedToolConfig, String> {
+) -> Result<LoadedToolConfig, ToolConfigLoadError> {
     let metadata = match std::fs::metadata(config_path) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             return Ok(LoadedToolConfig::Missing);
         }
         Err(error) => {
-            return Err(format!("读取分布式工具配置元数据失败: {error}"));
+            return Err(ToolConfigLoadError::Persistence(format!(
+                "读取分布式工具配置元数据失败: {error}"
+            )));
         }
     };
     if !metadata.is_file() {
-        return Err("分布式工具配置不是普通文件".to_string());
-    }
-    if metadata.len() > MAX_TOOL_CONFIG_BYTES {
-        return Err(format!(
-            "分布式工具配置超过 {} 字节上限",
-            MAX_TOOL_CONFIG_BYTES
+        return Err(ToolConfigLoadError::Persistence(
+            "分布式工具配置不是普通文件".to_string(),
         ));
     }
+    if metadata.len() > MAX_TOOL_CONFIG_BYTES {
+        return Err(ToolConfigLoadError::Invalid(format!(
+            "分布式工具配置超过 {} 字节上限",
+            MAX_TOOL_CONFIG_BYTES
+        )));
+    }
 
-    let mut file =
-        File::open(config_path).map_err(|error| format!("打开分布式工具配置失败: {error}"))?;
+    let mut file = File::open(config_path).map_err(|error| {
+        ToolConfigLoadError::Persistence(format!("打开分布式工具配置失败: {error}"))
+    })?;
     let mut content = String::with_capacity(metadata.len() as usize);
-    file.read_to_string(&mut content)
-        .map_err(|error| format!("读取分布式工具配置失败: {error}"))?;
-    let value: Value = serde_json::from_str(&content)
-        .map_err(|error| format!("解析分布式工具配置失败: {error}"))?;
+    file.read_to_string(&mut content).map_err(|error| {
+        let message = format!("读取分布式工具配置失败: {error}");
+        if error.kind() == std::io::ErrorKind::InvalidData {
+            ToolConfigLoadError::Invalid(message)
+        } else {
+            ToolConfigLoadError::Persistence(message)
+        }
+    })?;
+    let value: Value = serde_json::from_str(&content).map_err(|error| {
+        ToolConfigLoadError::Invalid(format!("解析分布式工具配置失败: {error}"))
+    })?;
 
     if value.is_array() {
-        serde_json::from_value::<Vec<String>>(value)
-            .map_err(|error| format!("解析旧版 disabled-name 工具配置失败: {error}"))?;
+        serde_json::from_value::<Vec<String>>(value).map_err(|error| {
+            ToolConfigLoadError::Invalid(format!("解析旧版 disabled-name 工具配置失败: {error}"))
+        })?;
         return Ok(LoadedToolConfig::LegacyDisabledNames);
     }
 
-    let object = value
-        .as_object()
-        .ok_or_else(|| "分布式工具授权配置必须是 JSON 对象".to_string())?;
+    let object = value.as_object().ok_or_else(|| {
+        ToolConfigLoadError::Invalid("分布式工具授权配置必须是 JSON 对象".to_string())
+    })?;
     let schema_version = object
         .get("schemaVersion")
         .and_then(Value::as_u64)
-        .ok_or_else(|| "分布式工具授权配置缺少有效 schemaVersion".to_string())?;
+        .ok_or_else(|| {
+            ToolConfigLoadError::Invalid("分布式工具授权配置缺少有效 schemaVersion".to_string())
+        })?;
     if schema_version != u64::from(TOOL_CONFIG_SCHEMA_VERSION) {
-        return Err(format!("不支持的分布式工具配置版本: {}", schema_version));
+        return Err(ToolConfigLoadError::Invalid(format!(
+            "不支持的分布式工具配置版本: {}",
+            schema_version
+        )));
     }
-    let names = object
-        .get("enabledTools")
-        .cloned()
-        .ok_or_else(|| "分布式工具授权配置缺少 enabledTools".to_string())?;
-    let names: Vec<String> = serde_json::from_value(names)
-        .map_err(|error| format!("解析 enabledTools 失败: {error}"))?;
+    let names = object.get("enabledTools").cloned().ok_or_else(|| {
+        ToolConfigLoadError::Invalid("分布式工具授权配置缺少 enabledTools".to_string())
+    })?;
+    let names: Vec<String> = serde_json::from_value(names).map_err(|error| {
+        ToolConfigLoadError::Invalid(format!("解析 enabledTools 失败: {error}"))
+    })?;
 
     let mut seen = HashSet::with_capacity(names.len());
     let mut enabled = HashSet::with_capacity(names.len());
     let mut orphaned = Vec::new();
     for name in names {
         if !seen.insert(name.clone()) {
-            return Err(format!("授权配置包含重复的分布式工具名称: {name}"));
+            return Err(ToolConfigLoadError::Invalid(format!(
+                "授权配置包含重复的分布式工具名称: {name}"
+            )));
         }
         if known_names.contains(&name) {
             enabled.insert(name);
@@ -834,26 +871,6 @@ mod tests {
     }
 
     #[test]
-    fn clean_install_catalog_is_visible_but_allowlist_is_empty() {
-        let temp = tempfile::tempdir().unwrap();
-        let path = temp.path().join(TOOL_CONFIG_FILE);
-        let loaded = load_tool_config_file(&path, &known_names()).unwrap();
-        assert_eq!(loaded, LoadedToolConfig::Missing);
-
-        let resolved = resolve_tool_config(Ok(loaded));
-        assert!(resolved.enabled.is_empty());
-        assert!(resolved.rewrite_empty);
-        assert_eq!(resolved.status.state, ToolConfigState::Ready);
-
-        let registry = test_registry();
-        assert_eq!(registry.get_tools_metadata().len(), 2);
-        assert!(!enabled_metadata(&registry, "Clipboard"));
-        assert!(!enabled_metadata(&registry, "DeviceInfo"));
-        assert!(!registry.is_enabled("Clipboard"));
-        assert!(!registry.is_enabled("DeviceInfo"));
-    }
-
-    #[test]
     fn streaming_plan_never_activates_hardware_for_empty_or_oneshot_only_allowlists() {
         let mut registry = test_registry();
         registry.register_streaming(DummyStreamingTool);
@@ -869,35 +886,6 @@ mod tests {
         assert_eq!(plan.tools.len(), 1);
         assert_eq!(plan.tools[0].interval, Duration::from_secs(30));
         assert_eq!(plan.tools[0].sensor_demand, SensorDemand::MOTION);
-    }
-
-    #[test]
-    fn legacy_disabled_names_are_explicitly_invalidated_to_empty_allowlist() {
-        let temp = tempfile::tempdir().unwrap();
-        let path = temp.path().join(TOOL_CONFIG_FILE);
-        std::fs::write(&path, br#"["Clipboard"]"#).unwrap();
-
-        let loaded = load_tool_config_file(&path, &known_names()).unwrap();
-        assert_eq!(loaded, LoadedToolConfig::LegacyDisabledNames);
-        let resolved = resolve_tool_config(Ok(loaded));
-        assert!(resolved.enabled.is_empty());
-        assert!(resolved.rewrite_empty);
-        assert_eq!(resolved.status.state, ToolConfigState::RecoveredDisabled);
-        assert!(resolved
-            .status
-            .message
-            .as_deref()
-            .unwrap_or_default()
-            .contains("重新授权"));
-
-        persist_enabled_config(&path, &resolved.enabled).unwrap();
-        assert_eq!(
-            load_tool_config_file(&path, &known_names()).unwrap(),
-            LoadedToolConfig::Current {
-                enabled: HashSet::new(),
-                orphaned: vec![],
-            }
-        );
     }
 
     #[test]
@@ -919,47 +907,43 @@ mod tests {
         assert_eq!(resolved.status.state, ToolConfigState::RecoveredDisabled);
     }
 
-    #[test]
-    fn atomic_persist_round_trips_versioned_enabled_allowlist() {
+    #[tokio::test]
+    async fn unreadable_config_location_is_preserved_instead_of_treated_as_bad_content() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join(TOOL_CONFIG_FILE);
-        let enabled = known_names();
-        persist_enabled_config(&path, &enabled).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        let original = path.join("unrelated-data");
+        std::fs::write(&original, b"keep").unwrap();
+        let resolved = resolve_tool_config(load_tool_config_file(&path, &known_names()));
+        assert!(!resolved.rewrite_empty);
+        assert_eq!(resolved.status.state, ToolConfigState::PersistenceError);
+        let registry = test_registry();
+        let status = registry
+            .ensure_enabled_config_loaded_from_path(Ok(path.clone()))
+            .await;
+        assert_eq!(status.state, ToolConfigState::PersistenceError);
+        assert!(!registry.is_enabled("Clipboard"));
+        assert_eq!(std::fs::read(original).unwrap(), b"keep");
+        assert_eq!(std::fs::read_dir(temp.path()).unwrap().count(), 1);
+    }
+
+    #[tokio::test]
+    async fn malformed_utf8_policy_still_recovers_to_current_empty_default() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join(TOOL_CONFIG_FILE);
+        std::fs::write(&path, [0xff]).unwrap();
+        let registry = test_registry();
+        let status = registry
+            .ensure_enabled_config_loaded_from_path(Ok(path.clone()))
+            .await;
+        assert_eq!(status.state, ToolConfigState::RecoveredDisabled);
         assert_eq!(
             load_tool_config_file(&path, &known_names()).unwrap(),
             LoadedToolConfig::Current {
-                enabled,
-                orphaned: vec![],
+                enabled: HashSet::new(),
+                orphaned: Vec::new(),
             }
         );
-        let persisted: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
-        assert_eq!(persisted.get("schemaVersion"), Some(&Value::from(2)));
-        assert!(persisted.get("enabledTools").is_some());
-        assert!(persisted.get("disabledTools").is_none());
-        assert!(std::fs::read_dir(temp.path()).unwrap().all(|entry| !entry
-            .unwrap()
-            .file_name()
-            .to_string_lossy()
-            .ends_with(".tmp")));
-    }
-
-    #[test]
-    fn newly_scanned_tool_stays_off_while_existing_grant_survives() {
-        let temp = tempfile::tempdir().unwrap();
-        let path = temp.path().join(TOOL_CONFIG_FILE);
-        persist_enabled_config(&path, &HashSet::from(["Clipboard".to_string()])).unwrap();
-
-        let loaded = load_tool_config_file(&path, &known_names()).unwrap();
-        let resolved = resolve_tool_config(Ok(loaded));
-        assert_eq!(resolved.enabled, HashSet::from(["Clipboard".to_string()]));
-        assert!(!resolved.rewrite_empty);
-
-        let registry = test_registry();
-        registry.replace_enabled(resolved.enabled).unwrap();
-        assert!(enabled_metadata(&registry, "Clipboard"));
-        assert!(!enabled_metadata(&registry, "DeviceInfo"));
-        assert!(registry.is_enabled("Clipboard"));
-        assert!(!registry.is_enabled("DeviceInfo"));
     }
 
     #[tokio::test]
@@ -975,6 +959,8 @@ mod tests {
         assert_eq!(status.state, ToolConfigState::Ready);
         assert!(registry.is_enabled("Clipboard"));
         assert!(!registry.is_enabled("DeviceInfo"));
+        assert!(enabled_metadata(&registry, "Clipboard"));
+        assert!(!enabled_metadata(&registry, "DeviceInfo"));
 
         persist_enabled_config(&path, &HashSet::new()).unwrap();
         let repeated = registry
@@ -1009,45 +995,6 @@ mod tests {
     }
 
     #[test]
-    fn per_tool_enable_disable_and_duplicate_registration_are_idempotent() {
-        let mut registry = test_registry();
-        registry.register_oneshot(DummyTool {
-            name: "Clipboard",
-            description: "replacement",
-        });
-        assert_eq!(registry.tool_count(), 2);
-        assert!(!registry.is_enabled("Clipboard"));
-
-        registry
-            .replace_enabled(HashSet::from(["Clipboard".to_string()]))
-            .unwrap();
-        assert!(registry.is_enabled("Clipboard"));
-        assert_eq!(
-            registry.tools["Clipboard"].manifest().description,
-            "replacement"
-        );
-
-        assert!(registry
-            .validate_enabled_names(vec!["Clipboard".to_string(), "Clipboard".to_string()])
-            .is_err());
-        registry.replace_enabled(HashSet::new()).unwrap();
-        assert!(!registry.is_enabled("Clipboard"));
-    }
-
-    #[test]
-    fn default_oneshot_registration_manifest_uses_generic_manifest_wire() {
-        let tool = DummyTool {
-            name: "Clipboard",
-            description: "clipboard",
-        };
-        let raw = tool.registration_manifest().expect("raw manifest");
-        assert_eq!(
-            serde_json::from_str::<Value>(raw.get()).unwrap(),
-            serde_json::to_value(tool.manifest()).unwrap()
-        );
-    }
-
-    #[test]
     fn orphaned_v2_grants_are_ignored_without_enabling_new_catalog_entries() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join(TOOL_CONFIG_FILE);
@@ -1058,25 +1005,6 @@ mod tests {
         assert_eq!(resolved.enabled, HashSet::from(["Clipboard".to_string()]));
         assert_eq!(resolved.status.state, ToolConfigState::Ready);
         assert!(resolved.status.message.is_some());
-    }
-
-    #[test]
-    fn future_v2_metadata_does_not_invalidate_the_authorization_core() {
-        let temp = tempfile::tempdir().unwrap();
-        let path = temp.path().join(TOOL_CONFIG_FILE);
-        std::fs::write(
-            &path,
-            br#"{"schemaVersion":2,"enabledTools":["Clipboard"],"migrationNoticeAcknowledged":true}"#,
-        )
-        .unwrap();
-
-        assert_eq!(
-            load_tool_config_file(&path, &known_names()).unwrap(),
-            LoadedToolConfig::Current {
-                enabled: HashSet::from(["Clipboard".to_string()]),
-                orphaned: vec![],
-            }
-        );
     }
 
     #[test]

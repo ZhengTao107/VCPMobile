@@ -318,6 +318,7 @@ export const useVcpCliStore = defineStore("vcpCli", () => {
 
   const runtimeStatus = ref<VcpCliRuntimeStatus | null>(null);
   const runtimeLoading = ref(false);
+  const runtimeGenerationRefreshing = ref(false);
   const runtimeError = ref<VcpCliUiError | null>(null);
   const jobs = ref<VcpCliJobSummary[]>([]);
   const jobsLoading = ref(false);
@@ -496,6 +497,7 @@ export const useVcpCliStore = defineStore("vcpCli", () => {
     if (!adoptRuntimeGeneration(next)) return false;
     if (current === null || current === next) return true;
     runtimeLoading.value = true;
+    runtimeGenerationRefreshing.value = true;
     if (!generationRefreshPromise && viewVisible.value) {
       const generation = viewGeneration.value;
       const owner = ++generationRefreshOwner;
@@ -503,7 +505,10 @@ export const useVcpCliStore = defineStore("vcpCli", () => {
         const ready = await refreshStatus(generation);
         if (ready && isCurrentView(generation)) await refreshJobs(generation);
       })().finally(() => {
-        if (owner === generationRefreshOwner) generationRefreshPromise = null;
+        if (owner === generationRefreshOwner) {
+          generationRefreshPromise = null;
+          runtimeGenerationRefreshing.value = false;
+        }
       });
       generationRefreshPromise = refresh;
     }
@@ -598,6 +603,11 @@ export const useVcpCliStore = defineStore("vcpCli", () => {
   }
 
   function closeView(): void {
+    if (pendingSkillImportOperationId.value) {
+      void invoke("plugin:vcp-mobile|cancel_file_operation", {
+        operationId: pendingSkillImportOperationId.value,
+      }).catch(console.warn);
+    }
     viewVisible.value = false;
     viewGeneration.value += 1;
     runGeneration += 1;
@@ -607,6 +617,7 @@ export const useVcpCliStore = defineStore("vcpCli", () => {
     resetJobDetail();
     resetSkillDetail();
     runtimeLoading.value = false;
+    runtimeGenerationRefreshing.value = false;
     jobsLoading.value = false;
     skillsLoading.value = false;
     runBusy.value = false;
@@ -966,11 +977,13 @@ export const useVcpCliStore = defineStore("vcpCli", () => {
     pendingSkillImportOperationId.value = operationId;
     skillImportBusy.value = true;
     skillImportError.value = null;
+    let pickedPath: string | undefined;
     try {
       const picked = await invoke<NativePickedFile | null>(
         VCP_CLI_NATIVE_PICK_FILE_COMMAND,
-        { mode: "file" },
+        { mode: "file", operationId },
       );
+      pickedPath = picked?.path;
       if (!isCurrentView(view) || !picked?.path) {
         if (isCurrentView(view)) pendingSkillImportOperationId.value = null;
         return;
@@ -1004,12 +1017,19 @@ export const useVcpCliStore = defineStore("vcpCli", () => {
         pendingSkillImportOperationId.value !== operationId
       )
         return;
+      if (String(error).toLowerCase().includes("cancel")) {
+        pendingSkillImportOperationId.value = null;
+        return;
+      }
       skillImportError.value = {
         code: "skill_import_error",
         message: describeError(error),
       };
       // Preserve the operation id so an ambiguous inspect IPC can replay its owned candidate.
     } finally {
+      if (pickedPath) {
+        await invoke("plugin:vcp-mobile|delete_temp_file", { filePath: pickedPath }).catch(console.warn);
+      }
       if (mutation === skillMutationGeneration) skillImportBusy.value = false;
     }
   }
@@ -1209,6 +1229,7 @@ export const useVcpCliStore = defineStore("vcpCli", () => {
     pollGeneration,
     runtimeStatus,
     runtimeLoading,
+    runtimeGenerationRefreshing,
     runtimeError,
     jobs,
     jobsLoading,

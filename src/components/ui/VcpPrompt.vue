@@ -2,13 +2,15 @@
 defineOptions({
   inheritAttrs: false
 });
-import { ref, onMounted, nextTick, watch } from 'vue';
+import { ref, nextTick, watch, onUnmounted, useId } from 'vue';
 import { useModalHistory } from '../../core/composables/useModalHistory';
 
 const props = defineProps<{
   title: string;
   initialValue?: string;
   placeholder?: string;
+  inputMode?: 'text' | 'numeric';
+  validate?: (value: string) => string | null;
   isOpen: boolean;
 }>();
 
@@ -19,23 +21,42 @@ const emit = defineEmits<{
 }>();
 
 const { registerModal, unregisterModal } = useModalHistory();
-const modalId = 'VcpPrompt';
+const modalId = 'Prompt';
+const surfaceRef = ref<HTMLElement | null>(null);
+const inputValue = ref(props.initialValue || '');
+const inputRef = ref<HTMLInputElement | null>(null);
+const isComposing = ref(false);
+const validationError = ref<string | null>(null);
+const errorId = useId();
+watch(inputValue, () => { validationError.value = null; });
+watch(() => props.initialValue, value => {
+  inputValue.value = value || '';
+  validationError.value = null;
+});
 
 watch(() => props.isOpen, (newVal) => {
+  isComposing.value = false;
   if (newVal) {
+    inputValue.value = props.initialValue || '';
+    validationError.value = null;
     registerModal(modalId, () => {
       emit('cancel');
       emit('update:isOpen', false);
+    }, () => surfaceRef.value);
+    nextTick(() => {
+      if (!props.isOpen) return;
+      inputRef.value?.focus({ preventScroll: true });
+      inputRef.value?.select();
     });
   } else {
     unregisterModal(modalId);
   }
-});
-
-const inputValue = ref(props.initialValue || '');
-const inputRef = ref<HTMLInputElement | null>(null);
+}, { immediate: true });
+onUnmounted(() => unregisterModal(modalId));
 
 const handleConfirm = () => {
+  validationError.value = props.validate?.(inputValue.value) ?? null;
+  if (validationError.value) return;
   emit('confirm', inputValue.value);
   emit('update:isOpen', false);
 };
@@ -45,22 +66,24 @@ const handleCancel = () => {
   emit('update:isOpen', false);
 };
 
-// Focus the input when the prompt opens
-onMounted(() => {
-  if (props.isOpen) {
-    nextTick(() => {
-      inputRef.value?.focus();
-      inputRef.value?.select();
-    });
+const handleInputKeydown = (event: KeyboardEvent) => {
+  if (isComposing.value || event.isComposing || event.keyCode === 229) return;
+  if (event.key === 'Enter') {
+    event.preventDefault();
+    handleConfirm();
+  } else if (event.key === 'Escape') {
+    event.preventDefault();
+    handleCancel();
   }
-});
+};
+
 </script>
 
 <template>
   <Teleport to="body">
     <Transition name="fade">
-      <div v-if="isOpen" v-bind="$attrs"
-        class="fixed inset-0 z-dialog flex items-start justify-center pt-[15vh] bg-black/40"
+      <div v-if="isOpen" ref="surfaceRef" v-bind="$attrs" role="dialog" aria-modal="true" :aria-label="title"
+        class="vcp-viewport-surface fixed inset-0 z-dialog flex items-start justify-center pt-[15vh] bg-black/40"
         @click.self="handleCancel">
         <div
           class="vcp-prompt-modal bg-white dark:bg-[#1a2a30] w-11/12 max-w-sm rounded-2xl shadow-2xl border border-black/10 dark:border-white/10 p-5 transform transition-all relative overflow-hidden">
@@ -74,8 +97,12 @@ onMounted(() => {
 
           <div class="relative mb-6">
             <input ref="inputRef" v-model="inputValue" type="text" :placeholder="placeholder"
+              :inputmode="inputMode || 'text'" :aria-label="title" :aria-invalid="!!validationError"
+              :aria-describedby="validationError ? errorId : undefined"
               class="w-full bg-black/5 dark:bg-black/20 text-gray-800 dark:text-gray-100 px-4 py-3 rounded-xl border border-black/10 dark:border-white/10 outline-none focus:border-blue-500/50 focus:ring-2 focus:ring-blue-500/20 transition-all text-sm"
-              @keydown.enter="handleConfirm" @keydown.esc="handleCancel" />
+              @compositionstart="isComposing = true" @compositionend="isComposing = false"
+              @blur="isComposing = false" @keydown="handleInputKeydown" />
+            <p v-if="validationError" :id="errorId" role="alert" class="m-0 mt-2 text-xs text-red-500">{{ validationError }}</p>
           </div>
 
           <div class="flex justify-end gap-3">

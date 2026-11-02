@@ -14,9 +14,9 @@ export const isAutoSyncReady = (
   settings: AppSettings | null | undefined,
 ): boolean => {
   // 缺省视为开启；只有显式 false 才关闭。
-  if (!settings || settings.autoSync === false) return false;
-  const url = settings.syncServerUrl;
-  const token = settings.syncToken;
+  if (!settings || settings.sync.autoSync === false) return false;
+  const url = settings.sync.serverUrl;
+  const token = settings.sync.token;
   return (
     typeof url === "string" &&
     url.trim().length > 0 &&

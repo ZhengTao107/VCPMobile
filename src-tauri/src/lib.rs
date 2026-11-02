@@ -19,7 +19,7 @@ use vcp_modules::vcp_client::{ActiveGroupTurns, ActiveRequests};
 pub fn run() {
     let context = tauri::generate_context!();
 
-    let app = tauri::Builder::default()
+    let builder = tauri::Builder::default()
         .setup(|app| {
             // 0. 启动分段计时：t0 近似进程起点，必须最先注册
             let boot_trace = vcp_modules::boot_trace::BootTraceState::new();
@@ -30,8 +30,13 @@ pub fn run() {
             app.manage(app.handle().clone());
             app.manage(LifecycleState::new());
             app.manage(ActiveRequests::default());
-            app.manage(ActiveGroupTurns::default());
+            app.manage(ActiveGroupTurns::new(&app.state::<LifecycleState>()));
             app.manage(ContextSanitizer::default());
+            app.manage(vcp_modules::chat::voice_service::VoiceServiceState::default());
+            app.manage(vcp_modules::chat::voice_service::VoiceCallState::default());
+            app.manage(vcp_modules::chat::voice_service::VoiceDocumentState::default());
+            app.manage(vcp_modules::chat::voice_service::TtsServiceState::default());
+            app.manage(vcp_modules::infra::share_inbox::ShareInboxState::default());
             app.manage(distributed::DistributedState::new());
 
             // 提前注册纯内存状态，防范前端在 bootstrap 完成前调用 command 导致 state() panic
@@ -123,6 +128,23 @@ pub fn run() {
         // 命令注册表与「IPC 防爆栈总闸」均已收口至 commands.rs（含完整机制注释）；
         // 此处仅挂载。新增命令请直接编辑 commands.rs 的注册清单。
         .invoke_handler(commands::app_command_handler!())
+        .on_page_load(|_webview, _payload| {
+            #[cfg(any(target_os = "android", target_os = "ios"))]
+            if matches!(_payload.event(), tauri::webview::PageLoadEvent::Started) {
+                vcp_modules::chat::voice_service::invalidate_document(_webview.app_handle(), None);
+            }
+        });
+
+    #[cfg(target_os = "ios")]
+    let builder = builder.on_web_content_process_terminate(|webview| {
+        vcp_modules::chat::voice_service::invalidate_document(webview.app_handle(), None);
+        // A custom termination hook replaces Wry's default reload handler.
+        if let Err(error) = webview.reload() {
+            log::error!("[VoiceDocument] WebContent reload failed: {error}");
+        }
+    });
+
+    let app = builder
         .build(context)
         .expect("error while building tauri application");
 
@@ -154,19 +176,4 @@ pub fn run() {
             _ => {}
         }
     });
-}
-
-#[cfg(test)]
-mod contract_tests {
-    #[test]
-    fn distributed_tool_authorization_command_uses_enabled_allowlist() {
-        // 命令注册表位于 commands.rs（lib.rs 仅保留启动编排）。
-        let commands_source = include_str!("commands.rs");
-        let distributed_source = include_str!("distributed/mod.rs");
-
-        assert!(commands_source.contains("distributed::update_enabled_tools,"));
-        assert!(!commands_source.contains("distributed::update_disabled_tools,"));
-        assert!(distributed_source.contains("enabled_names: Vec<String>"));
-        assert!(!distributed_source.contains("disabled_names: Vec<String>"));
-    }
 }

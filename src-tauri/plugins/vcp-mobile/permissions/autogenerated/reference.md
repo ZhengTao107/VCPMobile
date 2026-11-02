@@ -153,6 +153,32 @@ Denies the cancel_download_notification command without any pre-configured scope
 <tr>
 <td>
 
+`vcp-mobile:allow-cancel-file-operation`
+
+</td>
+<td>
+
+Enables the cancel_file_operation command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`vcp-mobile:deny-cancel-file-operation`
+
+</td>
+<td>
+
+Denies the cancel_file_operation command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
 `vcp-mobile:allow-capture-window-snapshot`
 
 </td>
@@ -302,6 +328,58 @@ Enables the clear_keep_screen_on command without any pre-configured scope.
 <td>
 
 Denies the clear_keep_screen_on command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`vcp-mobile:allow-complete-webview-resume`
+
+</td>
+<td>
+
+Enables the complete_webview_resume command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`vcp-mobile:deny-complete-webview-resume`
+
+</td>
+<td>
+
+Denies the complete_webview_resume command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`vcp-mobile:allow-connect-webview-resume`
+
+</td>
+<td>
+
+Enables the connect_webview_resume command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`vcp-mobile:deny-connect-webview-resume`
+
+</td>
+<td>
+
+Denies the connect_webview_resume command without any pre-configured scope.
 
 </td>
 </tr>
@@ -517,6 +595,32 @@ Denies the get_pending_notification command without any pre-configured scope.
 <tr>
 <td>
 
+`vcp-mobile:allow-get-webview-geometry`
+
+</td>
+<td>
+
+Enables the get_webview_geometry command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`vcp-mobile:deny-get-webview-geometry`
+
+</td>
+<td>
+
+Denies the get_webview_geometry command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
 `vcp-mobile:allow-launch-root-manager`
 
 </td>
@@ -666,6 +770,32 @@ Enables the pick_file command without any pre-configured scope.
 <td>
 
 Denies the pick_file command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`vcp-mobile:allow-prepare-file-operation`
+
+</td>
+<td>
+
+Enables the prepare_file_operation command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`vcp-mobile:deny-prepare-file-operation`
+
+</td>
+<td>
+
+Denies the prepare_file_operation command without any pre-configured scope.
 
 </td>
 </tr>
@@ -1108,6 +1238,32 @@ Enables the start_network_monitoring command without any pre-configured scope.
 <td>
 
 Denies the start_network_monitoring command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`vcp-mobile:allow-trigger-haptic-feedback`
+
+</td>
+<td>
+
+Enables the trigger_haptic_feedback command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`vcp-mobile:deny-trigger-haptic-feedback`
+
+</td>
+<td>
+
+Denies the trigger_haptic_feedback command without any pre-configured scope.
 
 </td>
 </tr>

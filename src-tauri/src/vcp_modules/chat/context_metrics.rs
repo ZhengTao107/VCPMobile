@@ -1,7 +1,7 @@
 //! 每条 assistant 消息的上下文用量遥测，口径对齐 VCPChat 桌面端：
 //! - 来源：VCP 后端下发的 SSE 块 `{object:"vcp.context.metrics", contextMetrics}`
 //!   （请求前一次快照、上游 usage 到达后再推一次同 roundIndex 的更新）。
-//! - 存储：`messages.context_metrics`（迁移 0101），JSON
+//! - 存储：`messages.context_metrics`（迁移 9001；ptp4g#31 前为 0101，旧库启动时改号），JSON
 //!   `{"rounds":[...], "attachmentTokenEstimate":N}`；前端暴露为
 //!   `assistantContextMetricRounds`，字段名与桌面端 history.json 一致。
 //! - 元数据不是流所有权：不参与消息指纹、不进同步 DTO、不阻塞 finalize。
@@ -345,10 +345,10 @@ mod tests {
             .execute(&pool)
             .await
             .expect("baseline");
-        sqlx::raw_sql(include_str!("../../../migrations/0101_add_message_context_metrics.sql"))
+        sqlx::raw_sql(include_str!("../../../migrations/9001_add_message_context_metrics.sql"))
             .execute(&pool)
             .await
-            .expect("0101");
+            .expect("9001");
         sqlx::query(
             "INSERT INTO messages (owner_type, owner_id, topic_id, msg_id, role, content,
                 timestamp, created_at, updated_at)

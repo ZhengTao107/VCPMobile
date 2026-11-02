@@ -1,9 +1,14 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { createPinia, disposePinia, setActivePinia, type Pinia } from 'pinia';
+import { flushPromises, shallowMount } from '@vue/test-utils';
+import { defineComponent, h } from 'vue';
+import { useAppLifecycle } from '../../../core/composables/useAppLifecycle';
 import { useAppLifecycleStore } from '../../../core/stores/appLifecycle';
 import { useNotificationStore } from '../../../core/stores/notification';
 import { useNotificationProcessor } from '../../../core/composables/useNotificationProcessor';
-import { invokeMock, mockInvoke } from '../../mocks/tauri';
+import { useRagObserverStore } from '../../../core/stores/ragObserver';
+import RagObserver from '../../../features/rag/RagObserver.vue';
+import { emitTauriEvent, invokeMock, mockInvoke } from '../../mocks/tauri';
 
 const testPlatform = vi.hoisted(() => ({ value: null as 'android' | 'ios' | null }));
 vi.mock('../../../core/utils/platform', () => ({
@@ -26,6 +31,7 @@ vi.mock('../../../core/stores/chatSessionStore', () => ({
     currentSelectedItem: null,
     currentTopicId: null,
     reconcileCurrentConversation: () => {},
+    restoreFocus: async () => {},
   }),
 }));
 vi.mock('../../../core/stores/chatHistoryStore', () => ({
@@ -46,6 +52,8 @@ vi.mock('../../../core/utils/bootTrace', () => ({
 describe('platform-aware bootstrap', () => {
   let pinia: Pinia;
   let backgroundServiceFailures: Array<'guardian' | 'helper' | 'events'>;
+  let logStatus: 'closed' | 'connecting' | 'connected' | 'error';
+  let logConfigurationError: string | null;
 
   beforeEach(() => {
     testPlatform.value = null;
@@ -53,11 +61,15 @@ describe('platform-aware bootstrap', () => {
     pinia = createPinia();
     setActivePinia(pinia);
     backgroundServiceFailures = [];
+    logStatus = 'connected';
+    logConfigurationError = null;
+    mockInvoke('allocate_voice_document', () => '42');
     mockInvoke('get_system_snapshot', () => ({
       lifecycle: null,
       core: 'ready',
       message: 'ready',
-      log: 'connected',
+      log: logStatus,
+      logConfigurationError,
       sync: 'disconnected',
       databaseRecovery: null,
       backgroundServiceFailures,
@@ -67,6 +79,170 @@ describe('platform-aware bootstrap', () => {
   afterEach(() => {
     disposePinia(pinia);
     vi.useRealTimers();
+  });
+
+  it.each([
+    ['ready', 'initializing'],
+    ['error', 'optimizing'],
+  ] as const)('preserves core %s when an earlier %s snapshot arrives during bootstrap', async (terminal, stale) => {
+    let releaseSnapshot!: () => void;
+    mockInvoke('get_system_snapshot', () => new Promise(resolve => {
+      releaseSnapshot = () => resolve({
+        core: stale, message: stale, log: 'connected', sync: 'disconnected',
+        lifecycle: null, databaseRecovery: null, backgroundServiceFailures: [],
+      });
+    }));
+    mockInvoke('get_last_error', () => 'database unavailable');
+    const lifecycle = useAppLifecycleStore();
+    const boot = lifecycle.bootstrap();
+    await flushPromises();
+    useNotificationProcessor().processPayload({ type: 'vcp-core-status', status: terminal, message: terminal });
+    releaseSnapshot();
+
+    if (terminal === 'ready') {
+      await boot;
+      expect(lifecycle.state).toBe('READY');
+    } else {
+      await expect(boot).rejects.toThrow('database unavailable');
+      expect(lifecycle.state).toBe('ERROR');
+    }
+    expect(useNotificationStore().vcpCoreStatus.status).toBe(terminal);
+    expect(useNotificationStore().vcpStatus.status).toBe('connected');
+  });
+
+  it('starts voice document admission without blocking READY on physical release', async () => {
+    let release!: () => void;
+    mockInvoke('connect_voice_document', () => new Promise<void>(resolve => { release = resolve; }));
+    const lifecycle = useAppLifecycleStore();
+    const boot = lifecycle.bootstrap();
+    await flushPromises();
+    expect(lifecycle.state).toBe('READY');
+    expect(invokeMock).toHaveBeenCalledWith('connect_voice_document', { documentId: '42' });
+    release();
+    await boot;
+    expect(lifecycle.state).toBe('READY');
+    await lifecycle.hydrateSystemStatus();
+    await lifecycle.bootstrap(true);
+    expect(invokeMock.mock.calls.filter(([command]) => command === 'connect_voice_document')).toHaveLength(1);
+    expect(invokeMock.mock.calls.some(([command]) => command === 'connect_tts_document')).toBe(false);
+  });
+
+  it('keeps a live VCPLog status delivered while a foreground snapshot was in flight', async () => {
+    let finish!: () => void;
+    mockInvoke('get_system_snapshot', () => new Promise(resolve => {
+      finish = () => resolve({
+        core: 'ready', log: 'closed', lifecycle: null, backgroundServiceFailures: [],
+      });
+    }));
+    const read = useAppLifecycleStore().hydrateSystemStatus();
+    useNotificationProcessor().processPayload({ type: 'vcp-log-status', status: 'connected', source: 'VCPLog' });
+    finish();
+    await read;
+    expect(useNotificationStore().vcpStatus.status).toBe('connected');
+  });
+
+  it('restores background recall records in an open observer alongside live foreground events', async () => {
+    logStatus = 'closed';
+    const metadata = (id: string) => ({
+      id, type: 'RAG_RETRIEVAL_DETAILS', title: id, subtitle: null, summary: '', timestamp: '', hasDetails: true,
+    });
+    mockInvoke('get_vcp_info_metadata_list', () => []);
+    mockInvoke('get_vcp_info_connection_status', () => 'closed');
+    const root = shallowMount(defineComponent({ setup() {
+      useAppLifecycle();
+      return () => h('div');
+    } }));
+    const page = shallowMount(RagObserver, { props: { isOpen: true } });
+    try {
+      await flushPromises();
+      emitTauriEvent('vcp-lifecycle-changed', { phase: 'background', transitionEpoch: 1, nativeSequence: 1, snapshot: false });
+      expect(useNotificationStore().vcpStatus.status).toBe('closed');
+      await flushPromises();
+      let finish!: () => void;
+      mockInvoke('get_vcp_info_metadata_list', () => new Promise(resolve => {
+        finish = () => resolve([metadata('overlap'), metadata('background')]);
+      }));
+      let finishStatus!: (status: string) => void;
+      mockInvoke('get_vcp_info_connection_status', () => new Promise(resolve => { finishStatus = resolve; }));
+      logStatus = 'connected';
+      emitTauriEvent('vcp-lifecycle-changed', { phase: 'active', transitionEpoch: 2, nativeSequence: 2, snapshot: false });
+      await flushPromises();
+      emitTauriEvent('vcp-info-event', { type: 'vcp-info-status', source: 'VCPInfo', status: 'connected' });
+      for (const id of ['overlap', 'live']) {
+        emitTauriEvent('vcp-info-event', { type: 'vcp-info-message', data: metadata(id) });
+      }
+      finish();
+      finishStatus('closed');
+      await flushPromises();
+      expect(useRagObserverStore().connectionStatus).toBe('connected');
+      expect(useNotificationStore().vcpStatus.status).toBe('connected');
+      expect(useRagObserverStore().metadataList.map(item => item.id)).toEqual(['live', 'overlap', 'background']);
+    } finally {
+      page.unmount();
+      root.unmount();
+    }
+  });
+
+  it('keeps the UI available after a native release failure and retries with the same document', async () => {
+    let failed = true;
+    mockInvoke('connect_voice_document', () => failed ? Promise.reject(new Error('native stop failed')) : undefined);
+    const lifecycle = useAppLifecycleStore();
+    await lifecycle.bootstrap();
+    expect(lifecycle.state).toBe('READY');
+    failed = false;
+    await lifecycle.bootstrap(true);
+    expect(lifecycle.state).toBe('READY');
+    expect(invokeMock.mock.calls.filter(([command]) => command === 'allocate_voice_document')).toHaveLength(1);
+    expect(invokeMock.mock.calls.filter(([command]) => command === 'connect_voice_document')
+      .map(([, args]) => args?.documentId)).toEqual(['42', '42']);
+  });
+
+  it.each(['snapshot', 'realtime'])('shows a saved connection configuration error when %s arrives first without blocking startup', async first => {
+    logStatus = 'closed';
+    logConfigurationError = 'WebSocket 地址必须明确使用 ws:// 或 wss://。';
+    const lifecycle = useAppLifecycleStore();
+    const store = useNotificationStore();
+    const { processPayload } = useNotificationProcessor();
+    const content = `连接已停止：${logConfigurationError} 请在设置中修正 WebSocket 地址或 Key。`;
+    const deliverRealtime = () => store.addNotification(processPayload({
+      type: 'vcp-log-message',
+      data: {
+        id: 'vcp_connection_configuration_error',
+        status: 'error',
+        tool_name: 'VCPLog / VCPInfo 配置错误',
+        content,
+        source: 'VCPLog / VCPInfo',
+      },
+    }));
+
+    if (first === 'realtime') deliverRealtime();
+    await lifecycle.bootstrap();
+
+    expect(lifecycle.state).toBe('READY');
+    expect(store.vcpStatus).toEqual({
+      status: 'closed', message: `连接已停止：${logConfigurationError}`, source: 'VCPLog',
+    });
+    expect(store.historyList).toHaveLength(1);
+    expect(store.activeToasts).toHaveLength(1);
+    expect(store.activeToasts[0]).toMatchObject({
+      id: 'vcp_connection_configuration_error', type: 'error', message: content,
+    });
+
+    if (first === 'snapshot') deliverRealtime();
+    expect(store.historyList).toHaveLength(1);
+    expect(store.activeToasts).toHaveLength(1);
+    expect(store.unreadCount).toBe(1);
+  });
+
+  it('shows an unconfigured closed connection as not connected without inventing a startup error', async () => {
+    logStatus = 'closed';
+    await useAppLifecycleStore().bootstrap();
+
+    expect(useAppLifecycleStore().state).toBe('READY');
+    const store = useNotificationStore();
+    expect(store.vcpStatus).toEqual({ status: 'closed', message: '未连接', source: 'VCPLog' });
+    expect(store.historyList).toHaveLength(0);
+    expect(store.activeToasts).toHaveLength(0);
   });
 
   it.each(['realtime', 'snapshot'])('accepts a retained events failure once when %s arrives first', async first => {
@@ -130,7 +306,7 @@ describe('platform-aware bootstrap', () => {
     expect(newStore.historyList[0].id).toBe('vcp_background_service_error_events');
   });
 
-  it.each(['denied', 'authorized', 'provisional', 'unknown'])('does not block iOS chat when notification permission is %s', async authorization => {
+  it.each(['authorized', 'provisional', 'ephemeral'])('accepts iOS notification authorization %s', async (authorization) => {
     testPlatform.value = 'ios';
     mockInvoke('plugin:vcp-mobile|get_notification_permission', () => ({ authorization }));
     const lifecycle = useAppLifecycleStore();
@@ -144,48 +320,56 @@ describe('platform-aware bootstrap', () => {
     expect(useNotificationStore().historyList).toHaveLength(0);
   });
 
-  it('lets an iOS user skip the first optional introduction without faking OS authorization or showing it again', async () => {
+  it.each(['notDetermined', 'denied', 'unknown'])('requires an actual iOS grant when authorization is %s, including after a legacy dismissal', async (authorization) => {
     testPlatform.value = 'ios';
-    mockInvoke('plugin:vcp-mobile|get_notification_permission', () => ({ authorization: 'notDetermined' }));
+    localStorage.setItem('vcp_ios_notification_intro_v1', 'seen');
+    mockInvoke('plugin:vcp-mobile|get_notification_permission', () => ({ authorization }));
     const lifecycle = useAppLifecycleStore();
     await lifecycle.bootstrap();
     expect(lifecycle.state).toBe('PERMISSIONS');
     await lifecycle.continueFromPermissionGuide();
-    expect(lifecycle.state).toBe('READY');
+    expect(lifecycle.state).toBe('PERMISSIONS');
+    expect(invokeMock).not.toHaveBeenCalledWith('get_system_snapshot');
     expect(invokeMock).not.toHaveBeenCalledWith('plugin:vcp-mobile|request_notification_permission');
 
-    disposePinia(pinia);
-    pinia = createPinia();
-    setActivePinia(pinia);
-    await useAppLifecycleStore().bootstrap();
-    expect(useAppLifecycleStore().state).toBe('READY');
-    expect(invokeMock.mock.calls.filter(([command]) => command === 'plugin:vcp-mobile|get_notification_permission')).toHaveLength(1);
+    mockInvoke('plugin:vcp-mobile|get_notification_permission', () => ({ authorization: 'authorized' }));
+    await lifecycle.continueFromPermissionGuide();
+    expect(lifecycle.state).toBe('READY');
   });
 
-  it('continues iOS startup if an optional permission query fails', async () => {
+  it('keeps the iOS permission guide when the system query fails', async () => {
     testPlatform.value = 'ios';
     mockInvoke('plugin:vcp-mobile|get_notification_permission', () => Promise.reject(new Error('native unavailable')));
     await useAppLifecycleStore().bootstrap();
-    expect(useAppLifecycleStore().state).toBe('READY');
+    expect(useAppLifecycleStore().state).toBe('PERMISSIONS');
     expect(useNotificationStore().historyList).toHaveLength(0);
   });
 
-  it('keeps the Android permission gate and rechecks native authorization before entering', async () => {
+  it.each(['notification', 'battery', 'backgroundAllowed', 'notificationListener'] as const)(
+    'blocks Android startup while %s is denied even if another check is unavailable', async (denied) => {
+      testPlatform.value = 'android';
+      const permissions = { notification: null, battery: null, backgroundAllowed: null, notificationListener: null };
+      mockInvoke('plugin:vcp-mobile|check_all_permissions', () => ({ ...permissions, [denied]: false }));
+      const lifecycle = useAppLifecycleStore();
+
+      await lifecycle.bootstrap();
+      expect(lifecycle.state).toBe('PERMISSIONS');
+      await lifecycle.continueFromPermissionGuide();
+      expect(lifecycle.state).toBe('PERMISSIONS');
+
+      mockInvoke('plugin:vcp-mobile|check_all_permissions', () => ({ ...permissions, [denied]: true }));
+      await lifecycle.continueFromPermissionGuide();
+      expect(lifecycle.state).toBe('READY');
+    },
+  );
+
+  it('continues Android startup when the device has no checkable gate items', async () => {
     testPlatform.value = 'android';
-    mockInvoke('plugin:vcp-mobile|check_all_permissions', () => ({ notification: false, battery: true }));
-    mockInvoke('plugin:vcp-mobile|check_notification_listener_permission', () => ({ enabled: true }));
-    const lifecycle = useAppLifecycleStore();
-
-    await lifecycle.bootstrap();
-    expect(lifecycle.state).toBe('PERMISSIONS');
-    expect(invokeMock.mock.calls.map(([command]) => command)).toEqual([
-      'plugin:vcp-mobile|check_all_permissions',
-      'plugin:vcp-mobile|check_notification_listener_permission',
-    ]);
-
-    mockInvoke('plugin:vcp-mobile|check_all_permissions', () => ({ notification: true, battery: true }));
-    await lifecycle.bootstrap(true);
-    expect(lifecycle.state).toBe('READY');
+    mockInvoke('plugin:vcp-mobile|check_all_permissions', () => ({
+      notification: null, battery: null, backgroundAllowed: null, notificationListener: null,
+    }));
+    await useAppLifecycleStore().bootstrap();
+    expect(useAppLifecycleStore().state).toBe('READY');
   });
 
   it('lets an Android user defer the keep-alive guide once, remembers it with a warning, and forgets it after all grants', async () => {

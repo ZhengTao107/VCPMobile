@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { ref, watch } from "vue";
-import { ChevronDown, ChevronUp } from "lucide-vue-next";
+import { ChevronDown, ChevronUp } from "@lucide/vue";
 import { renderMarkdownNodes } from "../../../core/utils/astRenderer";
 import type { ContentBlock } from "../../../core/types/chat";
 
@@ -40,7 +40,7 @@ function escapeHtml(text: string): string {
 
 <template>
   <div class="vcp-thought-block">
-    <div class="vcp-thought-header" @click="toggleExpand">
+    <div class="vcp-thought-header" data-longpress-native @click="toggleExpand">
       <span class="vcp-thought-icon">🧠</span>
       <span class="vcp-thought-label flex items-center gap-1">
         {{ block.theme || "元思考链" }}
@@ -53,14 +53,17 @@ function escapeHtml(text: string): string {
       class="vcp-thought-content"
     >
       <slot>
+        <!-- eslint-disable vue/no-v-html -- Generated AST escapes fields and filters URLs; embedded HTML uses the shared guard; plain content is escaped. -->
         <div
           class="thought-body"
+          data-message-content
           v-html="
             block.nodes && block.nodes.length > 0
               ? renderMarkdownNodes(block.nodes, messageId, block.hash)
               : escapeHtml(block.content || '')
           "
         />
+        <!-- eslint-enable vue/no-v-html -->
       </slot>
     </div>
   </div>

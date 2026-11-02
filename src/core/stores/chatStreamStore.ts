@@ -1,8 +1,8 @@
 import { defineStore } from "pinia";
 import { ref, computed, reactive, onScopeDispose } from "vue";
-import { invoke } from "@tauri-apps/api/core";
+import { invoke, type Channel } from "@tauri-apps/api/core";
 
-import { useChatSessionStore } from "./chatSessionStore";
+import { useChatSessionStore, type ConversationKey, type ConversationOwnerType } from "./chatSessionStore";
 import { useAssistantStore } from "./assistant";
 import { useAvatarStore } from "./avatar";
 import { useTopicStore } from "./topicListManager";
@@ -10,28 +10,34 @@ import { useChatHistoryStore } from "./chatHistoryStore";
 import { useNotificationStore } from "./notification";
 import { requestAutoSync } from "../sync/autoSyncTrigger";
 import { applyTopicContextMetrics, type MessageContextMetricsPayload } from "../utils/contextMetricsDisplay";
+import { useChatPreferencesStore } from "../../features/chat/preferences/store";
+import { triggerMessageHaptic } from "../utils/nativeHaptics";
 import type {
   ActiveGenerationDto,
+  AuroraUpdate,
+  ActiveGroupTurnDto,
   AuroraRecoverySnapshot,
   ChatMessage,
   ContentBlock,
   MarkdownNode,
   MessageShell,
-  RecoveryResultDto,
+  InterruptRequestDto,
+  GroupTurnSnapshotDto,
+  ReconnectChatStreamsDto,
   StreamBlock,
   StreamEventDto,
   TailFrame,
   TailRenderMode,
   TailTextOp,
 } from "../types/chat";
-import type {
-  ConversationKey,
-  ConversationOwnerType,
-} from "./chatSessionStore";
 
 interface StreamTerminalTombstone {
   terminalAt: number;
 }
+
+type TopicIdentity = Pick<ConversationKey, "ownerType" | "ownerId" | "topicId">;
+type PlaceholderKey = TopicIdentity & { messageId: string };
+type PlaceholderResult = PlaceholderKey & { state: "pending" | "unresolved" | "committed" | "missing" };
 
 type TailContentOp = Extract<TailTextOp, { op: "append" | "replace" }>;
 
@@ -58,7 +64,23 @@ function buildTailBlockFromOp(
   if (op.blockType === "html-preview") {
     return { ...shared, type: "html-preview" };
   }
+  if (op.blockType === "voice-guidance") {
+    return { ...shared, type: "voice-guidance", is_complete: false };
+  }
   return { ...shared, type: "markdown" };
+}
+
+// 快照提供完整正文基线，不能让先前未消费的 append/replace 继续代表它。
+function buildTailSnapshotOp(block: StreamBlock | null, mode: TailRenderMode): TailTextOp {
+  if (!block) return { op: "clear" };
+  return {
+    op: "replace",
+    content: block.content ?? "",
+    hash: block.hash,
+    mode,
+    blockType: block.type === "thought" || block.type === "html-preview" || block.type === "voice-guidance" ? block.type : "markdown",
+    thoughtTheme: block.type === "thought" ? block.theme : undefined,
+  };
 }
 
 export const useChatStreamStore = defineStore("chatStream", () => {
@@ -85,11 +107,6 @@ export const useChatStreamStore = defineStore("chatStream", () => {
     messageId,
   );
 
-  const compareMessageOrder = (a: ChatMessage, b: ChatMessage) => {
-    if (a.timestamp !== b.timestamp) return a.timestamp - b.timestamp;
-    return a.id < b.id ? -1 : a.id > b.id ? 1 : 0;
-  };
-
   // 核心：记录每个完整会话是否处于活动流状态。
   const sessionActiveStreams = ref<Record<string, string[]>>({});
 
@@ -100,9 +117,21 @@ export const useChatStreamStore = defineStore("chatStream", () => {
     string,
     StreamTerminalTombstone
   >();
-  // Covers a recovery command or its attached live consumer until end/error.
-  const recoveryMessageIds = new Map<string, object>();
   const streamConsumerRevisions = new Map<string, number>();
+  const conversationOperations = reactive(new Map<string, number>());
+  const activeGroupTurns = reactive(new Map<string, ActiveGroupTurnDto>());
+  const groupConsumerRevisions = new Map<string, number>();
+  const activeRequests = reactive(new Map<string, Set<string>>());
+  const requestConsumerRevisions = new Map<string, number>();
+  const MAX_REQUEST_ACTIVITY_REVISIONS = 1024;
+  const activityInventoryKnown = ref(false);
+  let reconnectChannel: Channel<StreamEventDto> | null = null;
+  const connectionId = crypto.randomUUID();
+  let connectionEpoch = 0;
+  let reconnectPromise: Promise<void> | null = null;
+  let receiptEventConversations: Set<string> | null = null;
+  let receiptEventMessages: Set<string> | null = null;
+  let receiptRequestKeys: Set<string> | null = null;
   let disposed = false;
 
   function isStreamDebugEnabled(): boolean {
@@ -299,28 +328,72 @@ export const useChatStreamStore = defineStore("chatStream", () => {
   // Rust vcp_client 的 33ms 门禁是 Aurora 唯一的频率上限。前端不能再设第二个
   // 33ms 时间门禁：后端时钟与屏幕 VSync 不同步，叠加会平白增加一帧延迟。
   // 此处 rAF 只合并下一次绘制前到达的事件，并将同一 Aurora 帧的字段原子写入 Vue。
-  const rAFPendingUpdates = new Map<
-    string,
-    {
-      content: string | null;
-      blocks: ContentBlock[] | null;
-      tailContent: string | null;
-      tailBlock: StreamBlock | null;
-      tailBlockChanged: boolean;
-      tailOp: TailTextOp | null;
-      tailFrame: TailFrame | null;
-      tailSnapshot: MarkdownNode[] | null;
-      streamId: number | null;
-      tailCursor: TailFrameCursor | null;
-      needsSnapshotReason: string | null;
-      animationFrameId: number | null;
+  interface PendingRenderUpdate {
+    content: string | null;
+    blocks: ContentBlock[] | null;
+    tailContent: string | null;
+    tailBlock: StreamBlock | null;
+    tailBlockChanged: boolean;
+    tailOp: TailTextOp | null;
+    tailFrame: TailFrame | null;
+    tailSnapshot: MarkdownNode[] | null;
+    streamId: number | null;
+    tailCursor: TailFrameCursor | null;
+    needsSnapshotReason: string | null;
+    snapshotBlocked: boolean;
+    animationFrameId: number | null;
+  }
+  const rAFPendingUpdates = new Map<string, PendingRenderUpdate>();
+
+  // rAF 与强制 flush 提交同一组字段；null 表示本批未更新，tailBlockChanged 区分清空。
+  const commitPendingRender = (message: ChatMessage, update: PendingRenderUpdate) => {
+    if (update.content !== null) message.content = update.content;
+    if (update.blocks !== null) message.blocks = update.blocks;
+    if (update.tailContent !== null) message.tailContent = update.tailContent;
+    if (update.tailBlockChanged) message.tailBlock = update.tailBlock ?? undefined;
+    if (update.tailOp !== null) message.tailOp = update.tailOp;
+    if (update.tailSnapshot !== null) message.tailSnapshot = update.tailSnapshot;
+    if (update.tailFrame !== null) message.tailFrame = update.tailFrame;
+    if (update.snapshotBlocked) {
+      // A bounded recovery that cannot bridge its cursor keeps receiving text,
+      // but cannot grow another full-message compilation loop for this stream.
+      if (message.tailBlock) message.tailBlock = { ...message.tailBlock, render_mode: "plain" };
+      message.tailFrame = undefined;
+      message.tailSnapshot = undefined;
     }
-  >();
+  };
+
+  // 只清除待提交投影；流身份、连续性游标和恢复原因由各自的接管路径处理。
+  const clearPendingRender = (update: PendingRenderUpdate) => {
+    update.content = null;
+    update.blocks = null;
+    update.tailContent = null;
+    update.tailBlock = null;
+    update.tailBlockChanged = false;
+    update.tailOp = null;
+    update.tailFrame = null;
+    update.tailSnapshot = null;
+  };
+
+  // Snapshot 完整覆盖渲染基线；完整 blocks 不带 tail，因而同时释放旧尾部。
+  const replaceRenderProjection = (
+    message: ChatMessage,
+    blocks: ContentBlock[],
+    tail?: { block: StreamBlock | null; mode: TailRenderMode; snapshot: MarkdownNode[]; frame: TailFrame },
+  ) => {
+    message.blocks = blocks;
+    message.tailContent = tail?.block?.content ?? "";
+    message.tailBlock = tail?.block ?? undefined;
+    message.tailOp = tail ? buildTailSnapshotOp(tail.block, tail.mode) : undefined;
+    message.tailSnapshot = tail?.snapshot;
+    message.tailFrame = tail?.frame;
+  };
 
   /**
    * 物理防线：强行中止、强制同步刷新并安全清理指定消息的 rAF 帧状态，杜绝任何泄漏与闪烁
    */
   const clearRAFUpdate = (messageKey: string, forceFlush = false) => {
+    finishAuroraRecovery(messageKey, null);
     const up = rAFPendingUpdates.get(messageKey);
     if (up) {
       if (up.animationFrameId !== null) {
@@ -329,19 +402,7 @@ export const useChatStreamStore = defineStore("chatStream", () => {
       }
       if (forceFlush) {
         const msg = activeStreamMessages.get(messageKey);
-        if (msg) {
-          if (up.content !== null) msg.content = up.content;
-          if (up.blocks !== null) msg.blocks = up.blocks;
-          // 漏洞 1 修复：同步强刷收尾时，必须将暂存池中的 tail 字段强刷，绝不允许丢字闪烁
-          if (up.tailContent !== null) msg.tailContent = up.tailContent;
-          if (up.tailBlockChanged) {
-            msg.tailBlock = up.tailBlock ?? undefined;
-          }
-          if (up.tailOp !== null) msg.tailOp = up.tailOp;
-          if (up.tailSnapshot !== null)
-            msg.tailSnapshot = up.tailSnapshot;
-          if (up.tailFrame !== null) msg.tailFrame = up.tailFrame;
-        }
+        if (msg) commitPendingRender(msg, up);
       }
       rAFPendingUpdates.delete(messageKey);
     }
@@ -359,32 +420,59 @@ export const useChatStreamStore = defineStore("chatStream", () => {
       if (!up) return;
 
       const m = activeStreamMessages.get(messageKey);
-      if (m) {
-        if (up.content !== null) m.content = up.content;
-        if (up.blocks !== null) m.blocks = up.blocks;
-        if (up.tailSnapshot !== null) m.tailSnapshot = up.tailSnapshot;
-        if (up.tailFrame !== null) m.tailFrame = up.tailFrame;
-        if (up.tailContent !== null) m.tailContent = up.tailContent;
-        if (up.tailBlockChanged) {
-          m.tailBlock = up.tailBlock ?? undefined;
-        }
-        if (up.tailOp !== null) m.tailOp = up.tailOp;
-      }
+      if (m) commitPendingRender(m, up);
 
       // 重置下一次绘制前的合并暂存状态。
-      up.content = null;
-      up.blocks = null;
-      up.tailContent = null;
-      up.tailBlock = null;
-      up.tailBlockChanged = false;
-      up.tailOp = null;
-      up.tailFrame = null;
-      up.tailSnapshot = null;
+      clearPendingRender(up);
       up.animationFrameId = null;
     });
   };
 
-  const auroraSnapshotJobs = new Map<string, Promise<boolean>>();
+  interface AuroraSnapshotJob {
+    // null means ownership was replaced, not that reconstruction failed.
+    promise: Promise<boolean | null>;
+    resolve: (recovered: boolean | null) => void;
+    updates: AuroraUpdate[];
+    bytes: number;
+    mutations: number;
+  }
+  const auroraSnapshotJobs = new Map<string, AuroraSnapshotJob>();
+  const MAX_RECOVERY_UPDATES = 64;
+  const MAX_RECOVERY_BYTES = 1024 * 1024;
+
+  function finishAuroraRecovery(messageKey: string, recovered: boolean | null): void {
+    const job = auroraSnapshotJobs.get(messageKey);
+    if (!job) return;
+    auroraSnapshotJobs.delete(messageKey);
+    job.updates.length = 0;
+    job.resolve(recovered);
+  }
+
+  function blockAuroraRecovery(messageKey: string): void {
+    const pending = rAFPendingUpdates.get(messageKey);
+    if (pending) {
+      pending.snapshotBlocked = true;
+      pending.needsSnapshotReason = null;
+      scheduleRAFUpdate(messageKey);
+    }
+    finishAuroraRecovery(messageKey, false);
+  }
+
+  function retainRecoveryUpdate(messageKey: string, aurora: AuroraUpdate): void {
+    const job = auroraSnapshotJobs.get(messageKey);
+    if (!job) return;
+    const bytes = JSON.stringify(aurora).length * 2;
+    const mutations = aurora.tailFrame?.mutations?.length ?? 0;
+    if (job.updates.length >= MAX_RECOVERY_UPDATES
+      || job.bytes + bytes > MAX_RECOVERY_BYTES
+      || job.mutations + mutations > MAX_PENDING_TAIL_MUTATIONS) {
+      blockAuroraRecovery(messageKey);
+      return;
+    }
+    job.updates.push(aurora);
+    job.bytes += bytes;
+    job.mutations += mutations;
+  }
 
   const cursorFromFrame = (frame?: TailFrame): TailFrameCursor | null => frame
     ? {
@@ -405,104 +493,259 @@ export const useChatStreamStore = defineStore("chatStream", () => {
     && left.revision === right.revision
     && left.frameSeq === right.frameSeq;
 
+  function mergeAuroraProjection(
+    update: PendingRenderUpdate,
+    message: ChatMessage,
+    aurora: AuroraUpdate,
+    forceSnapshot: boolean,
+  ): boolean {
+    const eventStreamId = aurora.streamId ?? aurora.tailFrame?.streamId;
+    let streamChanged = false;
+    if (eventStreamId !== undefined) {
+      if (!Number.isSafeInteger(eventStreamId) || eventStreamId <= 0) return false;
+      if (
+        aurora.tailFrame &&
+        aurora.tailFrame.streamId !== eventStreamId
+      ) return false;
+      if (update.streamId !== null && eventStreamId < update.streamId) return false;
+      if (update.streamId === null || eventStreamId > update.streamId) {
+        streamChanged = update.streamId !== null;
+        clearPendingRender(update);
+        update.streamId = eventStreamId;
+        update.tailCursor = null;
+        update.needsSnapshotReason = null;
+        update.snapshotBlocked = false;
+      }
+    }
+
+    let mergedTailFrame: TailFrame | null = null;
+    if (aurora.tailFrame) {
+      if (eventStreamId === undefined) return false;
+      if (import.meta.env.DEV && isStreamDebugEnabled()) {
+        streamDebugLog(
+          `[chatStreamStore] Received tailFrame stream=${aurora.tailFrame.streamId} seq=${aurora.tailFrame.frameSeq} mutations=${aurora.tailFrame.mutations?.length || 0} for ${message.id}`,
+        );
+      }
+      const latestSnapshot =
+        aurora.tailFrame.snapshot ??
+        aurora.tailBlock?.nodes;
+      const merged = mergeTailFrame(
+        update.tailFrame,
+        update.tailCursor,
+        aurora.tailFrame,
+        latestSnapshot,
+        streamChanged
+          || !!update.needsSnapshotReason
+          || forceSnapshot,
+      );
+      if (!merged.accepted || !merged.cursor) return false;
+      update.tailCursor = merged.cursor;
+      if (merged.needsSnapshot) {
+        update.tailFrame = null;
+        update.needsSnapshotReason = merged.needsSnapshot;
+      } else if (merged.frame) {
+        mergedTailFrame = merged.frame;
+        update.needsSnapshotReason = null;
+      }
+    }
+
+    // 3. 覆盖 Snapshot，或按基线身份应用 Delta。
+    if (typeof aurora.content === "string") {
+      update.content = aurora.content;
+    } else if (aurora.chunk) {
+      const currentBase =
+        update.content !== null ? update.content : message.content || "";
+      update.content = currentBase + aurora.chunk;
+    }
+
+    if (aurora.kind === "snapshot") {
+      if (typeof aurora.content === "string" && aurora.stableBlocks) update.snapshotBlocked = false;
+      if (aurora.stableBlocks) {
+        update.blocks = aurora.stableBlocks;
+      }
+      const snapshotMode: TailRenderMode = aurora.tailMode
+        ?? (aurora.tailBlock?.nodes ? "ast" : "plain");
+      update.tailContent = aurora.tailBlock?.content || "";
+      update.tailBlock = aurora.tailBlock
+        ? { ...aurora.tailBlock, render_mode: snapshotMode }
+        : null;
+      update.tailBlockChanged = true;
+      update.tailOp = buildTailSnapshotOp(update.tailBlock, snapshotMode);
+    } else if (aurora.kind === "delta") {
+      if (aurora.stableAppend) {
+        const stableBase = update.blocks ?? message.blocks ?? [];
+        if (stableBase.length === aurora.stableAppend.baseCount) {
+          update.blocks = [
+            ...stableBase,
+            ...aurora.stableAppend.blocks,
+          ];
+        } else {
+          update.needsSnapshotReason = "stable_base_mismatch";
+        }
+      }
+
+      if (aurora.tailOp) {
+        if (update.tailOp && aurora.tailOp.op === "append") {
+          if (update.tailOp.op === "append") {
+            update.tailOp = {
+              ...aurora.tailOp,
+              content: update.tailOp.content + aurora.tailOp.content,
+              previousHash: update.tailOp.previousHash,
+            };
+          } else if (update.tailOp.op === "replace") {
+            update.tailOp = {
+              ...update.tailOp,
+              content: update.tailOp.content + aurora.tailOp.content,
+              hash: aurora.tailOp.hash,
+            };
+          } else {
+            update.tailOp = aurora.tailOp;
+          }
+        } else {
+          update.tailOp = aurora.tailOp;
+        }
+
+        const currentBlock = update.tailBlockChanged ? update.tailBlock ?? undefined : message.tailBlock;
+        const currentContent = update.tailContent !== null
+          ? update.tailContent
+          : message.tailContent || "";
+        if (aurora.tailOp.op === "clear") {
+          update.tailContent = "";
+          update.tailBlock = null;
+          update.tailBlockChanged = true;
+          update.tailSnapshot = [];
+        } else if (aurora.tailOp.op === "replace") {
+          update.tailContent = aurora.tailOp.content;
+          update.tailBlock = buildTailBlockFromOp(
+            aurora.tailOp,
+            aurora.tailOp.content,
+            currentBlock,
+          );
+          update.tailBlockChanged = true;
+        } else {
+          const currentHash = currentBlock?.hash
+            ? String(currentBlock.hash)
+            : undefined;
+          if (currentHash !== aurora.tailOp.previousHash) {
+            update.needsSnapshotReason = "tail_base_mismatch";
+          } else {
+            const nextContent = currentContent + aurora.tailOp.content;
+            update.tailContent = nextContent;
+            update.tailBlock = buildTailBlockFromOp(
+              aurora.tailOp,
+              nextContent,
+              currentBlock,
+            );
+            update.tailBlockChanged = true;
+          }
+        }
+      }
+    }
+
+    if (mergedTailFrame) {
+      update.tailFrame = mergedTailFrame;
+      if (mergedTailFrame.snapshot !== undefined) {
+        update.tailSnapshot = mergedTailFrame.snapshot;
+      }
+    }
+    return true;
+  }
+
   const requestAuroraSnapshotByKey = (
     messageKey: string,
     reason: string,
-  ): Promise<boolean> => {
+  ): Promise<boolean | null> => {
     const existing = auroraSnapshotJobs.get(messageKey);
-    if (existing) return existing;
+    if (existing) return existing.promise;
+    if (disposed || hasStreamTerminalTombstone(messageKey)) return Promise.resolve(null);
+    const message = activeStreamMessages.get(messageKey);
+    const pending = rAFPendingUpdates.get(messageKey);
+    if (!message || !pending) return Promise.resolve(null);
+    if (pending.snapshotBlocked) return Promise.resolve(false);
 
-    const job = (async () => {
-      // 同一消息最多保留一个在途请求；若流在编译期间前进，就直接追赶最新 source/cursor。
-      for (;;) {
-        if (disposed || hasStreamTerminalTombstone(messageKey)) return false;
-        const message = activeStreamMessages.get(messageKey);
-        const pending = rAFPendingUpdates.get(messageKey);
-        if (!message || !pending) return false;
+    const source = pending.content ?? message.content ?? "";
+    const consumerRevision = streamConsumerRevisions.get(messageKey);
+    const cursor = pending.tailCursor ?? cursorFromFrame(message.tailFrame);
+    if (!cursor) return Promise.resolve(false);
 
-        const source = pending.content ?? message.content ?? "";
-        const consumerRevision = streamConsumerRevisions.get(messageKey);
-        const cursor = pending.tailCursor ?? cursorFromFrame(message.tailFrame);
-        if (!cursor) return false;
-
+    let resolve!: (recovered: boolean | null) => void;
+    const promise = new Promise<boolean | null>(done => { resolve = done; });
+    const job: AuroraSnapshotJob = { promise, resolve, updates: [], bytes: 0, mutations: 0 };
+    auroraSnapshotJobs.set(messageKey, job);
+    void (async () => {
+      try {
         if (import.meta.env.DEV && isStreamDebugEnabled()) {
-          streamDebugLog(
-            `[chatStreamStore] Requesting Aurora snapshot for ${message.id}: ${reason}`,
-          );
+          streamDebugLog("[chatStreamStore] Requesting Aurora snapshot:", message.id, reason);
         }
-
-        let snapshot: AuroraRecoverySnapshot;
-        try {
-          snapshot = await invoke<AuroraRecoverySnapshot>(
-            "rebuild_aurora_snapshot",
-            { content: source },
-          );
-        } catch (error) {
-          console.error(
-            `[chatStreamStore] Failed to rebuild Aurora snapshot for ${message.id}:`,
-            error,
-          );
-          return false;
-        }
-
-        if (disposed || hasStreamTerminalTombstone(messageKey)) return false;
+        // Compile one fixed cursor. Accepted live deltas remain bounded until
+        // this baseline can be replayed; output never has to pause to recover.
+        const snapshot = await invoke<AuroraRecoverySnapshot>(
+          "rebuild_aurora_snapshot", { content: source },
+        );
+        if (auroraSnapshotJobs.get(messageKey) !== job) return;
         const latestMessage = activeStreamMessages.get(messageKey);
         const latestPending = rAFPendingUpdates.get(messageKey);
-        if (!latestMessage || !latestPending) return false;
-        const latestSource = latestPending.content
-          ?? latestMessage.content
-          ?? "";
-        const latestCursor = latestPending.tailCursor
-          ?? cursorFromFrame(latestMessage.tailFrame);
-        if (streamConsumerRevisions.get(messageKey) !== consumerRevision
-          || latestSource !== source || !cursorsEqual(latestCursor, cursor)) {
-          continue;
+        if (disposed || hasStreamTerminalTombstone(messageKey)
+          || !latestMessage || latestPending !== pending
+          || streamConsumerRevisions.get(messageKey) !== consumerRevision) {
+          finishAuroraRecovery(messageKey, null);
+          return;
         }
 
         const mode: TailRenderMode = snapshot.tailMode
           ?? (snapshot.tailSnapshot.length > 0 ? "ast" : "plain");
         const tailBlock = snapshot.tailBlock
-          ? { ...snapshot.tailBlock, render_mode: mode }
-          : null;
-        const resetFrame: TailFrame = {
+          ? { ...snapshot.tailBlock, render_mode: mode } : null;
+        const replay: PendingRenderUpdate = {
+          content: source,
+          blocks: snapshot.stableBlocks,
+          tailContent: tailBlock?.content ?? "",
+          tailBlock,
+          tailBlockChanged: true,
+          tailOp: buildTailSnapshotOp(tailBlock, mode),
+          tailFrame: { ...cursor, reset: true, snapshot: snapshot.tailSnapshot, mutations: [] },
+          tailSnapshot: snapshot.tailSnapshot,
           streamId: cursor.streamId,
-          epoch: cursor.epoch,
-          revision: cursor.revision,
-          frameSeq: cursor.frameSeq,
-          reset: true,
-          snapshot: snapshot.tailSnapshot,
-          mutations: [],
+          tailCursor: cursor,
+          needsSnapshotReason: null,
+          snapshotBlocked: false,
+          animationFrameId: null,
         };
+        for (const update of job.updates) {
+          if (!mergeAuroraProjection(replay, latestMessage, update, false)
+            || replay.needsSnapshotReason) {
+            blockAuroraRecovery(messageKey);
+            return;
+          }
+        }
+        const latestSource = latestPending.content ?? latestMessage.content ?? "";
+        const latestCursor = latestPending.tailCursor ?? cursorFromFrame(latestMessage.tailFrame);
+        if (replay.content !== latestSource || !cursorsEqual(replay.tailCursor, latestCursor)) {
+          blockAuroraRecovery(messageKey);
+          return;
+        }
 
-        // Snapshot 是一次性原子恢复点：直接提交到响应式消息，避免等待下一次 rAF
-        // 期间组件再次挂载并重复请求同一快照。
+        // No await separates the baseline, its deltas and the final projection.
+        // Vue observes only the current result, never an older visible prefix.
         if (latestPending.animationFrameId !== null) {
           cancelAnimationFrame(latestPending.animationFrameId);
           latestPending.animationFrameId = null;
         }
-        latestMessage.content = latestSource;
-        latestMessage.blocks = snapshot.stableBlocks;
-        latestMessage.tailContent = snapshot.tailBlock?.content || "";
-        latestMessage.tailBlock = tailBlock ?? undefined;
-        latestMessage.tailSnapshot = snapshot.tailSnapshot;
-        latestMessage.tailFrame = resetFrame;
-
-        latestPending.content = null;
-        latestPending.blocks = null;
-        latestPending.tailContent = null;
-        latestPending.tailBlock = null;
-        latestPending.tailBlockChanged = false;
-        latestPending.tailSnapshot = null;
-        latestPending.tailFrame = null;
+        commitPendingRender(latestMessage, replay);
+        clearPendingRender(latestPending);
+        latestPending.tailCursor = replay.tailCursor;
         latestPending.needsSnapshotReason = null;
-        return true;
+        finishAuroraRecovery(messageKey, true);
+      } catch (error) {
+        if (auroraSnapshotJobs.get(messageKey) !== job) return;
+        console.error("[chatStreamStore] Failed to rebuild Aurora snapshot:", message.id, error);
+        // Transport/command errors do not invalidate the next cursor. Keep the
+        // renderer's existing retry/downgrade policy; only unbridgeable replay
+        // or a bounded-buffer overflow blocks this stream's local recovery.
+        finishAuroraRecovery(messageKey, false);
       }
-    })().finally(() => {
-      if (auroraSnapshotJobs.get(messageKey) === job) auroraSnapshotJobs.delete(messageKey);
-    });
-
-    auroraSnapshotJobs.set(messageKey, job);
-    return job;
+    })();
+    return promise;
   };
 
   const requestAuroraSnapshot = (
@@ -538,6 +781,7 @@ export const useChatStreamStore = defineStore("chatStream", () => {
   const assistantStore = useAssistantStore();
   const avatarStore = useAvatarStore();
   const topicStore = useTopicStore();
+  const chatPreferences = useChatPreferencesStore();
 
   /**
    * 在前端本地计算 MessageShell（替代 Rust 的 precompute_shell）
@@ -610,6 +854,108 @@ export const useChatStreamStore = defineStore("chatStream", () => {
     );
   }
 
+  // 覆盖请求持久化/上下文准备以及首个 thinking 事件前的窗口。
+  function beginConversationOperation(
+    ownerId: string,
+    ownerType: ConversationOwnerType,
+    topicId: string,
+  ): () => void {
+    const key = conversationMapKey(ownerId, ownerType, topicId);
+    conversationOperations.set(key, (conversationOperations.get(key) ?? 0) + 1);
+    let released = false;
+    return () => {
+      if (released) return;
+      released = true;
+      const remaining = (conversationOperations.get(key) ?? 0) - 1;
+      if (remaining > 0) conversationOperations.set(key, remaining);
+      else conversationOperations.delete(key);
+    };
+  }
+
+  function isConversationBusy(
+    ownerId: string,
+    ownerType: ConversationOwnerType,
+    topicId: string,
+  ): boolean {
+    const key = conversationMapKey(ownerId, ownerType, topicId);
+    return !activityInventoryKnown.value
+      || conversationOperations.has(key)
+      || activeGroupTurns.has(key)
+      || activeRequests.has(key)
+      || Boolean(sessionActiveStreams.value[key]?.length);
+  }
+
+  function isConversationPreparing(
+    ownerId: string,
+    ownerType: ConversationOwnerType,
+    topicId: string,
+  ): boolean {
+    const key = conversationMapKey(ownerId, ownerType, topicId);
+    return conversationOperations.has(key) || activeRequests.has(key);
+  }
+
+  function isOwnerBusy(ownerId: string, ownerType: ConversationOwnerType): boolean {
+    if (!activityInventoryKnown.value) return true;
+    const keys = new Set([
+      ...conversationOperations.keys(),
+      ...activeGroupTurns.keys(),
+      ...activeRequests.keys(),
+      ...Object.keys(sessionActiveStreams.value),
+    ]);
+    for (const key of keys) {
+      const [type, id] = JSON.parse(key) as [ConversationOwnerType, string, string];
+      if (type === ownerType && id === ownerId) return true;
+    }
+    return false;
+  }
+
+  // 侧栏生成活动汇总：按 ownerType:ownerId 跨话题归并真实生成态。
+  // 与 isOwnerBusy 不同：未确认活动清单时不假定活动，且等待重试（waiting_retry）的可恢复中断不显示为正在生成。
+  const generatingOwnerKeys = computed(() => {
+    const owners = new Set<string>();
+    const addOwnerFromConversationKey = (conversationKey: string) => {
+      const [type, id] = JSON.parse(conversationKey) as [
+        ConversationOwnerType,
+        string,
+        string,
+      ];
+      if ((type === "agent" || type === "group") && id) {
+        owners.add(`${type}:${id}`);
+      }
+    };
+
+    for (const key of conversationOperations.keys()) {
+      addOwnerFromConversationKey(key);
+    }
+    for (const key of activeGroupTurns.keys()) {
+      addOwnerFromConversationKey(key);
+    }
+    for (const [key, requests] of activeRequests.entries()) {
+      if (requests.size > 0) {
+        addOwnerFromConversationKey(key);
+      }
+    }
+    for (const [key, messageIds] of Object.entries(sessionActiveStreams.value)) {
+      const hasGeneratingStream = messageIds.some((messageId) => {
+        const msg = activeStreamMessages.get(
+          streamMessageMapKeyFromConversation(key, messageId),
+        );
+        return msg?.streamRecoveryState !== "waiting_retry";
+      });
+      if (hasGeneratingStream) {
+        addOwnerFromConversationKey(key);
+      }
+    }
+    return owners;
+  });
+
+  function isOwnerGenerating(
+    ownerId: string,
+    ownerType: ConversationOwnerType,
+  ): boolean {
+    return generatingOwnerKeys.value.has(`${ownerType}:${ownerId}`);
+  }
+
   function getActiveStreamMessage(
     ownerId: string,
     ownerType: ConversationOwnerType,
@@ -655,8 +1001,13 @@ export const useChatStreamStore = defineStore("chatStream", () => {
       "group",
       sessionStore.currentTopicId,
     );
-    const streams = sessionActiveStreams.value[key];
-    return streams ? streams.length > 0 : false;
+    return activeGroupTurns.has(key) || Boolean(sessionActiveStreams.value[key]?.length);
+  });
+
+  const currentGroupTurn = computed(() => {
+    const key = sessionStore.currentConversationKey;
+    if (!key || key.ownerType !== "group") return null;
+    return activeGroupTurns.get(conversationMapKey(key.ownerId, "group", key.topicId)) ?? null;
   });
 
   // 全局流消息池上限，防止极端场景下 OOM
@@ -672,6 +1023,7 @@ export const useChatStreamStore = defineStore("chatStream", () => {
       if (!activeStreamKeySet.value.has(messageKey)) {
         activeStreamMessages.delete(messageKey);
         streamConsumerRevisions.delete(messageKey);
+        clearRAFUpdate(messageKey, false);
         remaining -= 1;
       }
     }
@@ -738,8 +1090,8 @@ export const useChatStreamStore = defineStore("chatStream", () => {
     cleanupTimers.add(cleanupTimer);
   };
 
-  // 只在后端删除已提交后调用；同一消息的迟到事件、快照和恢复回调全部失效。
-  const forgetDeletedMessage = (
+  // SQLite 已证实消息结算或删除；同一交付者的迟到帧不能复活这个占位。
+  const retireStreamProjection = (
     ownerId: string,
     ownerType: ConversationOwnerType,
     topicId: string,
@@ -747,9 +1099,20 @@ export const useChatStreamStore = defineStore("chatStream", () => {
   ) => {
     const messageKey = streamMessageMapKey(ownerId, ownerType, topicId, messageId);
     recordStreamTerminalTombstone(messageKey);
-    recoveryMessageIds.delete(messageKey);
     if (streamingMessageKey.value === messageKey) streamingMessageKey.value = null;
     removeSessionStream(ownerId, ownerType, topicId, messageId, true);
+  };
+
+  const acceptPersistedMessage = (key: TopicIdentity, message: ChatMessage): ChatMessage => {
+    if (message.role !== "assistant") return message;
+    const { ownerId, ownerType, topicId } = key;
+    if (message.finishReason) {
+      if (!hasStreamTerminalTombstone(streamMessageMapKey(ownerId, ownerType, topicId, message.id))) {
+        retireStreamProjection(ownerId, ownerType, topicId, message.id);
+      }
+      return message;
+    }
+    return getActiveStreamMessage(ownerId, ownerType, topicId, message.id) ?? message;
   };
 
   /**
@@ -771,11 +1134,72 @@ export const useChatStreamStore = defineStore("chatStream", () => {
     const ownerId = ctx.ownerId;
 
     if (
-      !actualMessageId ||
       !topicId ||
       !ownerId ||
       (ownerType !== "agent" && ownerType !== "group")
     ) return;
+    if (!Number.isSafeInteger(event.consumerRevision) || event.consumerRevision <= 0) return;
+    const conversationKey = conversationMapKey(ownerId, ownerType, topicId);
+    if (type === "request_activity") {
+      if (typeof ctx.requestId !== "string") return;
+      const requestKey = streamMessageMapKeyFromConversation(conversationKey, ctx.requestId);
+      const previousRevision = requestConsumerRevisions.get(requestKey) ?? 0;
+      if (event.consumerRevision < previousRevision) return;
+      requestConsumerRevisions.set(requestKey, event.consumerRevision);
+      receiptRequestKeys?.add(requestKey);
+      const activity = event.chunk as { active?: boolean } | null;
+      if (activity?.active === true) {
+        if (!activeRequests.has(conversationKey)) activeRequests.set(conversationKey, new Set());
+        activeRequests.get(conversationKey)!.add(ctx.requestId);
+      } else if (activity?.active === false) {
+        const requests = activeRequests.get(conversationKey);
+        requests?.delete(ctx.requestId);
+        if (requests?.size === 0) activeRequests.delete(conversationKey);
+      }
+      // 仅保留近期已结束 attempt 的交付序号；正在执行的 owner 不被淘汰。
+      if (requestConsumerRevisions.size > MAX_REQUEST_ACTIVITY_REVISIONS) {
+        for (const key of requestConsumerRevisions.keys()) {
+          if (requestConsumerRevisions.size <= MAX_REQUEST_ACTIVITY_REVISIONS) break;
+          const [scope, requestId] = JSON.parse(key) as [string, string];
+          if (!activeRequests.get(scope)?.has(requestId)) requestConsumerRevisions.delete(key);
+        }
+      }
+      return;
+    }
+    if (type === "group_turn") {
+      if (ownerType !== "group" || typeof ctx.turnId !== "string") return;
+      const previousRevision = groupConsumerRevisions.get(conversationKey) ?? 0;
+      if (event.consumerRevision < previousRevision) return;
+      receiptEventConversations?.add(conversationKey);
+      groupConsumerRevisions.set(conversationKey, event.consumerRevision);
+      const activity = event.chunk as (GroupTurnSnapshotDto & { active?: boolean }) | null;
+      const previousTurn = activeGroupTurns.get(conversationKey);
+      if (previousTurn?.turnId === ctx.turnId && activity?.revision !== undefined
+        && previousTurn.revision !== undefined && activity.revision < previousTurn.revision) return;
+      if (activity?.active === true) {
+        activeGroupTurns.set(conversationKey, {
+          ...activity, ownerId, ownerType: "group", topicId, turnId: ctx.turnId,
+        });
+      } else if (activity?.active === false && previousTurn?.turnId === ctx.turnId) {
+        activeGroupTurns.delete(conversationKey);
+      }
+      if (activity?.active === false
+        && (activity.stopReason === "error" || activity.stopReason === "network_fallback_stop") && !ctx.replayed
+        && (!previousTurn || previousTurn.turnId === ctx.turnId)) {
+        const networkFallback = activity.stopReason === "network_fallback_stop";
+        useNotificationStore().addNotification({
+          id: `group-session-error:${conversationKey}:${ctx.turnId}`,
+          oncePerWebview: true,
+          type: networkFallback ? "info" : "error",
+          title: "群聊已停止",
+          message: networkFallback ? "网络异常，已结束群聊"
+            : activity.error || "群聊决策或发言失败，请检查配置后继续。",
+          duration: 6000,
+        });
+      }
+      return;
+    }
+    if (!actualMessageId) return;
     const messageKey = streamMessageMapKey(
       ownerId,
       ownerType,
@@ -784,17 +1208,16 @@ export const useChatStreamStore = defineStore("chatStream", () => {
     );
 
     if (hasStreamTerminalTombstone(messageKey)) return;
-    if (!Number.isSafeInteger(event.consumerRevision) || event.consumerRevision <= 0) return;
     const currentRevision = streamConsumerRevisions.get(messageKey) ?? 0;
     if (event.consumerRevision < currentRevision) return;
+    receiptEventMessages?.add(messageKey);
     if (event.consumerRevision > currentRevision) {
       clearRAFUpdate(messageKey, false);
-      if (recoveryMessageIds.has(messageKey)) recoveryMessageIds.set(messageKey, {});
     }
     streamConsumerRevisions.set(messageKey, event.consumerRevision);
-    if (type === "end" || type === "error") recoveryMessageIds.delete(messageKey);
-    if (type === "end") {
-      recordStreamTerminalTombstone(messageKey);
+    if (type === "end") recordStreamTerminalTombstone(messageKey);
+    if (type === "end" || type === "thinking") {
+      useChatHistoryStore().noteMessageChange({ ownerId, ownerType, topicId }, actualMessageId);
     }
 
     let msg = activeStreamMessages.get(messageKey);
@@ -818,7 +1241,7 @@ export const useChatStreamStore = defineStore("chatStream", () => {
         role: "assistant",
         name: ctx.agentName,
         content: "",
-        timestamp: Date.now(),
+        timestamp: event.timestamp ?? Date.now(),
         isThinking: type === "thinking",
         agentId: ctx.agentId,
         groupId: ownerType === "group" ? ownerId : undefined,
@@ -833,17 +1256,14 @@ export const useChatStreamStore = defineStore("chatStream", () => {
     }
 
     if (isNewStream) {
-      topicStore.incrementTopicMsgCount(ownerId, ownerType, topicId);
-      const currentKey = sessionStore.currentConversationKey;
-      if (
-        !currentKey ||
-        currentKey.ownerId !== ownerId ||
-        currentKey.ownerType !== ownerType ||
-        currentKey.topicId !== topicId
-      ) {
-        void topicStore
-          .incrementTopicUnreadCount(ownerId, ownerType, topicId)
-          .catch(() => {});
+      // thinking follows admission of a new reply. A snapshot, terminal replay
+      // or reattached request may be new to this WebView only.
+      if (type === "thinking" && !ctx.replayed) {
+        topicStore.incrementTopicMsgCount(ownerId, ownerType, topicId);
+        const currentKey = sessionStore.currentConversationKey;
+        if (currentKey?.ownerId !== ownerId || currentKey.ownerType !== ownerType || currentKey.topicId !== topicId) {
+          void topicStore.incrementTopicUnreadCount(ownerId, ownerType, topicId).catch(() => {});
+        }
       }
 
       // 回调：通知 UI 列表插入新消息
@@ -855,13 +1275,38 @@ export const useChatStreamStore = defineStore("chatStream", () => {
     // 维护流状态
     if (type === "thinking") {
       msg!.isThinking = true;
+      msg!.isReconnecting = false;
+      msg!.streamRecoveryState = undefined;
       addSessionStream(ownerId, ownerType, topicId, actualMessageId);
       if (!streamingMessageKey.value) {
         streamingMessageKey.value = messageKey;
       }
+    } else if (type === "reconnecting" || type === "connected" || type === "stopping") {
+      msg!.isThinking = false;
+      msg!.isReconnecting = type === "reconnecting";
+      msg!.streamRecoveryState = type === "reconnecting" ? "reconnecting" : undefined;
+      // 停止意图属于请求 owner，接管成功不会把它重新解释成继续生成。
+      if (type === "stopping") {
+        msg!.isStopping = true;
+        clearRAFUpdate(messageKey, true);
+        if (typeof event.content === "string" && event.content !== msg!.content) {
+          const content = event.content;
+          msg!.content = content;
+          void invoke<ContentBlock[]>("process_message_content", { content })
+            .then(blocks => {
+              if (!ownsConsumer() || hasStreamTerminalTombstone(messageKey)
+                || !msg!.isStopping || msg!.content !== content || rAFPendingUpdates.has(messageKey)) return;
+              replaceRenderProjection(msg!, blocks);
+            })
+            .catch(error => console.error("[ChatStreamStore] Failed to render stopping partial:", error));
+        }
+      }
+      if (msg!.finishReason === "error") msg!.finishReason = undefined;
+      addSessionStream(ownerId, ownerType, topicId, actualMessageId);
     } else if (type === "aurora") {
       msg!.isThinking = false;
       msg!.isReconnecting = false;
+      msg!.streamRecoveryState = undefined;
       addSessionStream(ownerId, ownerType, topicId, actualMessageId);
 
       const aurora = event.aurora;
@@ -916,171 +1361,33 @@ export const useChatStreamStore = defineStore("chatStream", () => {
             streamId: null,
             tailCursor: null,
             needsSnapshotReason: null,
+            snapshotBlocked: false,
             animationFrameId: null,
           };
           rAFPendingUpdates.set(messageKey, update);
         }
 
-        // 2. 先认领 Aurora 流身份与帧序列，再合并同一事件的 chunk/blocks/tail。
-        // 重复或迟到事件必须整体丢弃，否则即使忽略 AST frame，chunk 仍会被重复追加。
-        const eventStreamId = aurora.streamId ?? aurora.tailFrame?.streamId;
-        let streamChanged = false;
-        if (eventStreamId !== undefined) {
-          if (!Number.isSafeInteger(eventStreamId) || eventStreamId <= 0) return;
-          if (
-            aurora.tailFrame &&
-            aurora.tailFrame.streamId !== eventStreamId
-          ) return;
-          if (update.streamId !== null && eventStreamId < update.streamId) return;
-          if (update.streamId === null || eventStreamId > update.streamId) {
-            streamChanged = update.streamId !== null;
-            update.content = null;
-            update.blocks = null;
-            update.tailContent = null;
-            update.tailBlock = null;
-            update.tailBlockChanged = false;
-            update.tailOp = null;
-            update.tailFrame = null;
-            update.tailSnapshot = null;
-            update.streamId = eventStreamId;
-            update.tailCursor = null;
-            update.needsSnapshotReason = null;
-          }
-        }
+        if (!mergeAuroraProjection(update, msg!, aurora, typeof document !== "undefined" && document.hidden)) return;
 
-        let mergedTailFrame: TailFrame | null = null;
-        if (aurora.tailFrame) {
-          if (eventStreamId === undefined) return;
-          if (import.meta.env.DEV && isStreamDebugEnabled()) {
-            streamDebugLog(
-              `[chatStreamStore] Received tailFrame stream=${aurora.tailFrame.streamId} seq=${aurora.tailFrame.frameSeq} mutations=${aurora.tailFrame.mutations?.length || 0} for ${actualMessageId}`,
-            );
+        if (aurora.kind === "snapshot" && typeof aurora.content === "string"
+          && aurora.stableBlocks && !update.needsSnapshotReason) {
+          // A complete owner baseline supersedes an in-flight local rebuild.
+          // Publish before resolving so a remount cannot reclaim the old frame.
+          if (auroraSnapshotJobs.has(messageKey)) {
+            if (update.animationFrameId !== null) cancelAnimationFrame(update.animationFrameId);
+            update.animationFrameId = null;
+            commitPendingRender(msg!, update);
+            clearPendingRender(update);
+            finishAuroraRecovery(messageKey, true);
           }
-          const latestSnapshot =
-            aurora.tailFrame.snapshot ??
-            aurora.tailBlock?.nodes;
-          const merged = mergeTailFrame(
-            update.tailFrame,
-            update.tailCursor,
-            aurora.tailFrame,
-            latestSnapshot,
-            streamChanged
-              || !!update.needsSnapshotReason
-              || (typeof document !== "undefined" && document.hidden),
-          );
-          if (!merged.accepted || !merged.cursor) return;
-          update.tailCursor = merged.cursor;
-          if (merged.needsSnapshot) {
-            update.tailFrame = null;
-            update.needsSnapshotReason = merged.needsSnapshot;
-          } else if (merged.frame) {
-            mergedTailFrame = merged.frame;
-            update.needsSnapshotReason = null;
-          }
-        }
-
-        // 3. 覆盖 Snapshot，或按基线身份应用 Delta。
-        if (typeof aurora.content === "string") {
-          update.content = aurora.content;
-        } else if (aurora.chunk) {
-          const currentBase =
-            update.content !== null ? update.content : msg!.content || "";
-          update.content = currentBase + aurora.chunk;
-        }
-
-        if (aurora.kind === "snapshot") {
-          if (aurora.stableBlocks) {
-            update.blocks = aurora.stableBlocks;
-          }
-          const snapshotMode: TailRenderMode = aurora.tailMode
-            ?? (aurora.tailBlock?.nodes ? "ast" : "plain");
-          update.tailContent = aurora.tailBlock?.content || "";
-          update.tailBlock = aurora.tailBlock
-            ? { ...aurora.tailBlock, render_mode: snapshotMode }
-            : null;
-          update.tailBlockChanged = true;
-        } else if (aurora.kind === "delta") {
-          if (aurora.stableAppend) {
-            const stableBase = update.blocks ?? msg!.blocks ?? [];
-            if (stableBase.length === aurora.stableAppend.baseCount) {
-              update.blocks = [
-                ...stableBase,
-                ...aurora.stableAppend.blocks,
-              ];
-            } else {
-              update.needsSnapshotReason = "stable_base_mismatch";
-            }
-          }
-
-          if (aurora.tailOp) {
-            if (update.tailOp && aurora.tailOp.op === "append") {
-              if (update.tailOp.op === "append") {
-                update.tailOp = {
-                  ...aurora.tailOp,
-                  content: update.tailOp.content + aurora.tailOp.content,
-                  previousHash: update.tailOp.previousHash,
-                };
-              } else if (update.tailOp.op === "replace") {
-                update.tailOp = {
-                  ...update.tailOp,
-                  content: update.tailOp.content + aurora.tailOp.content,
-                  hash: aurora.tailOp.hash,
-                };
-              } else {
-                update.tailOp = aurora.tailOp;
-              }
-            } else {
-              update.tailOp = aurora.tailOp;
-            }
-
-            const currentBlock = update.tailBlock ?? msg!.tailBlock;
-            const currentContent = update.tailContent !== null
-              ? update.tailContent
-              : msg!.tailContent || "";
-            if (aurora.tailOp.op === "clear") {
-              update.tailContent = "";
-              update.tailBlock = null;
-              update.tailBlockChanged = true;
-              update.tailSnapshot = [];
-            } else if (aurora.tailOp.op === "replace") {
-              update.tailContent = aurora.tailOp.content;
-              update.tailBlock = buildTailBlockFromOp(
-                aurora.tailOp,
-                aurora.tailOp.content,
-                currentBlock,
-              );
-              update.tailBlockChanged = true;
-            } else {
-              const currentHash = currentBlock?.hash
-                ? String(currentBlock.hash)
-                : undefined;
-              if (currentHash !== aurora.tailOp.previousHash) {
-                update.needsSnapshotReason = "tail_base_mismatch";
-              } else {
-                const nextContent = currentContent + aurora.tailOp.content;
-                update.tailContent = nextContent;
-                update.tailBlock = buildTailBlockFromOp(
-                  aurora.tailOp,
-                  nextContent,
-                  currentBlock,
-                );
-                update.tailBlockChanged = true;
-              }
-            }
-          }
-        }
-
-        if (mergedTailFrame) {
-          update.tailFrame = mergedTailFrame;
-          if (mergedTailFrame.snapshot !== undefined) {
-            update.tailSnapshot = mergedTailFrame.snapshot;
-          }
+        } else {
+          retainRecoveryUpdate(messageKey, aurora);
         }
 
         // 4. 申请硬件级 rAF 渲染调度（合并原子提交）
         scheduleRAFUpdate(messageKey);
         if (
-          update.needsSnapshotReason
+          update.needsSnapshotReason && !update.snapshotBlocked
           && (typeof document === "undefined" || !document.hidden)
         ) {
           void requestAuroraSnapshotByKey(
@@ -1093,11 +1400,39 @@ export const useChatStreamStore = defineStore("chatStream", () => {
       // error 表示尚未 durable（终态提交失败或 Helper 接管中断）。保留 partial 和 active owner，
       // 不写终态 tombstone；后续 recovery 的权威 end 仍必须能够进入。
       clearRAFUpdate(messageKey, true);
+      const contentChanged = typeof event.content === "string" && event.content !== msg!.content;
       if (typeof event.content === "string") msg!.content = event.content;
       msg!.isThinking = false;
-      msg!.isReconnecting = true;
+      msg!.isReconnecting = false;
+      const wasWaiting = msg!.streamRecoveryState === "waiting_retry";
+      msg!.streamRecoveryState = "waiting_retry";
+      addSessionStream(ownerId, ownerType, topicId, actualMessageId);
+      if (contentChanged) {
+        const content = msg!.content || "";
+        void invoke<ContentBlock[]>("process_message_content", { content })
+          .then(blocks => {
+            if (!ownsConsumer() || hasStreamTerminalTombstone(messageKey)
+              || msg!.streamRecoveryState !== "waiting_retry" || msg!.content !== content) return;
+            replaceRenderProjection(msg!, blocks);
+          })
+          .catch(error => console.error("[ChatStreamStore] Failed to render recoverable partial:", error));
+      }
+      if (!wasWaiting && !msg!.isStopping) {
+        useNotificationStore().addNotification({
+          id: `stream-recovery:${messageKey}`,
+          type: "error",
+          title: "流式接续失败",
+          message: event.error || "连接暂不可用，等待重试",
+          toastOnly: true,
+        });
+      }
     } else if (type === "end") {
       const finishReason = event.finishReason;
+      // Only a live response completing normally is a new completion cue. Durable
+      // history replays and user cancellation still follow the same rendering owner.
+      const playCompletionFeedback = isMessageActive(ownerId, ownerType, topicId, actualMessageId)
+        && ctx.replayed !== true && !event.error
+        && (finishReason === 'completed' || finishReason === 'stop' || finishReason === 'length');
       if (typeof event.topicUpdatedAt === "number") {
         topicStore.setTopicUpdatedAt(
           ownerId,
@@ -1129,39 +1464,34 @@ export const useChatStreamStore = defineStore("chatStream", () => {
       if (msg) {
         msg!.isThinking = false;
         msg!.isReconnecting = false;
+        msg!.streamRecoveryState = undefined;
+        msg!.isStopping = false;
         if (event.timestamp) {
           msg!.timestamp = event.timestamp;
         }
 
         // 定义闭环终结函数，保证在 blocks 赋值完成后才移除活动流状态
-        const finalizeStream = () => {
+        const finalizeStream = (blocks?: ContentBlock[]) => {
           if (!ownsConsumer()) return;
-          msg!.tailContent = "";
-          msg!.tailBlock = undefined;
-          msg!.tailOp = undefined;
+          // 解析失败时保留已有展示；只有完整结果到达才释放旧尾部。
+          if (blocks) replaceRenderProjection(msg!, blocks);
           removeSessionStream(ownerId, ownerType, topicId, actualMessageId);
-          if (callbacks?.onStreamFinished) {
-            callbacks.onStreamFinished(actualMessageId, topicId);
-          }
+          if (!ctx.replayed) callbacks?.onStreamFinished?.(actualMessageId, topicId);
+          // fork ptp4g#4：消息完成后防抖触发自动同步。
           requestAutoSync("stream-end");
-          if (typeof navigator !== "undefined" && navigator.vibrate) {
-            navigator.vibrate(40);
-          }
+          if (playCompletionFeedback && chatPreferences.messageHapticsEnabled) triggerMessageHaptic('complete');
         };
 
         try {
           // 如果后端已经带回了预渲染好的 blocks，直接使用，跳过冗余解析
           if (event.blocks) {
-            msg.blocks = event.blocks;
-            finalizeStream();
+            finalizeStream(event.blocks);
           } else {
             invoke<ContentBlock[]>("process_message_content", {
               content: msg!.content || "",
             })
               .then((compiledBlocks) => {
-                if (!ownsConsumer()) return;
-                msg.blocks = compiledBlocks;
-                finalizeStream();
+                finalizeStream(compiledBlocks);
               })
               .catch((e) => {
                 console.error(
@@ -1190,21 +1520,36 @@ export const useChatStreamStore = defineStore("chatStream", () => {
     topicId: string,
     messageId: string,
   ) => {
-    console.log(
-      `[ChatStreamStore] Sending interrupt signal for message: ${messageId}`,
-    );
+    const message = getActiveStreamMessage(ownerId, ownerType, topicId, messageId);
+    const messageKey = streamMessageMapKey(ownerId, ownerType, topicId, messageId);
+    if (message) message.isStopping = true;
     try {
-      await invoke("interruptRequest", {
+      const receipt = await invoke<InterruptRequestDto>("interruptRequest", {
         ownerId,
         ownerType,
         topicId,
         messageId,
       });
+      if (disposed) return;
+      if (receipt?.status === "completed" && !hasStreamTerminalTombstone(messageKey)
+        && isMessageActive(ownerId, ownerType, topicId, messageId)) {
+        // 收据只证明后端已提交；缺失的正文仍经统一连接/历史对账取得。
+        await checkAndRecoverInterruptedStreams();
+      }
     } catch (e) {
       console.error(
         `[ChatStreamStore] Failed to interrupt stream for ${messageId}:`,
         e,
       );
+      if (!disposed && isMessageActive(ownerId, ownerType, topicId, messageId)) {
+        useNotificationStore().addNotification({
+          id: `stream-stop:${messageKey}`,
+          type: "warning",
+          title: "停止待确认",
+          message: e instanceof Error ? e.message : String(e),
+          toastOnly: true,
+        });
+      }
     }
   };
 
@@ -1212,30 +1557,43 @@ export const useChatStreamStore = defineStore("chatStream", () => {
    * 强行中止整个群组的接力赛回合
    */
   const stopGroupTurn = async (ownerId: string, topicId: string) => {
-    console.log(
-      `[ChatStreamStore] Global Group Interruption for topic: ${topicId}`,
-    );
-    // 在首个 await 前冻结目标集合，避免切换会话后误停新话题的流。
-    const activeIds = Array.from(activeStreamingIds.value);
+    const conversationKey = conversationMapKey(ownerId, "group", topicId);
+    for (const id of sessionActiveStreams.value[conversationKey] ?? []) {
+      const message = getActiveStreamMessage(ownerId, "group", topicId, id);
+      if (message) message.isStopping = true;
+    }
     try {
       await invoke("interruptGroupTurn", {
         ownerId,
         ownerType: "group",
         topicId,
       });
-      if (activeIds.length > 0) {
-        await Promise.all(
-          activeIds.map((id) => stopMessage(ownerId, "group", topicId, id)),
-        );
-      }
     } catch (e) {
       console.error("[ChatStreamStore] Failed to stop group turn:", e);
+      if (!disposed && (activeGroupTurns.has(conversationKey) || sessionActiveStreams.value[conversationKey]?.length)) {
+        useNotificationStore().addNotification({
+          id: `stream-stop-group:${conversationKey}`,
+          type: "warning",
+          title: "停止待确认",
+          message: e instanceof Error ? e.message : String(e),
+          toastOnly: true,
+        });
+      }
     }
   };
 
   onScopeDispose(() => {
     disposed = true;
-    recoveryMessageIds.clear();
+    connectionEpoch += 1;
+    reconnectChannel = null;
+    receiptEventConversations = null;
+    receiptEventMessages = null;
+    receiptRequestKeys = null;
+    conversationOperations.clear();
+    activeGroupTurns.clear();
+    groupConsumerRevisions.clear();
+    activeRequests.clear();
+    requestConsumerRevisions.clear();
     cleanupTimers.forEach(clearTimeout);
     cleanupTimers.clear();
     rAFPendingUpdates.forEach((up) => {
@@ -1244,299 +1602,194 @@ export const useChatStreamStore = defineStore("chatStream", () => {
       }
     });
     rAFPendingUpdates.clear();
+    for (const messageKey of auroraSnapshotJobs.keys()) finishAuroraRecovery(messageKey, null);
     streamTerminalTombstones.clear();
     streamConsumerRevisions.clear();
   });
 
-  const isRecovering = ref(false);
+  const connectionError = ref<string | null>(null);
+
+  const createOutputChannel = (): Channel<StreamEventDto> => {
+    const epoch = ++connectionEpoch;
+    const channel = useChatHistoryStore().makeStreamChannel(null);
+    const handleEvent = channel.onmessage;
+    channel.onmessage = event => {
+      if (!disposed && epoch === connectionEpoch) handleEvent(event);
+    };
+    reconnectChannel = channel;
+    return channel;
+  };
+
+  async function resolvePreviousPlaceholders(candidates: Set<string>, eventMessages: Set<string>) {
+    const keys: PlaceholderKey[] = [];
+    for (const messageKey of candidates) {
+      if (!activeStreamKeySet.value.has(messageKey) || eventMessages.has(messageKey)) continue;
+      const [scope, messageId] = JSON.parse(messageKey) as [string, string];
+      const [ownerType, ownerId, topicId] = JSON.parse(scope) as [ConversationOwnerType, string, string];
+      keys.push({ ownerType, ownerId, topicId, messageId });
+    }
+    for (let offset = 0; offset < keys.length; offset += 500) {
+      const rows = await invoke<PlaceholderResult[]>("resolve_chat_placeholders", { keys: keys.slice(offset, offset + 500) });
+      if (disposed) return;
+      for (const { ownerId, ownerType, topicId, messageId, state } of rows) {
+        const messageKey = streamMessageMapKey(ownerId, ownerType, topicId, messageId);
+        if (eventMessages.has(messageKey) || !activeStreamKeySet.value.has(messageKey)) continue;
+        if (state === "committed" || state === "missing") retireStreamProjection(ownerId, ownerType, topicId, messageId);
+      }
+    }
+  }
 
   /**
-   * 检查并恢复被异常打断的活跃生成（冷启动自对齐与流接续）
+   * 同一 WebView 只持有一个输出连接。Rust 安排接管；每条生成的结果只从 Channel 归约。
    */
-  const checkAndRecoverInterruptedStreams = async () => {
-    if (disposed || isRecovering.value) return;
-    isRecovering.value = true;
+  const checkAndRecoverInterruptedStreams = (): Promise<void> => {
+    if (disposed) return Promise.resolve();
+    if (reconnectPromise) return reconnectPromise;
+    // Tauri 每次反序列化 Channel 都新建原生序号，不能重复传递同一个 JS Channel。
+    // 注册后只传连接身份，让 Rust 复用最初注册的 Channel 实例及其有序序号。
+    let registrationChannel = reconnectChannel ? undefined : createOutputChannel();
+    let epoch = connectionEpoch;
+    const previousActiveKeys = new Set(activeStreamKeySet.value);
+    const eventConversations = new Set<string>();
+    const eventMessages = new Set<string>();
+    const requestEvents = new Set<string>();
+    receiptEventConversations = eventConversations;
+    receiptEventMessages = eventMessages;
+    receiptRequestKeys = requestEvents;
 
-    // 1. 本地扫表：无网状态下也能运行
-    let activeGens: ActiveGenerationDto[] = [];
-    try {
-      const streamChannel = useChatHistoryStore().makeStreamChannel(null);
-      activeGens = await invoke<ActiveGenerationDto[]>("get_active_generations", { streamChannel });
-    } catch (e) {
-      console.error("[ChatStreamStore] Failed to get active generations:", e);
-      isRecovering.value = false;
-      return;
-    }
-
-    if (disposed) {
-      isRecovering.value = false;
-      return;
-    }
-    activeGens = (activeGens ?? []).filter((generation) =>
-      (generation.ownerType === "agent" || generation.ownerType === "group")
-      && !recoveryMessageIds.has(streamMessageMapKey(
-        generation.ownerId, generation.ownerType, generation.topicId, generation.msgId,
-      ))
-      && !hasStreamTerminalTombstone(streamMessageMapKey(
-        generation.ownerId, generation.ownerType, generation.topicId, generation.msgId,
-      )),
-    );
-
-    if (!activeGens || activeGens.length === 0) {
-      isRecovering.value = false;
-      return;
-    }
-
-    try {
-      console.log(
-        `[ChatStreamStore] Found ${activeGens.length} interrupted active generations:`,
-        activeGens,
-      );
-      // 扫描前已有的活跃消息无需再次标记未读。
-      const existingMessageIds = new Set(activeStreamMessages.keys());
-      const recoveryUnreadUpdates: Promise<void>[] = [];
-
-      // 2. UI 预处理：在内存中将消息标记为 reconnecting，让用户在界面上看到“重连中”
-      for (const gen of activeGens) {
-        const { msgId, topicId, ownerId, ownerType, agentId, agentName } = gen;
-        if (ownerType !== "agent" && ownerType !== "group") continue;
-        const messageKey = streamMessageMapKey(
-          ownerId,
-          ownerType,
-          topicId,
-          msgId,
-        );
-
-        let msg = activeStreamMessages.get(messageKey);
-        if (!msg) {
-          const historyStore = useChatHistoryStore();
-          const currentKey = sessionStore.currentConversationKey;
-          const isCurrentConversation = Boolean(
-            currentKey &&
-              currentKey.topicId === topicId &&
-              currentKey.ownerId === ownerId &&
-              currentKey.ownerType === ownerType,
-          );
-          const existingMsg = isCurrentConversation
-            ? historyStore.currentChatHistory.find((x) => x.id === msgId)
-            : undefined;
-
-          if (existingMsg) {
-            msg = existingMsg;
-            msg.isReconnecting = true;
-          } else {
-            msg = reactive<ChatMessage>({
-              id: msgId,
-              role: "assistant",
-              name: agentName ?? undefined,
-              content: "",
-              timestamp: gen.createdAt || Date.now(),
-              isThinking: false,
-              isReconnecting: true,
-              agentId: agentId || (ownerType === "agent" ? ownerId : undefined),
-              groupId: ownerType === "group" ? ownerId : undefined,
-              isGroupMessage: ownerType === "group",
-              shell: computeShell({
-                role: "assistant",
-                agentId: agentId || (ownerType === "agent" ? ownerId : undefined),
-              }),
-            });
-
-            // 如果是当前展示的话题，且历史中没有，立即推入历史中展示
-            if (isCurrentConversation) {
-              historyStore.currentChatHistory.push(msg);
-              historyStore.currentChatHistory.sort(compareMessageOrder);
-            }
-          }
-          activeStreamMessages.set(messageKey, msg);
-        } else {
-          msg.isReconnecting = true;
+    reconnectPromise = (async () => {
+      try {
+        let receipt: ReconnectChatStreamsDto;
+        try {
+          receipt = await invoke<ReconnectChatStreamsDto>("reconnect_chat_streams", {
+            connectionId,
+            ...(registrationChannel ? { channel: registrationChannel } : {}),
+          });
+        } catch (error) {
+          if (disposed || epoch !== connectionEpoch) return;
+          if (String(error) !== "connection_not_registered" || registrationChannel) throw error;
+          registrationChannel = createOutputChannel();
+          epoch = connectionEpoch;
+          receipt = await invoke<ReconnectChatStreamsDto>("reconnect_chat_streams", {
+            connectionId, channel: registrationChannel,
+          });
         }
-        // 数据库仍将该消息列为 pending；上次接续拒绝的临时错误不属于生成终态。
-        if (msg.finishReason === "error") msg.finishReason = undefined;
-        addSessionStream(ownerId, ownerType, topicId, msgId);
-      }
-
-      for (const gen of activeGens) {
-        const { msgId, topicId, ownerId, ownerType } = gen;
-        if (ownerType !== "agent" && ownerType !== "group") continue;
-        const messageKey = streamMessageMapKey(
-          ownerId,
-          ownerType,
-          topicId,
-          msgId,
-        );
-        const currentKey = sessionStore.currentConversationKey;
-        const recoveryKey: ConversationKey | null =
-          currentKey &&
-          currentKey.topicId === topicId &&
-          currentKey.ownerId === ownerId &&
-          currentKey.ownerType === ownerType
-            ? {
-                ownerId: currentKey.ownerId,
-                ownerType: currentKey.ownerType,
-                topicId: currentKey.topicId,
-                epoch: currentKey.epoch,
-              }
-            : null;
-
-        if (recoveryMessageIds.has(messageKey)) continue;
-        const recoveryOwner = {};
-        recoveryMessageIds.set(messageKey, recoveryOwner);
-        const ownsRecovery = () => !disposed
-          && recoveryMessageIds.get(messageKey) === recoveryOwner
-          && !hasStreamTerminalTombstone(messageKey);
-
-        if (!existingMessageIds.has(messageKey) && ownerType === "agent" && !recoveryKey) {
-          recoveryUnreadUpdates.push(
-            topicStore.setTopicUnread(ownerId, ownerType, topicId, true),
-          );
+        if (disposed || epoch !== connectionEpoch) return;
+        if (!receipt || !Array.isArray(receipt.generations) || !Array.isArray(receipt.groupTurns)
+          || !Array.isArray(receipt.activeRequests)) {
+          throw new Error("聊天连接未返回有效的活动状态");
         }
-        let msg = activeStreamMessages.get(messageKey);
-        if (!msg) {
-          // 说明是冷启动后第一次加载或者流不在活跃池中
-          const historyStore = useChatHistoryStore();
-          const existing = recoveryKey
-            ? historyStore.currentChatHistory.find((x) => x.id === msgId)
-            : undefined;
-          if (existing) {
-            msg = existing;
-            activeStreamMessages.set(messageKey, msg);
+        activityInventoryKnown.value = true;
+        connectionError.value = null;
+        for (const generation of receipt.generations) {
+          if (generation.ownerType !== "agent" && generation.ownerType !== "group") continue;
+          const { ownerId, ownerType, topicId, msgId } = generation;
+          const messageKey = streamMessageMapKey(ownerId, ownerType, topicId, msgId);
+          previousActiveKeys.delete(messageKey);
+          // 事件可先于收据抵达；收据从不覆盖新快照、待重试状态或持久终态。
+          if (hasStreamTerminalTombstone(messageKey)) continue;
+          hydratePendingReceipt(generation, ownerType, eventMessages.has(messageKey));
+        }
+
+        const liveTurns = new Map(receipt.groupTurns.map(turn => [
+          conversationMapKey(turn.ownerId, "group", turn.topicId), turn,
+        ]));
+        for (const key of activeGroupTurns.keys()) {
+          if (!eventConversations.has(key) && !liveTurns.has(key)) activeGroupTurns.delete(key);
+        }
+        for (const [key, turn] of liveTurns) {
+          if (!eventConversations.has(key)) activeGroupTurns.set(key, turn);
+        }
+
+        const liveRequestKeys = new Set<string>();
+        for (const request of receipt.activeRequests) {
+          const key = conversationMapKey(request.ownerId, request.ownerType, request.topicId);
+          const requestKey = streamMessageMapKeyFromConversation(key, request.requestId);
+          liveRequestKeys.add(requestKey);
+          if (!requestEvents.has(requestKey)) {
+            if (!activeRequests.has(key)) activeRequests.set(key, new Set());
+            activeRequests.get(key)!.add(request.requestId);
           }
         }
-
-        const recoveryMessage = msg;
-        // 保留已显示内容，首个权威 snapshot 会原子覆盖正文、稳定块与尾部。
-        if (recoveryMessage) {
-          recoveryMessage.isThinking = false;
+        for (const [key, requests] of activeRequests) {
+          for (const requestId of requests) {
+            const requestKey = streamMessageMapKeyFromConversation(key, requestId);
+            if (!liveRequestKeys.has(requestKey) && !requestEvents.has(requestKey)) requests.delete(requestId);
+          }
+          if (requests.size === 0) activeRequests.delete(key);
         }
 
-        const compileRecoveredContent = () => {
-          if (!recoveryMessage) return;
-          const content = recoveryMessage.content || "";
-          const consumerRevision = streamConsumerRevisions.get(messageKey);
-          void invoke<ContentBlock[]>("process_message_content", { content })
-            .then((compiledBlocks) => {
-              if (disposed || hasStreamTerminalTombstone(messageKey)
-                || streamConsumerRevisions.get(messageKey) !== consumerRevision
-                || recoveryMessage.content !== content) return;
-              recoveryMessage.blocks = compiledBlocks;
-              recoveryMessage.tailContent = "";
-              recoveryMessage.tailBlock = undefined;
-              recoveryMessage.tailOp = undefined;
-            })
-            .catch((error) => {
-              console.error("[ChatStreamStore] Failed to compile recovered message:", error);
-            });
-        };
-
-        const streamChannel = useChatHistoryStore().makeStreamChannel(null);
-
-        // 后端在一个 owner lease 内先判定 durable 状态，再决定是否需要网络接续。
-        // navigator.onLine 不能前置否决：Finalizing/Interrupted 等状态必须可离线收口。
-        // 扫描门闩可以释放，但 recoveryMessageIds 会覆盖整个长连接生命周期。
-        let attached = false;
-        void invoke<RecoveryResultDto>("recover_active_generation", {
-          ownerId,
-          ownerType,
-          topicId,
-          msgId,
-          streamChannel,
-        })
-          .then((res) => {
-            if (!ownsRecovery()) return;
-            console.log(
-              `[ChatStreamStore] Recovery status for ${msgId}: ${String(res?.status ?? "unknown")}`,
-            );
-            if (res.status === "attached") {
-              attached = true;
-              return;
-            }
-
-            if (recoveryMessage) {
-              recoveryMessage.isReconnecting = false;
-              recoveryMessage.isThinking = false;
-              if (typeof res.content === "string") {
-                clearRAFUpdate(messageKey, false);
-                recoveryMessage.content = res.content;
-                compileRecoveredContent();
-              }
-              if (res.status === "failed" || res.status === "not_found") {
-                recoveryMessage.finishReason = "error";
-              } else if (res.status === "completed" && res.finishReason) {
-                recoveryMessage.finishReason = res.finishReason;
-              }
-            }
-            removeSessionStream(ownerId, ownerType, topicId, msgId);
-
-            if (
-              recoveryKey &&
-              sessionStore.isConversationCurrent(recoveryKey)
-            ) {
-              const historyStore = useChatHistoryStore();
-              if (
-                !historyStore.currentChatHistory.some((x) => x.id === msgId)
-              ) {
-                void historyStore.loadHistory(ownerId, ownerType, topicId);
-              }
-            }
-          })
-          .catch((err) => {
-            if (!ownsRecovery()) return;
-            console.error(
-              `[ChatStreamStore] Failed to recover stream for ${msgId}:`,
-              err,
-            );
-            if (recoveryMessage) {
-              clearRAFUpdate(messageKey, true);
-              recoveryMessage.isReconnecting = false;
-              recoveryMessage.finishReason = "error";
-              compileRecoveredContent();
-            }
-            removeSessionStream(ownerId, ownerType, topicId, msgId);
-            useNotificationStore().addNotification({
-              type: "error",
-              title: "流式接续失败",
-              message: err instanceof Error ? err.message : String(err),
-              toastOnly: true,
-            });
-          })
-          .finally(() => {
-            if (!attached && recoveryMessageIds.get(messageKey) === recoveryOwner) {
-              recoveryMessageIds.delete(messageKey);
-            }
+        // A whole group turn can start and finish while this consumer is away.
+        // Reconcile the observed window even when no earlier request ID is known.
+        try {
+          await useChatHistoryStore().reconcileWindow();
+          if (!disposed) await resolvePreviousPlaceholders(previousActiveKeys, eventMessages);
+        } catch (error) {
+          if (!disposed) useNotificationStore().addNotification({
+            id: "chat-window-recovery", type: "error", title: "聊天记录核对失败",
+            message: error instanceof Error ? error.message : String(error), toastOnly: true,
           });
+        }
+      } catch (error) {
+        if (disposed || epoch !== connectionEpoch) return;
+        connectionError.value = error instanceof Error ? error.message : String(error);
+        useNotificationStore().addNotification({
+          id: "chat-output-connection",
+          type: "error",
+          title: "聊天连接失败",
+          message: `${connectionError.value}。返回前台或网络恢复后将重新连接。`,
+          toastOnly: true,
+        });
+      } finally {
+        if (receiptEventConversations === eventConversations) receiptEventConversations = null;
+        if (receiptEventMessages === eventMessages) receiptEventMessages = null;
+        if (receiptRequestKeys === requestEvents) receiptRequestKeys = null;
+        reconnectPromise = null;
       }
-
-      if (recoveryUnreadUpdates.length > 0) {
-        await Promise.allSettled(recoveryUnreadUpdates);
-      }
-
-      const selectedOwner = sessionStore.currentSelectedItem;
-      if (
-        selectedOwner &&
-        (selectedOwner.type === "agent" || selectedOwner.type === "group") &&
-        activeGens.some(
-          (generation) =>
-            generation.ownerId === selectedOwner.id &&
-            generation.ownerType === selectedOwner.type,
-        )
-      ) {
-        await topicStore
-          .loadTopicList(selectedOwner.id, selectedOwner.type)
-          .catch((error) => {
-            console.error(
-              "[ChatStreamStore] Failed to reconcile topic list after recovery:",
-              error,
-            );
-          });
-      }
-    } catch (e) {
-      console.error("[ChatStreamStore] Cloud sync failed during recovery:", e);
-    } finally {
-      isRecovering.value = false;
-    }
+    })();
+    return reconnectPromise;
   };
+
+  function hydratePendingReceipt(
+    generation: ActiveGenerationDto,
+    ownerType: ConversationOwnerType,
+    preserveEventState: boolean,
+  ): void {
+    const { ownerId, topicId, msgId } = generation;
+    const messageKey = streamMessageMapKey(ownerId, ownerType, topicId, msgId);
+    const history = useChatHistoryStore();
+    const loaded = history.loadedConversationKey;
+    const isLoaded = loaded?.ownerId === ownerId && loaded.ownerType === ownerType
+      && loaded.topicId === topicId && sessionStore.isConversationCurrent(loaded);
+    let message = activeStreamMessages.get(messageKey);
+    if (!message && isLoaded) message = history.currentChatHistory.find(item => item.id === msgId);
+    if (!message) {
+      message = reactive<ChatMessage>({
+        id: msgId,
+        role: "assistant",
+        name: generation.agentName ?? undefined,
+        content: "",
+        timestamp: generation.createdAt,
+        agentId: generation.agentId ?? (ownerType === "agent" ? ownerId : undefined),
+        groupId: ownerType === "group" ? ownerId : undefined,
+        isGroupMessage: ownerType === "group",
+      });
+    }
+    // live owner 的 connected 可先于元数据抵达；只补展示身份，不覆盖它已交付的正文/状态。
+    if (!message.name && generation.agentName) message.name = generation.agentName;
+    if (!message.agentId && generation.agentId) message.agentId = generation.agentId;
+    if (generation.createdAt > 0) message.timestamp = generation.createdAt;
+    message.shell = computeShell({ role: message.role, agentId: message.agentId, name: message.name ?? undefined });
+    activeStreamMessages.set(messageKey, message);
+    if (isLoaded) history.projectLiveMessage(loaded, message);
+    // 只有没有事件状态的冷占位才表示等待接管；已有消息状态由生产者继续控制。
+    if (!preserveEventState && !streamConsumerRevisions.has(messageKey)) {
+      message.isReconnecting = !generation.stopRequested;
+      message.streamRecoveryState = generation.stopRequested ? undefined : "reconnecting";
+    }
+    if (!preserveEventState && generation.stopRequested) message.isStopping = true;
+    addSessionStream(ownerId, ownerType, topicId, msgId);
+  }
 
   return {
     streamingMessageKey,
@@ -1549,10 +1802,20 @@ export const useChatStreamStore = defineStore("chatStream", () => {
     getActiveStreamMessage,
     isConversationStreaming,
     isGroupGenerating,
+    currentGroupTurn,
+    beginConversationOperation,
+    isConversationBusy,
+    isConversationPreparing,
+    isOwnerBusy,
+    generatingOwnerKeys,
+    isOwnerGenerating,
+    activityInventoryKnown,
+    connectionError,
     computeShell,
     addSessionStream,
     removeSessionStream,
-    forgetDeletedMessage,
+    retireStreamProjection,
+    acceptPersistedMessage,
     requestAuroraSnapshot,
     processStreamEvent,
     stopMessage,

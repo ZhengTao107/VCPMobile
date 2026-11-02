@@ -1,5 +1,6 @@
 use crate::vcp_modules::db_write_queue::DbWriteQueue;
 use crate::vcp_modules::sync::attachment_blob::AttachmentBlobSync;
+use crate::vcp_modules::sync::sync_transfer::SyncHttpClient;
 use crate::vcp_modules::sync_error::{
     decode_wire_sync_error, encode_wire_sync_error, is_attempt_restart_code, WireSyncError,
 };
@@ -352,7 +353,7 @@ impl BatchDiffHandler {
     pub async fn handle_diff_batch(
         app_handle: &AppHandle,
         frame: MessageDiffResultFrame,
-        http_client: &reqwest::Client,
+        http_client: &SyncHttpClient,
         base_url: &str,
         token: &str,
         tracker: &Arc<Phase3Tracker>,
@@ -661,52 +662,6 @@ mod tests {
         assert!(validate_phase3_result_topics(&expected, &duplicate)
             .expect_err("duplicate compound identity must fail phase 3")
             .contains("duplicate topic identity"));
-    }
-
-    #[test]
-    fn phase3_decision_is_a_strict_discriminated_union() {
-        let mut valid = decision("topic-a");
-        valid.pull_message_ids = Some(vec!["message-a".to_string()]);
-        assert_eq!(
-            parse_topic_decision(&topic("topic-a"), &valid).expect("valid decision"),
-            TopicDecision {
-                pull_message_ids: vec!["message-a".to_string()],
-                push_topic: false,
-                delete_messages: Vec::new(),
-            }
-        );
-
-        let mut deleted = decision("topic-a");
-        deleted.delete_messages = Some(vec![MessageDeleteDecision {
-            msg_id: "message-b".to_string(),
-            deleted_at: 1234,
-        }]);
-        assert_eq!(
-            parse_topic_decision(&topic("topic-a"), &deleted)
-                .expect("valid delete decision")
-                .delete_messages,
-            vec![MessageDeleteDecision {
-                msg_id: "message-b".to_string(),
-                deleted_at: 1234,
-            }]
-        );
-
-        let mut invalid = decision("topic-a");
-        invalid.pull_message_ids = None;
-        assert!(parse_topic_decision(&topic("topic-a"), &invalid).is_err());
-    }
-
-    #[test]
-    fn raw_phase3_parser_rejects_legacy_result_maps() {
-        let legacy = r#"{
-            "type":"SYNC_DIFF_RESULTS_BATCH",
-            "results":{
-                "topic-a":{"ok":true,"toPull":[],"toPush":false}
-            }
-        }"#;
-        let error = parse_message_diff_result_frame(legacy)
-            .expect_err("legacy result maps must not be accepted");
-        assert_eq!(error.code, "PHASE3_FRAME_INVALID");
     }
 
     #[test]

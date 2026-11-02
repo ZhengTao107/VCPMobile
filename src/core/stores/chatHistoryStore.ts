@@ -1,16 +1,22 @@
 import { defineStore } from "pinia";
-import { nextTick, ref } from "vue";
+import { ref, watch } from "vue";
+import { useChatWindow } from "./chatWindow";
 import { invoke, Channel } from "@tauri-apps/api/core";
 import { useChatSessionStore } from "./chatSessionStore";
 import { useChatStreamStore } from "./chatStreamStore";
 import { useAttachmentStore } from "./attachmentStore";
 import { useAssistantStore } from "./assistant";
 import { useSettingsStore } from "./settings";
+import { SETTINGS_DEFAULTS } from "../config/generated/defaults";
 import { useTopicStore } from "./topicListManager";
 import { useNotificationStore } from "./notification";
+import { useShareStore, type ShareIdentity } from "./shareStore";
 import { clearMessageCache } from "../utils/astRenderer";
 import { extractMentionedMemberIds } from "../utils/mention";
-import { applyTopicContextMetrics, type MessageContextMetricsPayload } from "../utils/contextMetricsDisplay";
+import { triggerMessageHaptic } from "../utils/nativeHaptics";
+import { allowChatMutation } from "../../features/chat/chatMutationPolicy";
+import { useChatPreferencesStore } from "../../features/chat/preferences/store";
+import { useBubbleNarration } from "../../features/chat/voice/useBubbleNarration";
 
 import type {
   ChatMessage,
@@ -23,16 +29,9 @@ import type {
 } from "../types/chat";
 import type {
   ConversationKey,
-  ConversationOwnerType,
 } from "./chatSessionStore";
 
-export interface HistoryPageResult {
-  addedCount: number;
-  error?: unknown;
-  aborted?: boolean;
-}
-
-type AnchorLoadResult = "loaded" | "missing" | "aborted";
+export { MAX_HISTORY_MESSAGES, type HistoryPageResult } from './chatWindow';
 
 export interface MessageActionKey {
   conversation: ConversationKey;
@@ -44,27 +43,6 @@ interface EditingMessageIntent {
   initialContent: string;
 }
 
-export const MAX_HISTORY_MESSAGES = 500;
-
-const compareMessages = (a: ChatMessage, b: ChatMessage) => {
-  if (a.timestamp !== b.timestamp) return a.timestamp - b.timestamp;
-  // 与 SQLite 默认 BINARY collation 对齐，避免同毫秒消息在 keyset 游标处错位。
-  return a.id < b.id ? -1 : a.id > b.id ? 1 : 0;
-};
-
-const mergeHistoryWindow = (
-  existing: ChatMessage[],
-  incoming: ChatMessage[],
-  loadingOlder: boolean,
-) => {
-  const byId = new Map(existing.map(message => [message.id, message]));
-  incoming.forEach(message => byId.set(message.id, message));
-  const merged = Array.from(byId.values()).sort(compareMessages);
-  if (merged.length <= MAX_HISTORY_MESSAGES) return merged;
-  return loadingOlder
-    ? merged.slice(0, MAX_HISTORY_MESSAGES)
-    : merged.slice(-MAX_HISTORY_MESSAGES);
-};
 
 const sameConversation = (a: ConversationKey | null, b: ConversationKey | null) =>
   Boolean(
@@ -77,55 +55,32 @@ const sameConversation = (a: ConversationKey | null, b: ConversationKey | null) 
   );
 
 export const useChatHistoryStore = defineStore("chatHistory", () => {
-  const currentChatHistory = ref<ChatMessage[]>([]);
-  const loading = ref(false);
-
-  // 分页加载状态
-  const hasMoreHistory = ref(true);    // 是否还有更多旧消息
-  const isLoadingHistory = ref(false); // 防止并发重复触发
-  const hasEvictedNewer = ref(false);  // 深翻历史触发窗口裁剪后，最新端需要显式重载
-  const loadedConversationKey = ref<ConversationKey | null>(null);
-
-  // 启动预加载缓存：PRELOADING 阶段提前拉取首屏历史，ChatView mount 后直接消费
-  const preloadedHistory = ref<{ key: ConversationKey; messages: ChatMessage[] } | null>(null);
-  let preloadConsumed = false;
+  const window = useChatWindow();
+  const { currentChatHistory, hasEvictedNewer, canCommitConversation,
+    projectLiveMessage, reconcileWindow, noteMessageChange, returnToLatest } = window;
 
   // “编辑重发”意图必须绑定完整会话身份，避免异步读取后误落到其他话题。
   const editingMessage = ref<EditingMessageIntent | null>(null);
+  const isSubmitting = ref(false);
 
-  // 用于防止并发加载与话题切换导致竞态的消息拉取中止控制器 (AbortController)
-  let currentLoadAbortController: AbortController | null = null;
-  let currentLoadId = 0;
-  let currentAnchorLoadId = 0;
 
   const sessionStore = useChatSessionStore();
+  watch(() => sessionStore.sessionEpoch, () => { editingMessage.value = null; }, { flush: 'sync' });
   const streamStore = useChatStreamStore();
   const attachmentStore = useAttachmentStore();
   const assistantStore = useAssistantStore();
   const settingsStore = useSettingsStore();
   const topicStore = useTopicStore();
   const notificationStore = useNotificationStore();
+  const shareStore = useShareStore();
+  const chatPreferences = useChatPreferencesStore();
 
   const errorMessage = (error: unknown) =>
     error instanceof Error ? error.message : String(error);
-  const isMissingTopicError = (error: unknown) =>
-    errorMessage(error) === "topic does not belong to the selected owner";
-  const notifyHistoryLoadFailure = () => {
-    notificationStore.addNotification({
-      type: "error",
-      title: "历史加载失败",
-      message: "暂时无法读取聊天记录，请稍后重试",
-      toastOnly: true,
-    });
-  };
-
   const captureLoadedConversation = (): ConversationKey | null => {
     const key = sessionStore.currentConversationKey;
-    return sameConversation(loadedConversationKey.value, key) && key ? { ...key } : null;
+    return key && canCommitConversation(key) ? { ...key } : null;
   };
-
-  const canCommitConversation = (key: ConversationKey) =>
-    sessionStore.isConversationCurrent(key) && sameConversation(loadedConversationKey.value, key);
 
   const captureMessageActionKey = (messageId: string): MessageActionKey | null => {
     const conversation = captureLoadedConversation();
@@ -135,36 +90,23 @@ export const useChatHistoryStore = defineStore("chatHistory", () => {
   const isMessageActionCurrent = (key: MessageActionKey) =>
     canCommitConversation(key.conversation);
 
-  /**
-   * 启动预加载：在 PRELOADING 阶段提前拉取首屏聊天历史
-   * 让 DB + IPC 开销与 Vue 组件挂载并行，ChatView mount 后直接命中缓存
-   */
-  const preloadHistory = async (
-    ownerId: string,
-    ownerType: ConversationOwnerType,
-    topicId: string,
-    limit: number = 5,
-  ) => {
-    const key = sessionStore.currentConversationKey;
-    if (
-      !key ||
-      key.ownerId !== ownerId ||
-      key.ownerType !== ownerType ||
-      key.topicId !== topicId
-    ) {
-      return;
-    }
+  // Reading another section of the same conversation must preserve its composer.
+  const resetHistoryForConversation = () => {
+    window.resetHistoryForConversation();
+    editingMessage.value = null;
+  };
+
+  const openLoadedReference = async (id: string) => {
+    const key = captureLoadedConversation();
+    if (!key || !currentChatHistory.value.some(row => row.id === id)) return;
+    const intent = sessionStore.beginNavigation();
     try {
-      const messages = await invoke<ChatMessage[]>('load_chat_history', {
-        ownerId, ownerType, topicId, limit, offset: 0,
-        beforeTimestamp: null, beforeMessageId: null,
+      const result = await sessionStore.selectTopicById(key.ownerId, key.ownerType, key.topicId, intent, id);
+      if (sessionStore.isNavigationCurrent(intent)) sessionStore.notifyNavigationResult(result);
+    } catch (error) {
+      if (sessionStore.isNavigationCurrent(intent)) notificationStore.addNotification({
+        type: 'error', title: '无法打开引用消息', message: errorMessage(error), toastOnly: true,
       });
-      if (!sessionStore.isConversationCurrent(key)) return;
-      preloadedHistory.value = { key, messages };
-      console.log(`[ChatHistoryStore] Preloaded ${messages.length} messages for topic ${topicId}`);
-    } catch (e) {
-      console.error('[ChatHistoryStore] Preload failed:', e);
-      preloadedHistory.value = null;
     }
   };
 
@@ -221,265 +163,6 @@ export const useChatHistoryStore = defineStore("chatHistory", () => {
     }
   };
 
-  /**
-   * 加载聊天历史
-   */
-  const loadHistory = async (
-    ownerId: string,
-    ownerType: ConversationOwnerType,
-    topicId: string,
-    limit: number = 15,
-    loadingOlder = false,
-  ): Promise<HistoryPageResult> => {
-    const key = sessionStore.currentConversationKey;
-    if (
-      !key ||
-      key.ownerId !== ownerId ||
-      key.ownerType !== ownerType ||
-      key.topicId !== topicId
-    ) {
-      return { addedCount: 0, aborted: true };
-    }
-    const loadId = ++currentLoadId;
-    const oldest = loadingOlder ? currentChatHistory.value[0] : undefined;
-    if (loadingOlder && !oldest) return { addedCount: 0, aborted: true };
-    console.log(
-      `[ChatHistoryStore] Loading ${loadingOlder ? "older" : "latest"} history for ${ownerId}, topic: ${topicId}, limit: ${limit}`,
-    );
-    if (currentLoadAbortController) {
-      currentLoadAbortController.abort();
-    }
-    const controller = new AbortController();
-    currentLoadAbortController = controller;
-    const { signal } = controller;
-    loading.value = true;
-    isLoadingHistory.value = true;
-
-    try {
-      let messages: ChatMessage[];
-      if (
-        !loadingOlder &&
-        !preloadConsumed &&
-        preloadedHistory.value &&
-        sameConversation(preloadedHistory.value.key, key)
-      ) {
-        messages = preloadedHistory.value.messages;
-        preloadedHistory.value = null;
-        preloadConsumed = true;
-      } else {
-        preloadConsumed = true;
-        messages = await invoke<ChatMessage[]>('load_chat_history', {
-          ownerId, ownerType, topicId, limit,
-          // 后端分页使用稳定游标；offset=0 只标识最新窗口读取。
-          offset: loadingOlder ? null : 0,
-          beforeTimestamp: oldest?.timestamp ?? null,
-          beforeMessageId: oldest?.id ?? null,
-        });
-      }
-
-      if (
-        signal.aborted ||
-        loadId !== currentLoadId ||
-        !sessionStore.isConversationCurrent(key)
-      ) {
-        return { addedCount: 0, aborted: true };
-      }
-
-      const hydrated = messages.map(
-        msg => streamStore.getActiveStreamMessage(ownerId, ownerType, topicId, msg.id) || msg,
-      );
-      // 用量遥测是本端元数据，旁路读取；失败只是不显示。
-      void Promise.resolve()
-        .then(() => invoke<Record<string, MessageContextMetricsPayload>>('get_topic_context_metrics', {
-          ownerId, ownerType, topicId,
-        }))
-        .then(metrics => {
-          if (!sessionStore.isConversationCurrent(key)) return;
-          applyTopicContextMetrics(currentChatHistory.value, metrics);
-        })
-        .catch(() => {});
-      let addedCount = hydrated.length;
-      if (!loadingOlder) {
-        currentChatHistory.value = mergeHistoryWindow([], hydrated, false);
-        hasEvictedNewer.value = false;
-      } else {
-        const existingIds = new Set(currentChatHistory.value.map(message => message.id));
-        const unique = hydrated.filter(message => !existingIds.has(message.id));
-        if (currentChatHistory.value.length + unique.length > MAX_HISTORY_MESSAGES) {
-          hasEvictedNewer.value = true;
-        }
-        currentChatHistory.value = mergeHistoryWindow(
-          currentChatHistory.value,
-          unique,
-          true,
-        );
-        addedCount = unique.length;
-      }
-      loadedConversationKey.value = key;
-      hasMoreHistory.value = messages.length >= limit;
-      hydrated.forEach(msg => attachmentStore.resolveMessageAssets(msg));
-      return { addedCount };
-    } catch (e) {
-      console.error("[ChatHistoryStore] Failed to load history:", e);
-      if (
-        signal.aborted ||
-        loadId !== currentLoadId ||
-        !sessionStore.isConversationCurrent(key)
-      ) {
-        return { addedCount: 0, aborted: true };
-      }
-      if (isMissingTopicError(e)) {
-        sessionStore.clearCurrentTopic();
-        return { addedCount: 0, aborted: true };
-      }
-      notifyHistoryLoadFailure();
-      return { addedCount: 0, error: e };
-    } finally {
-      if (
-        currentLoadAbortController === controller &&
-        loadId === currentLoadId &&
-        sessionStore.isConversationCurrent(key)
-      ) {
-        currentLoadAbortController = null;
-        loading.value = false;
-        isLoadingHistory.value = false;
-      }
-    }
-  };
-
-  const resetHistoryForConversation = () => {
-    currentLoadId += 1;
-    currentLoadAbortController?.abort();
-    currentLoadAbortController = null;
-    currentChatHistory.value = [];
-    loadedConversationKey.value = null;
-    hasMoreHistory.value = true;
-    hasEvictedNewer.value = false;
-    loading.value = false;
-    isLoadingHistory.value = false;
-    editingMessage.value = null;
-  };
-
-  const loadHistoryPaginated = async (
-    ownerId: string,
-    ownerType: ConversationOwnerType,
-    topicId: string,
-  ) => {
-    resetHistoryForConversation();
-    return loadHistory(ownerId, ownerType, topicId, 5);
-  };
-
-  const loadMoreHistory = async (): Promise<HistoryPageResult> => {
-    const key = sessionStore.currentConversationKey;
-    if (
-      !key ||
-      !sameConversation(loadedConversationKey.value, key) ||
-      !hasMoreHistory.value ||
-      isLoadingHistory.value
-    ) {
-      return { addedCount: 0, aborted: true };
-    }
-    return loadHistory(
-      key.ownerId,
-      key.ownerType,
-      key.topicId,
-      10,
-      true,
-    );
-  };
-
-  const returnToLatest = async (): Promise<HistoryPageResult> => {
-    if (!hasEvictedNewer.value) return { addedCount: 0 };
-    const key = sessionStore.currentConversationKey;
-    if (!key || !sameConversation(loadedConversationKey.value, key)) {
-      return { addedCount: 0, aborted: true };
-    }
-    return loadHistory(key.ownerId, key.ownerType, key.topicId, 15);
-  };
-
-  /**
-   * 锚点窗口加载（全局搜索跳转定位）：以 anchorMessageId 为中心，
-   * 用"前 beforeN + 锚点 + 后 afterN"的消息窗口整体替换当前历史。
-   * 读取成功前不切换会话；独立序号保证连续点击时只有最后一次可以提交。
-   */
-  const loadHistoryAround = async (
-    ownerId: string,
-    ownerType: ConversationOwnerType,
-    topicId: string,
-    anchorMessageId: string,
-    beforeN = 12,
-    afterN = 8,
-  ): Promise<AnchorLoadResult> => {
-    const sourceEpoch = sessionStore.sessionEpoch;
-    const anchorLoadId = ++currentAnchorLoadId;
-    let messages: ChatMessage[];
-    try {
-      messages = await invoke<ChatMessage[]>('load_chat_history_around', {
-        ownerId,
-        ownerType,
-        topicId,
-        anchorMsgId: anchorMessageId,
-        beforeN,
-        afterN,
-      });
-    } catch (e) {
-      console.error("[ChatHistoryStore] Failed to load history around anchor:", e);
-      if (
-        anchorLoadId !== currentAnchorLoadId ||
-        sessionStore.sessionEpoch !== sourceEpoch
-      ) {
-        return "aborted";
-      }
-      if (isMissingTopicError(e)) {
-        return "missing";
-      }
-      throw e;
-    }
-
-    if (
-      anchorLoadId !== currentAnchorLoadId ||
-      sessionStore.sessionEpoch !== sourceEpoch
-    ) {
-      return "aborted";
-    }
-
-    const anchorIndex = messages.findIndex((message) => message.id === anchorMessageId);
-    if (anchorIndex === -1) return "missing";
-
-    const hydrated = messages.map(
-      message => streamStore.getActiveStreamMessage(ownerId, ownerType, topicId, message.id) || message,
-    );
-    const current = sessionStore.currentConversationKey;
-    if (
-      !current ||
-      current.ownerId !== ownerId ||
-      current.ownerType !== ownerType ||
-      current.topicId !== topicId
-    ) {
-      await sessionStore.selectTopicById(ownerId, ownerType, topicId);
-      await nextTick();
-    }
-    if (anchorLoadId !== currentAnchorLoadId) return "aborted";
-
-    const targetKey = sessionStore.currentConversationKey;
-    if (
-      !targetKey ||
-      targetKey.ownerId !== ownerId ||
-      targetKey.ownerType !== ownerType ||
-      targetKey.topicId !== topicId
-    ) {
-      return "aborted";
-    }
-
-    resetHistoryForConversation();
-    currentChatHistory.value = mergeHistoryWindow([], hydrated, false);
-    loadedConversationKey.value = targetKey;
-    // 锚点上方未取满 beforeN 说明已触顶；下方未取满 afterN 说明已在最新端
-    hasMoreHistory.value = anchorIndex >= beforeN;
-    hasEvictedNewer.value = messages.length - anchorIndex - 1 >= afterN;
-    hydrated.forEach(message => attachmentStore.resolveMessageAssets(message));
-    return "loaded";
-  };
 
   /**
    * 构造群聊/单聊共用的流式事件 Channel 接线
@@ -495,14 +178,7 @@ export const useChatHistoryStore = defineStore("chatHistory", () => {
         && canCommitConversation(target);
       return streamStore.processStreamEvent(event, {
         onMessageCreated: (msg) => {
-          if (canCommitEvent() && !currentChatHistory.value.some(m => m.id === msg.id)) {
-            currentChatHistory.value.push(msg);
-            currentChatHistory.value = mergeHistoryWindow(
-              currentChatHistory.value,
-              [],
-              false,
-            );
-          }
+          if (target && canCommitEvent()) projectLiveMessage(target, msg);
         },
         onStreamFinished: () => {
           if (canCommitEvent()) {
@@ -515,11 +191,12 @@ export const useChatHistoryStore = defineStore("chatHistory", () => {
   };
 
   /**
-   * 邀请群成员单人发言（invite_only 模式入口）
+   * 同一次邀约由 Rust 的同一个群轮 owner 顺序执行，停止会覆盖剩余成员。
    */
-  const inviteGroupMember = async (agentId: string, frozenKey?: ConversationKey) => {
+  const inviteGroupMembers = async (agentIds: string[], frozenKey?: ConversationKey) => {
     const key = frozenKey || captureLoadedConversation();
-    if (!key || key.ownerType !== "group") return;
+    if (!key || key.ownerType !== "group" || agentIds.length === 0) return;
+    const releaseOperation = streamStore.beginConversationOperation(key.ownerId, key.ownerType, key.topicId);
     try {
       const settings = settingsStore.settings;
       if (!settings) throw new Error("应用尚未完成初始化");
@@ -529,13 +206,12 @@ export const useChatHistoryStore = defineStore("chatHistory", () => {
         payload: {
           groupId: key.ownerId,
           topicId: key.topicId,
-          agentId,
+          agentIds,
         },
         streamChannel,
       });
     } catch (e) {
       console.error("[ChatHistoryStore] Invite failed:", e);
-      // 邀请链路失败绝不能静默：必须给用户可见反馈
       notificationStore.addNotification({
         type: "error",
         title: "邀请发言失败",
@@ -543,6 +219,34 @@ export const useChatHistoryStore = defineStore("chatHistory", () => {
         toastOnly: true,
         duration: 6000,
       });
+    } finally {
+      releaseOperation();
+    }
+  };
+
+  const inviteGroupMember = (agentId: string, frozenKey?: ConversationKey) =>
+    inviteGroupMembers([agentId], frozenKey);
+
+  /** 只提交用户意图；会话、仲裁和后续成员始终由 Rust 群轮 owner 执行。 */
+  const controlGroupSession = async (action: "start" | "continue") => {
+    const key = captureLoadedConversation();
+    if (!key || key.ownerType !== "group") return;
+    const releaseOperation = streamStore.beginConversationOperation(key.ownerId, "group", key.topicId);
+    try {
+      await invoke<GroupChatResultDto>("control_group_session", {
+        payload: { groupId: key.ownerId, topicId: key.topicId, action },
+        streamChannel: makeStreamChannel(key),
+      });
+    } catch (error) {
+      notificationStore.addNotification({
+        type: "error",
+        title: action === "start" ? "发起群聊失败" : "继续群聊失败",
+        message: errorMessage(error),
+        toastOnly: true,
+        duration: 6000,
+      });
+    } finally {
+      releaseOperation();
     }
   };
 
@@ -552,12 +256,21 @@ export const useChatHistoryStore = defineStore("chatHistory", () => {
   const triggerGeneration = async (
     userMsg: ChatMessage,
     frozenKey?: ConversationKey,
+    shareIdentity?: ShareIdentity,
+    commit: { persisted?: MessageWriteResultDto; onCommitted?: () => void } = {},
   ): Promise<number | null> => {
     const key = frozenKey || captureLoadedConversation();
     if (!key) return null;
+    const releaseOperation = streamStore.beginConversationOperation(key.ownerId, key.ownerType, key.topicId);
     let topicUpdatedAt: number;
+    let alreadySent = false;
     try {
-      const persisted = await invoke<MessageWriteResultDto>("append_single_message", {
+      const shareResult = shareIdentity ? await shareStore.commit(shareIdentity, userMsg) : null;
+      if (shareResult) {
+        Object.assign(userMsg, shareResult.message);
+        alreadySent = shareResult.alreadySent;
+      }
+      const persisted = commit.persisted ?? shareResult?.persisted ?? await invoke<MessageWriteResultDto>("append_single_message", {
         ownerId: key.ownerId,
         ownerType: key.ownerType,
         topicId: key.topicId,
@@ -567,13 +280,7 @@ export const useChatHistoryStore = defineStore("chatHistory", () => {
         },
       });
 
-      const targetIndex = currentChatHistory.value.findIndex(m => m.id === userMsg.id);
-      if (canCommitConversation(key) && targetIndex !== -1) {
-        currentChatHistory.value[targetIndex] = {
-          ...currentChatHistory.value[targetIndex],
-          blocks: persisted.blocks,
-        };
-      }
+      projectLiveMessage(key, { ...userMsg, blocks: persisted.blocks });
       topicUpdatedAt = persisted.topicUpdatedAt;
       topicStore.setTopicUpdatedAt(
         key.ownerId,
@@ -590,9 +297,16 @@ export const useChatHistoryStore = defineStore("chatHistory", () => {
         toastOnly: true,
         duration: 6000,
       });
+      releaseOperation();
       return null;
     }
 
+    // This receipt belongs to persistence, independently of the model request.
+    commit.onCommitted?.();
+    if (alreadySent) {
+      releaseOperation();
+      return topicUpdatedAt;
+    }
     try {
       const settings = settingsStore.settings;
       if (!settings) throw new Error("应用尚未完成初始化");
@@ -612,7 +326,7 @@ export const useChatHistoryStore = defineStore("chatHistory", () => {
         // 否则用户看到的是"发送后没有任何反应"
         if (result?.status === "no_ai_response") {
           if (result.reason === "invite_only") {
-            // 提及即邀约：消息中 @ 到的成员按出现顺序依次单人发言（群聊串行约束）；
+            // 提及即邀约：整批成员按出现顺序交给同一群轮，停止不会另启后续邀约；
             // 未提及任何成员时引导用户使用邀约横条
             const group = assistantStore.groups.find((g) => g.id === key.ownerId);
             const mentionedIds = group
@@ -625,9 +339,7 @@ export const useChatHistoryStore = defineStore("chatHistory", () => {
                 )
               : [];
             if (mentionedIds.length > 0) {
-              for (const agentId of mentionedIds) {
-                await inviteGroupMember(agentId, key);
-              }
+              await inviteGroupMembers(mentionedIds, key);
             } else {
               notificationStore.addNotification({
                 type: "info",
@@ -638,13 +350,10 @@ export const useChatHistoryStore = defineStore("chatHistory", () => {
               });
             }
           } else {
-            const message = result.reason === "mode_not_implemented"
-              ? "当前发言模式尚未实现，请在群组设置中改为「顺序发言」或「自然随机」。"
-              : "没有成员满足发言条件，可尝试 @提及 成员或调整发言模式。";
             notificationStore.addNotification({
               type: "info",
               title: "群组未产生回复",
-              message,
+              message: "没有成员满足发言条件，可尝试 @提及 成员或调整发言模式。",
               toastOnly: true,
               duration: 6000,
             });
@@ -662,7 +371,6 @@ export const useChatHistoryStore = defineStore("chatHistory", () => {
       }
     } catch (e) {
       console.error("[ChatHistoryStore] Generation failed:", e);
-      // 生成链路失败绝不能静默：release 下控制台不可见，必须给用户可见反馈
       notificationStore.addNotification({
         type: "error",
         title: "消息生成失败",
@@ -670,6 +378,8 @@ export const useChatHistoryStore = defineStore("chatHistory", () => {
         toastOnly: true,
         duration: 6000,
       });
+    } finally {
+      releaseOperation();
     }
     return topicUpdatedAt;
   };
@@ -677,118 +387,164 @@ export const useChatHistoryStore = defineStore("chatHistory", () => {
   /**
    * 发送消息
    */
-  const sendMessage = async (content: string) => {
-    if (hasEvictedNewer.value && !editingMessage.value) {
-      const latest = await returnToLatest();
-      if (latest.error || latest.aborted || hasEvictedNewer.value) return;
-    }
+  const sendMessage = async (content: string, onCommitted?: () => void) => {
+    if (isSubmitting.value) return;
     const key = captureLoadedConversation();
-    // 导入失败的卡片没有 src，绝不随消息发出：只按其余附件判断能否发送
-    const sendable = attachmentStore.stagedAttachments.filter(attachment => attachment.status !== "failed");
+    const stagedAtSend = [...attachmentStore.stagedAttachments];
+    // fork ptp4g#12：导入失败的卡片没有 src，绝不随消息发出；提交后与已发送附件一起清出暂存区。
+    const sendable = stagedAtSend.filter(attachment => attachment.status !== "failed");
+    const skippedFailed = stagedAtSend.length - sendable.length;
     if (!key || (!content.trim() && sendable.length === 0)) return;
     if (sendable.some(attachment => attachment.status !== "done")) return;
+    const intentAtSend = editingMessage.value;
+    const currentStaged = sendable.map((attachment, attachmentOrder) => ({ ...attachment, attachmentOrder }));
+    let awaitingCommit = true;
+    const committed = () => {
+      awaitingCommit = false;
+      isSubmitting.value = false;
+      if (skippedFailed > 0) {
+        notificationStore.addNotification({
+          type: "info", title: "已跳过失败附件",
+          message: `${skippedFailed} 个导入失败的附件未随消息发送`, toastOnly: true,
+        });
+      }
+      onCommitted?.();
+    };
+    isSubmitting.value = true;
+    try {
+      const shareAtSend = shareStore.activeDraft ? {
+        generation: shareStore.activeDraft.generation,
+        deliveryId: shareStore.activeDraft.deliveryId,
+      } : undefined;
+      if ((window.anchored.value || window.pinned.value || hasEvictedNewer.value) && !editingMessage.value) {
+        const latest = await returnToLatest();
+        if (latest.error || latest.aborted || window.anchored.value || window.pinned.value || hasEvictedNewer.value) return;
+      }
+      if (!canCommitConversation(key) || editingMessage.value !== intentAtSend
+        || shareStore.activeDraft?.deliveryId !== shareAtSend?.deliveryId) return;
 
-    if (typeof navigator !== "undefined" && navigator.vibrate) {
-      navigator.vibrate(25);
-    }
+      if (editingMessage.value) {
+        const intent = editingMessage.value;
+        if (!sameConversation(intent.key.conversation, key)) return;
+        if (!allowChatMutation(key)) return;
+        const originalId = intent.key.messageId;
+        const targetIndex = currentChatHistory.value.findIndex(m => m.id === originalId);
+        if (targetIndex === -1) return;
+        if (chatPreferences.messageHapticsEnabled) triggerMessageHaptic('send');
+        const targetMsg = {
+          ...currentChatHistory.value[targetIndex],
+          content,
+          attachments: currentStaged.length > 0 ? currentStaged : currentChatHistory.value[targetIndex].attachments,
+          blocks: [{ type: "markdown" as const, content }],
+        };
+        const releaseOperation = streamStore.beginConversationOperation(key.ownerId, key.ownerType, key.topicId);
+        try {
+          await useBubbleNarration().stopMessage(intent.key);
+          if (!isMessageActionCurrent(intent.key)) return;
+          const persisted = await invoke<MessageWriteResultDto & { msgCount: number }>("edit_resend_message", {
+            ownerId: key.ownerId,
+            ownerType: key.ownerType,
+            topicId: key.topicId,
+            message: { ...targetMsg, blocks: undefined },
+          });
+          topicStore.setTopicMsgCount(
+            key.ownerId,
+            key.ownerType,
+            key.topicId,
+            persisted.msgCount,
+          );
+          topicStore.setTopicUpdatedAt(
+            key.ownerId,
+            key.ownerType,
+            key.topicId,
+            persisted.topicUpdatedAt,
+          );
+          if (canCommitConversation(key)) {
+            const currentIndex = currentChatHistory.value.findIndex(message => message.id === originalId);
+            if (currentIndex !== -1) {
+              currentChatHistory.value[currentIndex] = { ...targetMsg, blocks: persisted.blocks };
+              currentChatHistory.value = currentChatHistory.value.slice(0, currentIndex + 1);
+            }
+          }
+          if (editingMessage.value === intent) editingMessage.value = null;
+          await triggerGeneration(targetMsg, key, undefined, {
+            persisted,
+            onCommitted: () => {
+              if (currentStaged.length > 0) {
+                attachmentStore.stagedAttachments = attachmentStore.stagedAttachments.filter(item =>
+                  !stagedAtSend.some(sent => sent.id ? sent.id === item.id : sent === item),
+                );
+              }
+              committed();
+            },
+          });
+        } catch (e) {
+          notificationStore.addNotification({
+            type: "error",
+            title: "编辑重发失败",
+            message: errorMessage(e),
+            toastOnly: true,
+            duration: 6000,
+          });
+        } finally {
+          releaseOperation();
+        }
+        return;
+      }
 
-    if (editingMessage.value) {
-      const intent = editingMessage.value;
-      editingMessage.value = null;
-      if (!sameConversation(intent.key.conversation, key)) return;
-      const originalId = intent.key.messageId;
-      const targetIndex = currentChatHistory.value.findIndex(m => m.id === originalId);
-      if (targetIndex === -1) return;
-      const targetMsg = {
-        ...currentChatHistory.value[targetIndex],
+      const shareIdentity = shareAtSend;
+      if (shareIdentity && shareStore.sending) return;
+      if (chatPreferences.messageHapticsEnabled) triggerMessageHaptic('send');
+      if (shareIdentity) shareStore.sending = true;
+
+      const now = Date.now();
+      const userName = settingsStore.settings?.identity.userName ?? SETTINGS_DEFAULTS.identity.userName;
+      const userMsg: ChatMessage = {
+        id: shareIdentity ? `msg_share_${shareIdentity.deliveryId}` : `msg_${now}_user_${Math.random().toString(36).substring(2, 9)}`,
+        role: "user",
+        name: userName,
         content,
+        timestamp: now,
+        attachments: currentStaged.length > 0 ? currentStaged : undefined,
+        shell: streamStore.computeShell({ role: "user", name: userName }),
         blocks: [{ type: "markdown" as const, content }],
       };
-      try {
-        const activity = await invoke<TopicActivityDto>("truncate_history_after_message", {
-          ownerId: key.ownerId,
-          ownerType: key.ownerType,
-          topicId: key.topicId,
-          anchorMessageId: originalId,
-        });
-        topicStore.setTopicMsgCount(
-          key.ownerId,
-          key.ownerType,
-          key.topicId,
-          activity.msgCount,
-        );
-        topicStore.setTopicUpdatedAt(
-          key.ownerId,
-          key.ownerType,
-          key.topicId,
-          activity.updatedAt,
-        );
-        if (canCommitConversation(key)) {
-          const currentIndex = currentChatHistory.value.findIndex(message => message.id === originalId);
-          if (currentIndex !== -1) {
-            currentChatHistory.value[currentIndex] = targetMsg;
-            currentChatHistory.value = currentChatHistory.value.slice(0, currentIndex + 1);
-          }
-        }
-        await triggerGeneration(targetMsg, key);
-      } catch (e) {
-        if (canCommitConversation(key)) editingMessage.value = intent;
-        notificationStore.addNotification({
-          type: "error",
-          title: "编辑重发失败",
-          message: errorMessage(e),
-          toastOnly: true,
-          duration: 6000,
-        });
-      }
-      return;
-    }
 
-    const skippedFailed = attachmentStore.stagedAttachments.length - sendable.length;
-    const currentStaged = sendable.map((attachment, attachmentOrder) => ({
-      ...attachment,
-      attachmentOrder,
-    }));
-    attachmentStore.clearStaged();
-    if (skippedFailed > 0) {
-      notificationStore.addNotification({
-        type: "info",
-        title: "已跳过失败附件",
-        message: `${skippedFailed} 个导入失败的附件未随消息发送`,
-        toastOnly: true,
-      });
-    }
-
-    const now = Date.now();
-    const userName = settingsStore.settings?.userName || "User";
-    const userMsg: ChatMessage = {
-      id: `msg_${now}_user_${Math.random().toString(36).substring(2, 9)}`,
-      role: "user",
-      name: userName,
-      content,
-      timestamp: now,
-      attachments: currentStaged.length > 0 ? currentStaged : undefined,
-      shell: streamStore.computeShell({ role: "user", name: userName }),
-      blocks: [{ type: "markdown" as const, content }],
-    };
-
-    if (canCommitConversation(key)) {
-      currentChatHistory.value = mergeHistoryWindow(
-        currentChatHistory.value,
-        [userMsg],
-        false,
-      );
-    }
-    topicStore.incrementTopicMsgCount(key.ownerId, key.ownerType, key.topicId);
-    const topicUpdatedAt = await triggerGeneration(userMsg, key);
-    if (topicUpdatedAt === null) {
       if (canCommitConversation(key)) {
-        currentChatHistory.value = currentChatHistory.value.filter(
-          message => message.id !== userMsg.id,
-        );
+        projectLiveMessage(key, userMsg);
       }
-      topicStore.decrementTopicMsgCount(key.ownerId, key.ownerType, key.topicId);
+      topicStore.incrementTopicMsgCount(key.ownerId, key.ownerType, key.topicId);
+      const topicUpdatedAt = await triggerGeneration(userMsg, key, shareIdentity, {
+        onCommitted: () => {
+          if (!shareIdentity) {
+            attachmentStore.stagedAttachments = attachmentStore.stagedAttachments.filter(item =>
+              !stagedAtSend.some(sent => sent.id ? sent.id === item.id : sent === item),
+            );
+          }
+          committed();
+        },
+      });
+      if (topicUpdatedAt === null) {
+        if (canCommitConversation(key)) {
+          currentChatHistory.value = currentChatHistory.value.filter(
+            message => message.id !== userMsg.id,
+          );
+        }
+        topicStore.decrementTopicMsgCount(key.ownerId, key.ownerType, key.topicId);
+      }
+    } finally {
+      // A previous model call can finish after the next submission has started.
+      if (awaitingCommit) isSubmitting.value = false;
     }
+  };
+
+  /** Project an already committed Rust message without touching the composer. */
+  const mergePersistedVoiceMessage = (key: ConversationKey, message: ChatMessage, topicUpdatedAt: number) => {
+    topicStore.setTopicUpdatedAt(key.ownerId, key.ownerType, key.topicId, topicUpdatedAt);
+    const hydrated = { ...message, shell: streamStore.computeShell({
+      role: message.role, agentId: message.agentId, name: message.name ?? undefined,
+    }) };
+    projectLiveMessage(key, hydrated);
   };
 
   /**
@@ -798,18 +554,22 @@ export const useChatHistoryStore = defineStore("chatHistory", () => {
     const key = messageKey.conversation;
     const messageId = messageKey.messageId;
     if (!isMessageActionCurrent(messageKey)) return;
+    if (!allowChatMutation(key)) return;
 
     const targetIndex = currentChatHistory.value.findIndex(m => m.id === messageId);
     if (targetIndex === -1) return;
 
     try {
+      await useBubbleNarration().stopMessage(messageKey);
+      if (!isMessageActionCurrent(messageKey)) return;
       const activity = await invoke<TopicActivityDto>("delete_messages", {
         ownerId: key.ownerId,
         ownerType: key.ownerType,
         topicId: key.topicId,
         msgIds: [messageId],
       });
-      streamStore.forgetDeletedMessage(key.ownerId, key.ownerType, key.topicId, messageId);
+      noteMessageChange(key, messageId);
+      streamStore.retireStreamProjection(key.ownerId, key.ownerType, key.topicId, messageId);
       if (canCommitConversation(key)) {
         const currentIndex = currentChatHistory.value.findIndex(message => message.id === messageId);
         if (currentIndex !== -1) currentChatHistory.value.splice(currentIndex, 1);
@@ -826,6 +586,9 @@ export const useChatHistoryStore = defineStore("chatHistory", () => {
         key.topicId,
         activity.updatedAt,
       );
+      if (canCommitConversation(key) && !window.isLoadingHistory.value && sessionStore.acceptedWindow?.anchorId === messageId) {
+        await refreshAfterMutation();
+      }
     } catch (e) {
       notificationStore.addNotification({
         type: "error",
@@ -854,6 +617,7 @@ export const useChatHistoryStore = defineStore("chatHistory", () => {
       attachmentOrder,
       hash,
     });
+    noteMessageChange(key, messageId);
     topicStore.setTopicUpdatedAt(
       key.ownerId,
       key.ownerType,
@@ -884,6 +648,8 @@ export const useChatHistoryStore = defineStore("chatHistory", () => {
     const msg = { ...currentChatHistory.value[targetIndex] };
 
     try {
+      await useBubbleNarration().stopMessage(messageKey);
+      if (!isMessageActionCurrent(messageKey)) return;
       const persisted = await invoke<MessageWriteResultDto>("patch_single_message", {
         ownerId: key.ownerId,
         ownerType: key.ownerType,
@@ -894,6 +660,7 @@ export const useChatHistoryStore = defineStore("chatHistory", () => {
           blocks: undefined,
         },
       });
+      noteMessageChange(key, messageId);
       topicStore.setTopicUpdatedAt(
         key.ownerId,
         key.ownerType,
@@ -928,8 +695,10 @@ export const useChatHistoryStore = defineStore("chatHistory", () => {
     const key = messageKey.conversation;
     const targetMessageId = messageKey.messageId;
     if (!isMessageActionCurrent(messageKey)) return;
+    if (!allowChatMutation(key)) return;
     const targetIndex = currentChatHistory.value.findIndex(m => m.id === targetMessageId);
     if (targetIndex === -1) return;
+    const releaseOperation = streamStore.beginConversationOperation(key.ownerId, key.ownerType, key.topicId);
 
     // 当前窗口仅负责乐观更新；权威用户锚点由后端从完整历史中寻找。
     let lastUserMsgIndex = targetIndex - 1;
@@ -937,6 +706,19 @@ export const useChatHistoryStore = defineStore("chatHistory", () => {
       lastUserMsgIndex--;
     }
     const didOptimisticTruncate = lastUserMsgIndex >= 0;
+    const narration = useBubbleNarration();
+    const narratedKey = narration.activeMessageKey;
+    if (narratedKey && sameConversation(narratedKey.conversation, key)
+      && currentChatHistory.value.slice(lastUserMsgIndex + 1).some(message => message.id === narratedKey.messageId)) {
+      try {
+        await narration.stopMessage(narratedKey);
+      } catch (error) {
+        releaseOperation();
+        notificationStore.addNotification({ type: 'error', title: '停止朗读失败', message: errorMessage(error), toastOnly: true });
+        return;
+      }
+      if (!isMessageActionCurrent(messageKey)) { releaseOperation(); return; }
+    }
     if (didOptimisticTruncate) {
       const countToDelete = currentChatHistory.value.length - (lastUserMsgIndex + 1);
       currentChatHistory.value = currentChatHistory.value.slice(0, lastUserMsgIndex + 1);
@@ -944,23 +726,7 @@ export const useChatHistoryStore = defineStore("chatHistory", () => {
     }
 
     try {
-      const streamChannel = new Channel<StreamEventDto>();
-      streamChannel.onmessage = (event) => streamStore.processStreamEvent(event, {
-        onMessageCreated: (msg, tid) => {
-          if (tid === key.topicId && canCommitConversation(key) && !currentChatHistory.value.some(m => m.id === msg.id)) {
-            currentChatHistory.value = mergeHistoryWindow(
-              currentChatHistory.value,
-              [msg],
-              false,
-            );
-          }
-        },
-        onStreamFinished: (_mid, tid) => {
-          if (tid === key.topicId && canCommitConversation(key)) {
-            summarizeTopic();
-          }
-        }
-      });
+      const streamChannel = makeStreamChannel(key);
 
       const result = await invoke<RegenerateTopicResultDto>("regenerate_topic_response", {
         ownerId: key.ownerId,
@@ -969,13 +735,9 @@ export const useChatHistoryStore = defineStore("chatHistory", () => {
         targetResponseMsgId: targetMessageId,
         streamChannel
       });
-      if (!didOptimisticTruncate && canCommitConversation(key)) {
-        await loadHistory(key.ownerId, key.ownerType, key.topicId, 15);
-      }
       topicStore.setTopicMsgCount(key.ownerId, key.ownerType, key.topicId, result.msgCount);
     } catch (e) {
       console.error("[ChatHistoryStore] Regeneration failed:", e);
-      // 与 triggerGeneration 一致：重新生成失败同样需要用户可见反馈
       notificationStore.addNotification({
         type: "error",
         title: "重新生成失败",
@@ -983,14 +745,17 @@ export const useChatHistoryStore = defineStore("chatHistory", () => {
         toastOnly: true,
         duration: 6000,
       });
-      if (canCommitConversation(key)) {
-        await loadHistory(key.ownerId, key.ownerType, key.topicId, 15);
-        if (canCommitConversation(key)) {
-          await topicStore.loadTopicList(key.ownerId, key.ownerType).catch((reloadError) => {
-            console.error("[ChatHistoryStore] Failed to reconcile topic count:", reloadError);
-          });
-        }
-      }
+    } finally {
+      releaseOperation();
+      if (canCommitConversation(key)) await refreshAfterMutation();
+    }
+  };
+
+  // A failed refresh is separate from the result of the SQLite mutation.
+  const refreshAfterMutation = async () => {
+    try { await reconcileWindow(true); }
+    catch (error) {
+      notificationStore.addNotification({ type: 'error', title: '聊天记录核对失败', message: errorMessage(error), toastOnly: true });
     }
   };
 
@@ -1020,12 +785,18 @@ export const useChatHistoryStore = defineStore("chatHistory", () => {
   };
 
   const beginEditResend = async (messageKey: MessageActionKey) => {
+    if (!allowChatMutation(messageKey.conversation)) return;
     const initialContent = await fetchRawContent(messageKey);
     if (!isMessageActionCurrent(messageKey)) return;
+    if (!allowChatMutation(messageKey.conversation)) return;
     editingMessage.value = {
       key: messageKey,
       initialContent,
     };
+  };
+
+  const cancelEditResend = () => {
+    editingMessage.value = null;
   };
 
   const reRenderMessage = async (messageKey: MessageActionKey) => {
@@ -1062,22 +833,15 @@ export const useChatHistoryStore = defineStore("chatHistory", () => {
   };
 
   return {
-    currentChatHistory,
-    loading,
-    hasMoreHistory,
-    isLoadingHistory,
-    hasEvictedNewer,
-    loadedConversationKey,
-    editingMessage,
-    preloadedHistory,
-    preloadHistory,
-    loadHistory,
-    loadHistoryPaginated,
-    loadMoreHistory,
-    loadHistoryAround,
-    returnToLatest,
+    ...window,
+    loading: window.isLoadingHistory,
     resetHistoryForConversation,
+    openLoadedReference,
+    editingMessage,
     sendMessage,
+    isSubmitting,
+    controlGroupSession,
+    mergePersistedVoiceMessage,
     deleteMessage,
     deleteAttachment,
     triggerGeneration,
@@ -1088,6 +852,7 @@ export const useChatHistoryStore = defineStore("chatHistory", () => {
     isMessageActionCurrent,
     updateMessageContent,
     beginEditResend,
+    cancelEditResend,
     regenerateResponse,
     fetchRawContent,
     reRenderMessage,

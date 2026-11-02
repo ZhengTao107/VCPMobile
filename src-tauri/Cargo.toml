@@ -1,6 +1,6 @@
 [package]
 name = "vcp-mobile"
-version = "1.1.6"
+version = "1.1.7"
 description = "A Tauri App"
 authors = ["MRiecy"]
 edition = "2021"
@@ -8,14 +8,18 @@ edition = "2021"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [workspace]
-members = [".", "plugins/vcp-mobile"]
+members = [".", "plugins/vcp-mobile", "crates/voice-mp3", "crates/config-export"]
+
+[features]
+# Explicit host development tooling, never enabled by mobile builds.
+config-export = ["dep:ts-rs", "tauri-plugin-vcp-mobile/config-export"]
 
 [workspace.dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["raw_value"] }
 log = { version = "0.4", features = ["release_max_level_info"] }
 jni = "0.21"
-tauri = { version = "2.12.1" }
+tauri = { version = "2.12.4" }
 
 [lib]
 # The `_lib` suffix may seem redundant but it is necessary
@@ -25,14 +29,14 @@ name = "vcp_mobile_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
 [build-dependencies]
-tauri-build = { version = "2.7.1", features = [] }
+tauri-build = { version = "2.7.3", features = [] }
 
 [package.metadata.android.build_targets]
 targets = ["aarch64-linux-android"]
 
 [dependencies]
-tauri = { version = "2.12.1", features = ["protocol-asset"] }
-tauri-plugin-opener = "2.5.4"
+tauri = { version = "2.12.4", features = ["protocol-asset"] }
+tauri-plugin-opener = "2.7.2"
 tauri-plugin-os = "=2.4.0"
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["raw_value"] }
@@ -43,25 +47,29 @@ futures-util = "0.3"
 url = "2"
 dashmap = "6"
 tokio-util = { version = "0.7", features = ["codec", "io", "rt"] }
-lru = "0.16.3"
+lru = "0.19.0"
 regex = "1"
 lazy_static = "1.4"
 uuid = { version = "1", features = ["v4", "serde"] }
 rand = "0.8"
 log = { version = "0.4", features = ["release_max_level_info"] }
 sqlx = { version = "=0.9.0", default-features = false, features = ["sqlite", "runtime-tokio", "macros", "migrate"] }
-rusqlite = { version = "=0.39.0", features = ["bundled", "limits"] }
+rusqlite = { version = "=0.39.0", features = ["bundled", "limits", "hooks", "trace"] }
 sha2 = "0.11"
 hex = "0.4"
 chrono = { version = "0.4", features = ["serde"] }
 semver = "1"
 infer = "0.15"
-tauri-plugin-log = "2.9.0"
+tauri-plugin-log = "2.10.1"
 tauri-plugin-vcp-mobile = { path = "./plugins/vcp-mobile" }
+vcp-voice-mp3 = { path = "crates/voice-mp3" }
+symphonia = { version = "0.6.1", default-features = false, features = ["mp3", "pcm", "wav", "id3v1", "id3v2"] }
+rubato = { version = "5.0.1", default-features = false, features = ["fft_resampler"] }
 base64 = "0.22"
-zip = { version = "8.6.0", default-features = false, features = ["deflate"] }
+zip = { version = "9.0.5", default-features = false, features = ["deflate"] }
+quick-xml = { version = "=0.42.0", features = ["encoding"] }
 pdf_oxide = { version = "0.3.77", default-features = false }
-tokio-tungstenite = { version = "0.26", features = ["rustls-tls-webpki-roots"] }
+tokio-tungstenite = { version = "0.30", features = ["rustls-tls-webpki-roots"] }
 async-trait = "0.1"
 libc = "0.2"
 percent-encoding = "2"
@@ -75,8 +83,6 @@ tar = "0.4"
 encoding_rs = "0.8"
 chardetng = "0.1"
 mime_guess = "2.0"
-axum = { version = "0.7", features = ["ws"] }
-tower-http = { version = "0.5", features = ["fs", "cors", "trace"] }
 html5ever = "0.38"
 markup5ever_rcdom = "0.38"
 htmd = "0.5.5"
@@ -84,11 +90,15 @@ htmd = "0.5.5"
 [target.'cfg(target_os = "android")'.dependencies]
 jni = "0.21"
 
+[target.'cfg(not(any(target_os = "android", target_os = "ios")))'.dependencies]
+ts-rs = { version = "=12.0.1", optional = true, features = ["serde-json-impl"] }
+
 [target.'cfg(target_os = "ios")'.dependencies]
 objc2 = "0.6.4"
 objc2-ui-kit = { version = "0.3.2", default-features = false, features = ["std", "UIApplication", "UIResponder", "UIScene", "UISceneSession", "UISceneDefinitions", "UIWindowScene"] }
 
 [dev-dependencies]
+axum = "0.8.9"
 tempfile = "3"
 criterion = { version = "0.5", features = ["html_reports"] }
 tokio = { version = "1", default-features = false, features = ["test-util"] }

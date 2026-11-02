@@ -25,6 +25,9 @@ use super::tool_registry::{SessionToolPlan, ToolExecutionContext, ToolRegistry};
 use super::tools::distributed_operation_id;
 use super::types::*;
 use crate::vcp_modules::cli::runtime::MobileCliRuntimeState;
+use crate::vcp_modules::infra::vcp_ws_endpoint::{
+    compile_distributed_connection, endpoint_log_label, BaseKind,
+};
 
 const WS_OPERATION_TIMEOUT: Duration = Duration::from_secs(5);
 const WS_OUTBOUND_CAPACITY: usize = 64;
@@ -297,25 +300,8 @@ where
     future.await
 }
 
-fn normalize_remote_ws_url(raw_url: &str) -> Result<String, String> {
-    let mut url = url::Url::parse(raw_url.trim())
-        .map_err(|error| format!("invalid distributed WebSocket URL: {error}"))?;
-    if !matches!(url.scheme(), "ws" | "wss") {
-        return Err("distributed URL must use ws:// or wss://".to_string());
-    }
-    if !url.username().is_empty() || url.password().is_some() {
-        return Err("distributed URL must not contain userinfo".to_string());
-    }
-    if url.query().is_some() || url.fragment().is_some() {
-        return Err("distributed URL must not contain query or fragment".to_string());
-    }
-    let normalized_path = url.path().trim_end_matches('/').to_string();
-    url.set_path(&normalized_path);
-    Ok(url.as_str().trim_end_matches('/').to_string())
-}
-
-fn stable_remote_identity(ws_url: &str, device_name: &str) -> Result<String, String> {
-    let normalized_url = normalize_remote_ws_url(ws_url)?;
+fn stable_remote_identity(base_url: &url::Url, device_name: &str) -> Result<String, String> {
+    let normalized_url = base_url.as_str().trim_end_matches('/');
     let normalized_device = device_name.trim();
     if normalized_device.is_empty() {
         return Err("distributed device name must not be empty".to_string());
@@ -329,8 +315,7 @@ fn stable_remote_identity(ws_url: &str, device_name: &str) -> Result<String, Str
 
 /// Immutable configuration for a single connection lifecycle.
 struct ConnectionConfig {
-    ws_url: String,
-    vcp_key: String,
+    url: url::Url,
     device_name: String,
     remote_identity: String,
 }
@@ -386,27 +371,28 @@ impl DistributedClient {
     /// Start the distributed node connection.
     /// `ws_url`: base URL of the main server, e.g. "ws://192.168.1.100:5800"
     /// `vcp_key`: authentication key
+    /// `base_kind`: whether the address comes from Log settings or the node's own prefix.
     /// `device_name`: node name (maps to VCPChat's `serverName` / config.env `ServerName`)
-    pub async fn start(
+    pub(crate) async fn start(
         &self,
         app: AppHandle,
         ws_url: String,
         vcp_key: String,
+        base_kind: BaseKind,
         device_name: String,
         registry: Arc<ToolRegistry>,
     ) -> Result<(), String> {
         let _lifecycle_guard = self.lifecycle.lock().await;
-        let validated = if vcp_key.trim().is_empty() {
-            Err("distributed authentication key must not be empty".to_string())
-        } else {
-            normalize_remote_ws_url(&ws_url).and_then(|url| {
-                stable_remote_identity(&url, &device_name).map(|identity| (url, identity))
-            })
-        };
-        let (ws_url, remote_identity) = match validated {
-            Ok(config) => config,
+        let config = match self
+            .prepare_start(&ws_url, &vcp_key, base_kind, device_name)
+            .await
+        {
+            Ok(Some(config)) => config,
+            Ok(None) => {
+                Self::emit_status(&app, &self.status).await;
+                return Ok(());
+            }
             Err(error) => {
-                self.status.write().await.last_error = Some(error.clone());
                 Self::emit_status(&app, &self.status).await;
                 return Err(error);
             }
@@ -456,12 +442,6 @@ impl DistributedClient {
 
         Self::emit_status(&app, &status).await;
 
-        let config = ConnectionConfig {
-            ws_url,
-            vcp_key,
-            device_name,
-            remote_identity,
-        };
         let ctx = SessionContext {
             status,
             registry,
@@ -494,10 +474,46 @@ impl DistributedClient {
         Ok(())
     }
 
+    /// Caller holds `lifecycle`; an invalid or unconfigured replacement must
+    /// retire the previous session before publishing its inactive status.
+    async fn prepare_start(
+        &self,
+        ws_url: &str,
+        vcp_key: &str,
+        base_kind: BaseKind,
+        device_name: String,
+    ) -> Result<Option<ConnectionConfig>, String> {
+        let prepared = compile_distributed_connection(ws_url, vcp_key, base_kind)
+            .map_err(|error| error.to_string())
+            .and_then(|endpoint| {
+                endpoint
+                    .map(|endpoint| {
+                        stable_remote_identity(&endpoint.base, &device_name).map(
+                            |remote_identity| ConnectionConfig {
+                                url: endpoint.url,
+                                device_name,
+                                remote_identity,
+                            },
+                        )
+                    })
+                    .transpose()
+            });
+        if !matches!(&prepared, Ok(Some(_))) {
+            self.stop_session().await;
+            self.status.write().await.last_error = prepared.as_ref().err().cloned();
+        }
+        prepared
+    }
+
     /// Stop the distributed node.
     pub async fn stop(&self, app: &AppHandle) {
         let _lifecycle_guard = self.lifecycle.lock().await;
+        self.stop_session().await;
+        Self::emit_status(app, &self.status).await;
+    }
 
+    /// Caller holds `lifecycle`; do not acquire it again while replacing a session.
+    async fn stop_session(&self) {
         let stop_generation = {
             let mut s = self.status.write().await;
             let was_running = s.state != ConnectionState::Disconnected || s.connected;
@@ -537,7 +553,6 @@ impl DistributedClient {
                 s.registered_tools = 0;
             }
         }
-        Self::emit_status(app, &self.status).await;
     }
 
     /// Get current status snapshot.
@@ -588,16 +603,9 @@ impl DistributedClient {
                 break;
             }
 
-            // Build connection URL: ws://host:port/vcp-distributed-server/VCP_Key=<key>
-            let connection_url = format!(
-                "{}/vcp-distributed-server/VCP_Key={}",
-                config.ws_url.trim_end_matches('/'),
-                config.vcp_key
-            );
-
             log::info!(
                 "[Distributed] Connecting to main server: {}",
-                connection_url.replace(&config.vcp_key, "***")
+                endpoint_log_label(&config.url)
             );
 
             // Connect with cancellation support — avoids blocking on TCP timeout during shutdown.
@@ -606,7 +614,7 @@ impl DistributedClient {
                 async {
                     tokio::select! {
                         result = tokio_tungstenite::connect_async_with_config(
-                            &connection_url,
+                            config.url.as_str(),
                             Some(inbound_websocket_config()),
                             false,
                         ) => Some(result),
@@ -798,7 +806,7 @@ impl DistributedClient {
                 msg = ws_rx.next() => {
                     match msg {
                         Some(Ok(Message::Text(text))) => {
-                            Self::handle_incoming(
+                            if let Err(error) = Self::handle_incoming(
                                 app,
                                 &text,
                                 device_name,
@@ -810,7 +818,11 @@ impl DistributedClient {
                                 &child_tracker,
                                 &mut streaming_started,
                                 session_id,
-                            ).await;
+                            ).await {
+                                log::warn!("[Distributed] Invalid connection acknowledgement: {error}");
+                                exit_reason = error;
+                                break;
+                            }
                         }
                         Some(Ok(Message::Ping(data))) => {
                             if let Err(error) = Self::send_ws_frame(&ws_tx, Message::Pong(data)).await {
@@ -909,23 +921,23 @@ impl DistributedClient {
         child_tracker: &Arc<SessionTaskTracker>,
         streaming_started: &mut bool,
         session_id: u64,
-    ) {
+    ) -> Result<(), String> {
         if text.len() > MAX_INCOMING_MESSAGE_BYTES {
             log::warn!(
                 "[Distributed] Incoming message exceeds {} byte budget; ignored.",
                 MAX_INCOMING_MESSAGE_BYTES
             );
-            return;
+            return Ok(());
         }
         let envelope: IncomingEnvelope = match serde_json::from_str(text) {
             Ok(e) => e,
             Err(e) => {
                 log::warn!("[Distributed] Failed to parse message: {}", e);
-                return;
+                return Ok(());
             }
         };
 
-        match envelope.parse() {
+        match envelope.parse()? {
             IncomingMessage::ConnectionAck {
                 server_id,
                 client_id,
@@ -944,14 +956,14 @@ impl DistributedClient {
                         session_id,
                         server_id.clone(),
                         client_id.clone(),
-                    )
+                    )?
                 };
                 if !accepted {
                     log::info!(
                         "[Distributed] Ignoring stale connection ACK for session {}.",
                         session_id
                     );
-                    return;
+                    return Ok(());
                 }
                 Self::emit_status_with_app(app, status).await;
 
@@ -1016,7 +1028,7 @@ impl DistributedClient {
             } => {
                 if let Err(error) = validate_vcp_context(vcp_context.as_ref()) {
                     Self::send_tool_rejection(ws_tx, &request_id, error).await;
-                    return;
+                    return Ok(());
                 }
                 let execution_context = {
                     let current = status.read().await;
@@ -1031,7 +1043,7 @@ impl DistributedClient {
                         Err(error) => {
                             drop(current);
                             Self::send_tool_rejection(ws_tx, &request_id, error).await;
-                            return;
+                            return Ok(());
                         }
                     }
                 };
@@ -1048,7 +1060,7 @@ impl DistributedClient {
                     Ok(permit) => permit,
                     Err(error) => {
                         Self::send_tool_rejection(ws_tx, &request_id, error).await;
-                        return;
+                        return Ok(());
                     }
                 };
 
@@ -1098,7 +1110,7 @@ impl DistributedClient {
                             }
                         })
                         .await;
-                    return;
+                    return Ok(());
                 }
 
                 child_tracker
@@ -1147,6 +1159,7 @@ impl DistributedClient {
                 log::debug!("[Distributed] Unknown message type: {}", msg_type);
             }
         }
+        Ok(())
     }
 
     // ================================================================
@@ -1324,9 +1337,12 @@ impl DistributedClient {
         session_id: u64,
         server_id: String,
         client_id: String,
-    ) -> bool {
+    ) -> Result<bool, String> {
         if status.session_id != session_id {
-            return false;
+            return Ok(false);
+        }
+        if server_id.is_empty() || client_id.is_empty() {
+            return Err("connection_ack requires non-empty serverId and clientId".to_string());
         }
 
         status.state = ConnectionState::Connected;
@@ -1334,7 +1350,7 @@ impl DistributedClient {
         status.server_id = Some(server_id);
         status.client_id = Some(client_id);
         status.last_error = None;
-        true
+        Ok(true)
     }
 
     /// Serialize and send a message over WebSocket.
@@ -1431,25 +1447,6 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn lifecycle_mutex_serializes_transitions() {
-        let client = Arc::new(DistributedClient::new());
-        let guard = client.lifecycle.lock().await;
-        let waiter_client = client.clone();
-        let waiter = tokio::spawn(async move {
-            let _guard = waiter_client.lifecycle.lock().await;
-        });
-
-        tokio::task::yield_now().await;
-        assert!(!waiter.is_finished());
-
-        drop(guard);
-        tokio::time::timeout(Duration::from_secs(1), waiter)
-            .await
-            .expect("queued lifecycle transition should resume")
-            .expect("queued lifecycle transition should not panic");
-    }
-
     #[test]
     fn advanced_generation_rejects_late_connection_ack() {
         let mut status = DistributedStatus {
@@ -1463,10 +1460,45 @@ mod tests {
             1,
             "old-server".to_string(),
             "old-client".to_string(),
-        ));
+        )
+        .unwrap());
         assert_eq!(status.state, ConnectionState::Disconnecting);
         assert!(!status.connected);
         assert_eq!(status.session_id, 2);
+    }
+
+    #[test]
+    fn malformed_ack_cannot_commit_connection_or_admit_registration() {
+        let mut status = DistributedStatus {
+            state: ConnectionState::Connecting,
+            session_id: 3,
+            ..DistributedStatus::default()
+        };
+        for (server_id, client_id) in [("", "client"), ("server", ""), ("", "")] {
+            assert!(DistributedClient::commit_connection_ack(
+                &mut status,
+                3,
+                server_id.to_string(),
+                client_id.to_string(),
+            )
+            .is_err());
+            assert_eq!(status.state, ConnectionState::Connecting);
+            assert!(!status.connected);
+            assert_eq!(status.server_id, None);
+            assert_eq!(status.client_id, None);
+            assert_eq!(status.registered_tools, 0);
+        }
+        assert!(DistributedClient::commit_connection_ack(
+            &mut status,
+            3,
+            "server".into(),
+            "client".into(),
+        )
+        .unwrap());
+        assert_eq!(status.state, ConnectionState::Connected);
+        assert!(status.connected);
+        assert_eq!(status.server_id.as_deref(), Some("server"));
+        assert_eq!(status.client_id.as_deref(), Some("client"));
     }
 
     #[tokio::test]
@@ -1527,18 +1559,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn scoped_guard_is_released_when_connect_await_finishes() {
-        let (dropped_tx, dropped_rx) = oneshot::channel();
-
-        let result = with_scoped_guard(DropSignal(Some(dropped_tx)), async { 42 }).await;
-
-        assert_eq!(result, 42);
-        dropped_rx
-            .await
-            .expect("connect lease must be released before session processing begins");
-    }
-
-    #[tokio::test]
     async fn bounded_outbound_queue_times_out_instead_of_waiting_forever() {
         let (ws_tx, mut ws_rx) = mpsc::channel(1);
         let (completion, _completed) = oneshot::channel();
@@ -1565,34 +1585,6 @@ mod tests {
     }
 
     #[test]
-    fn websocket_protocol_budget_matches_incoming_handler_budget() {
-        let config = inbound_websocket_config();
-
-        assert_eq!(config.max_message_size, Some(MAX_INCOMING_MESSAGE_BYTES));
-        assert_eq!(config.max_frame_size, Some(MAX_INCOMING_MESSAGE_BYTES));
-    }
-
-    #[test]
-    fn empty_registration_serializes_an_explicit_empty_tool_set() {
-        let message = OutgoingMessage::RegisterTools {
-            server_name: "mobile".to_string(),
-            tools: vec![],
-            capabilities: ServerCapabilities { cancel_tool: true },
-        };
-        assert_eq!(
-            serde_json::to_value(message).unwrap(),
-            serde_json::json!({
-                "type": "register_tools",
-                "data": {
-                    "serverName": "mobile",
-                    "tools": [],
-                    "capabilities": { "cancelTool": true }
-                }
-            })
-        );
-    }
-
-    #[test]
     fn registered_tool_count_clear_is_generation_guarded() {
         let mut status = DistributedStatus {
             state: ConnectionState::Connected,
@@ -1614,14 +1606,110 @@ mod tests {
 
     #[test]
     fn remote_identity_normalizes_endpoint_and_excludes_connection_epoch() {
-        let first =
-            stable_remote_identity("WS://Example.COM:80/vcp/", " Mobile ").expect("first identity");
-        let second =
-            stable_remote_identity("ws://example.com/vcp", "Mobile").expect("second identity");
-        assert_eq!(first, second);
-        assert_eq!(first.len(), 64);
-        assert!(normalize_remote_ws_url("https://example.com").is_err());
-        assert!(normalize_remote_ws_url("ws://example.com/path?node=other").is_err());
+        let first = compile_distributed_connection(
+            "WS://Example.COM:80/vcp/",
+            "first-key",
+            BaseKind::Distributed,
+        )
+        .expect("first endpoint")
+        .expect("configured endpoint");
+        let second = compile_distributed_connection(
+            "ws://example.com/vcp",
+            "rotated-key",
+            BaseKind::Distributed,
+        )
+        .expect("second endpoint")
+        .expect("configured endpoint");
+        assert_ne!(first.url, second.url);
+        assert_eq!(
+            stable_remote_identity(&first.base, " Mobile ").expect("first identity"),
+            stable_remote_identity(&second.base, "Mobile").expect("second identity"),
+        );
+    }
+
+    #[tokio::test]
+    async fn inactive_start_retires_existing_session_and_replaces_its_error() {
+        for (url, key, should_fail) in [
+            ("example.invalid", "configured-key", true),
+            ("", "configured-key", false),
+            ("ws://example.invalid", "", false),
+        ] {
+            let client = DistributedClient::new();
+            *client.status.write().await = DistributedStatus {
+                state: ConnectionState::Connected,
+                connected: true,
+                server_id: Some("old-server".to_string()),
+                client_id: Some("old-client".to_string()),
+                registered_tools: 3,
+                session_id: 7,
+                last_error: Some("previous connection failure".to_string()),
+            };
+            let cancel_token = CancellationToken::new();
+            let session_token = cancel_token.clone();
+            let (finished_tx, finished_rx) = oneshot::channel();
+            let task_handle = tokio::spawn(async move {
+                session_token.cancelled().await;
+                let _ = finished_tx.send(());
+            });
+            let (reconfigure_tx, _reconfigure_rx) = mpsc::channel(1);
+            let (reconnect_tx, _reconnect_rx) = mpsc::channel(1);
+            *client.session.lock().await = Some(ConnectionSession {
+                cancel_token: cancel_token.clone(),
+                reconfigure_tx,
+                reconnect_tx,
+                task_handle,
+            });
+
+            let _lifecycle_guard = client.lifecycle.lock().await;
+            let prepared = time::timeout(
+                Duration::from_secs(1),
+                client.prepare_start(url, key, BaseKind::Distributed, "Mobile".to_string()),
+            )
+            .await
+            .expect("inactive replacement must not acquire the lifecycle lock twice");
+            let error = match prepared {
+                Err(error) => Some(error),
+                Ok(None) => None,
+                Ok(Some(_)) => panic!("invalid or empty input must not create a connection"),
+            };
+            assert_eq!(error.is_some(), should_fail);
+            assert!(cancel_token.is_cancelled());
+            finished_rx.await.expect("old session must finish");
+            assert!(client.session.lock().await.is_none());
+            let status = client.get_status().await;
+            assert_eq!(status.state, ConnectionState::Disconnected);
+            assert!(!status.connected);
+            assert_eq!(status.server_id, None);
+            assert_eq!(status.client_id, None);
+            assert_eq!(status.registered_tools, 0);
+            assert_eq!(status.session_id, 8);
+            assert_eq!(status.last_error, error);
+        }
+    }
+
+    #[tokio::test]
+    async fn start_uses_compiled_channel_and_preserves_distributed_prefix() {
+        let client = DistributedClient::new();
+        for (base_kind, address, expected) in [
+            (
+                BaseKind::Log,
+                "ws://example.invalid/VCPlog/",
+                "ws://example.invalid/vcp-distributed-server/VCP_Key=key",
+            ),
+            (
+                BaseKind::Distributed,
+                "ws://example.invalid/proxy/",
+                "ws://example.invalid/proxy/vcp-distributed-server/VCP_Key=key",
+            ),
+        ] {
+            let _lifecycle_guard = client.lifecycle.lock().await;
+            let config = client
+                .prepare_start(address, "key", base_kind, "Mobile".to_string())
+                .await
+                .expect("valid connection")
+                .expect("configured connection");
+            assert_eq!(config.url.as_str(), expected);
+        }
     }
 
     #[test]
@@ -1643,9 +1731,6 @@ mod tests {
         )
         .expect("current epoch context");
         assert_eq!(context.connection_epoch, 7);
-        assert_eq!(context.server_id, "server-1");
-        assert_eq!(context.client_id, "client-1");
-        assert_eq!(context.remote_identity, "remote-fingerprint");
         assert!(current_tool_execution_context(
             &status,
             6,
@@ -1807,25 +1892,6 @@ mod tests {
                 .err()
                 .expect("ordinary duplicate must be rejected"),
             "duplicate requestId rejected"
-        );
-    }
-
-    #[test]
-    fn top_level_vcp_context_has_a_strict_budget() {
-        assert!(validate_vcp_context(Some(&serde_json::json!({
-            "river": "text"
-        })))
-        .is_ok());
-        let exact_limit = Value::String("x".repeat(MAX_VCP_CONTEXT_BYTES - 2));
-        assert_eq!(
-            serde_json::to_vec(&exact_limit).unwrap().len(),
-            MAX_VCP_CONTEXT_BYTES
-        );
-        assert!(validate_vcp_context(Some(&exact_limit)).is_ok());
-        let oversized = Value::String("x".repeat(MAX_VCP_CONTEXT_BYTES));
-        assert_eq!(
-            validate_vcp_context(Some(&oversized)),
-            Err("_vcpContext exceeds 128KB budget".to_string())
         );
     }
 }

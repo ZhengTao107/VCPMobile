@@ -1,10 +1,11 @@
 <script setup lang="ts">
 import { ref, computed, nextTick, onMounted, onUnmounted, watch } from "vue";
-import { useChatSessionStore } from "../../core/stores/chatSessionStore";
+import { useChatSessionStore, type ConversationKey } from "../../core/stores/chatSessionStore";
 import { useChatHistoryStore } from "../../core/stores/chatHistoryStore";
 import { useChatStreamStore } from "../../core/stores/chatStreamStore";
 import { useTopicStore } from "../../core/stores/topicListManager";
 import { useThemeStore } from "../../core/stores/theme";
+import { useChatPreferencesStore } from "./preferences/store";
 import { useOverlayStore } from "../../core/stores/overlay";
 import { useAppLifecycleStore } from "../../core/stores/appLifecycle";
 import { useLayoutStore } from "../../core/stores/layout";
@@ -16,34 +17,42 @@ import TarvenSelector from "./components/TarvenSelector.vue";
 import OpenTabsBar from "./components/OpenTabsBar.vue";
 import VcpAvatar from "../../components/ui/VcpAvatar.vue";
 import CoreStatusIndicator from "../../components/ui/CoreStatusIndicator.vue";
-import { ArrowDown, RefreshCw } from "lucide-vue-next";
-import { useAttachmentStore } from "../../core/stores/attachmentStore";
+import { ArrowDown, ListChecks, RefreshCw, SlidersHorizontal } from "@lucide/vue";
+import VoiceCallControls from "./voice/VoiceCallControls.vue";
+import { useVoiceCallStore } from "./voice/voiceCallStore";
 import { useKeyboardInsets } from "../../core/composables/useKeyboardInsets";
 import { useChatScroll } from "../../core/composables/useChatScroll";
+import { scrollToMessageById } from "../../core/utils/scrollToMessage";
 import { openPresentationMenu } from "./presentationMenu";
+
+const emit = defineEmits<{
+  (event: "content-settled", key: ConversationKey | null): void;
+  (event: "content-pending", key: ConversationKey | null): void;
+}>();
+let contentGeneration = 0;
+let viewDisposed = false;
 
 const sessionStore = useChatSessionStore();
 const historyStore = useChatHistoryStore();
 const topicStore = useTopicStore();
 const streamStore = useChatStreamStore();
-const attachmentStore = useAttachmentStore();
 const themeStore = useThemeStore();
+const chatPreferences = useChatPreferencesStore();
 const lifecycleStore = useAppLifecycleStore();
 const layoutStore = useLayoutStore();
 const notificationStore = useNotificationStore();
 const overlayStore = useOverlayStore();
 const syncStore = useSyncSessionStore();
+const voiceCall = useVoiceCallStore();
 const { keyboardHeight, forceRecalculate } = useKeyboardInsets();
-
-// 跟踪输入增强组件底部的扩展菜单状态
-const isMenuExpanded = ref(false);
-const handleMenuToggle = (expanded: boolean) => {
-  isMenuExpanded.value = expanded;
-};
 
 // 容器 refs
 const messageListRef = ref<HTMLElement | null>(null);
 const chatViewContainerRef = ref<HTMLElement | null>(null);
+const inputRef = ref<InstanceType<typeof InputEnhancer> | null>(null);
+const footerRef = ref<HTMLElement | null>(null);
+const footerHeight = ref(0);
+let footerObserver: ResizeObserver | null = null;
 
 // 哨兵元素已废弃，新滚动架构不再需要
 // const topSentinelRef = ref<HTMLElement | null>(null);
@@ -51,22 +60,12 @@ const chatViewContainerRef = ref<HTMLElement | null>(null);
 
 // 流式状态
 const isStreamingActive = computed(() => streamStore.activeStreamingIds.size > 0);
-const isConversationReady = computed(() => {
-  const current = sessionStore.currentConversationKey;
-  const loaded = historyStore.loadedConversationKey;
-  return Boolean(
-    current &&
-      loaded &&
-      current.ownerId === loaded.ownerId &&
-      current.ownerType === loaded.ownerType &&
-      current.topicId === loaded.topicId &&
-      current.epoch === loaded.epoch,
-  );
-});
+const isConversationReady = computed(() => historyStore.ready);
 
 // 滚动管理 composable（封装 IO 双哨兵 + RAF 轮询 + 消息新增自动滚动）
 const {
   showScrollToBottom,
+  followingLatest,
   scrollToBottom,
   startAutoScroll,
   stopAutoScroll,
@@ -79,8 +78,10 @@ const {
   messageCount: computed(() => historyStore.currentChatHistory.length),
   hasMoreHistory: computed(() => historyStore.hasMoreHistory),
   isLoadingHistory: computed(() => historyStore.isLoadingHistory),
-  onLoadMore: () => historyStore.loadMoreHistory(),
+  anchored: computed(() => historyStore.anchored || historyStore.pinned),
+  onLoadMore: pin => historyStore.loadMoreHistory(pin),
 });
+watch(followingLatest, following => { historyStore.followingLatest = following; }, { immediate: true });
 
 const isPresentationMenuOpen = computed(
   () => overlayStore.contextMenuConfig?.title === "消息呈现",
@@ -89,15 +90,27 @@ const isPresentationMenuOpen = computed(
 // The pre-flush watcher captures the old geometry before Vue patches the data
 // attribute. This protects both the long-press menu and the settings-page entry.
 watch(
-  () => themeStore.presentationMode,
+  () => chatPreferences.presentationMode,
   () => {
     void preserveViewportAcrossLayoutChange(() => undefined);
   },
   { flush: "pre" },
 );
 
+watch(() => voiceCall.active, () => {
+  void preserveViewportAcrossLayoutChange(() => undefined);
+}, { flush: 'pre' });
+
+const startVoiceCall = () => {
+  if (!isConversationReady.value || voiceCall.active) return;
+  inputRef.value?.suspendComposer();
+  layoutStore.setLeftDrawer(false);
+  layoutStore.setRightDrawer(false);
+  voiceCall.start();
+};
+
 const scrollToLatest = async (smooth = true) => {
-  if (historyStore.hasEvictedNewer && !historyStore.editingMessage) {
+  if ((historyStore.anchored || historyStore.pinned || historyStore.hasEvictedNewer) && !historyStore.editingMessage) {
     const result = await historyStore.returnToLatest();
     if (result.error || result.aborted || historyStore.hasEvictedNewer) return;
     await nextTick();
@@ -105,26 +118,55 @@ const scrollToLatest = async (smooth = true) => {
   scrollToBottom(smooth);
 };
 
-// 监听话题切换与智能体变更，触发历史加载与防御性状态清空
+// The same accepted window drives mount, navigation and WebView recovery.
 watch(
-  () => sessionStore.currentConversationKey,
-  (key) => {
+  [() => sessionStore.currentConversationKey, () => sessionStore.acceptedWindow?.windowRevision],
+  async ([key, revision], previous, onCleanup) => {
+    let current = true;
+    onCleanup(() => { current = false; });
     showScrollToBottom.value = false;
     resetChatScroll();
-    if (key) {
-      console.log(`[ChatView] Topic changed to ${key.topicId}, loading history...`);
-      topicStore.markTopicAsRead(key.ownerId, key.ownerType, key.topicId);
-      historyStore.loadHistoryPaginated(
-        key.ownerId,
-        key.ownerType,
-        key.topicId,
-      );
-    } else {
-      console.log('[ChatView] Clearing chat history (Selected item or Topic became null).');
+    if (!key) {
       historyStore.resetHistoryForConversation();
     }
+    if (!key || revision === undefined) return;
+    const result = await historyStore.ensureWindow();
+    await nextTick();
+    if (!current || result.aborted || result.error || !sessionStore.isConversationCurrent(key)) return;
+    const anchor = sessionStore.acceptedWindow?.anchorId;
+    const target = historyStore.anchorRemoved ? historyStore.replacementAnchorId : anchor;
+    if (target) scrollToMessageById(target, { behavior: 'instant' });
+    if (previous?.[0]?.epoch !== key.epoch) topicStore.markTopicAsRead(key.ownerId, key.ownerType, key.topicId);
   },
   { immediate: true }
+);
+
+watch(() => historyStore.replacementAnchorId, (replacement, previous) => {
+  // A live deletion can remove the original anchor after the initial positioning.
+  if (replacement && previous !== undefined && historyStore.ready) {
+    scrollToMessageById(replacement, { behavior: 'instant', flash: false });
+  }
+}, { flush: 'post' });
+
+// Follow the actual history owner, including a replacement load in the same
+// conversation. An old aborted Promise cannot declare the new page ready.
+watch(
+  [() => historyStore.loading, isConversationReady, () => sessionStore.currentConversationKey?.epoch],
+  async ([loading]) => {
+    const generation = ++contentGeneration;
+    const key = sessionStore.currentConversationKey;
+    if (!isConversationReady.value) emit("content-pending", key);
+    // Loading an older page retains the current visible window. Only a reset
+    // current window revokes readiness, including a reload in the same epoch.
+    if (loading && !isConversationReady.value) return;
+    await nextTick();
+    if (viewDisposed || generation !== contentGeneration
+      || historyStore.loading && !isConversationReady.value) return;
+    if (key ? !sessionStore.isConversationCurrent(key) : sessionStore.currentConversationKey !== null) return;
+    // Load errors already have visible feedback and are a usable rendered state.
+    emit("content-settled", key);
+  },
+  { immediate: true, flush: "sync" },
 );
 
 // --- 阻止非交互空白区域的 touchmove，防止 WebView viewport 被拖动 ---
@@ -148,35 +190,9 @@ const handleVcpButtonClick = (e: any) => {
 
 
 watch(isStreamingActive, (active) => {
-  active ? startAutoScroll() : stopAutoScroll();
+  if (active) startAutoScroll();
+  else stopAutoScroll();
 });
-
-// 外部分享意图：将已处理的文件挂载到附件栏
-watch(
-  () => sessionStore.sharePrefillFiles,
-  (files) => {
-    if (!files || files.length === 0) return;
-
-    for (const file of files) {
-      const stableId = `share_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
-      attachmentStore.stagedAttachments.unshift({
-        id: stableId,
-        type: file.mime || "application/octet-stream",
-        src: file.path,
-        internalPath: file.path,
-        thumbnailPath: file.thumbnailPath ?? undefined,
-        name: file.name,
-        size: file.size,
-        hash: file.hash,
-        status: "done",
-      });
-    }
-
-    // 消费后清空
-    sessionStore.sharePrefillFiles = [];
-  },
-  { deep: true },
-);
 
 // --- Keyboard Offset & Inset Handler ---
 watch(keyboardHeight, (height) => {
@@ -187,15 +203,6 @@ watch(keyboardHeight, (height) => {
     `${height}px`,
   );
 
-  // 只有当焦点确实处于主界面的输入框中时，键盘高度变化才执行置底
-  const isMainInputFocused = document.activeElement?.classList.contains("vcp-textarea");
-  if (!isMainInputFocused) {
-    return;
-  }
-
-  if (height > 0 && historyStore.currentChatHistory.length > 0) {
-    void scrollToLatest(true);
-  }
 });
 
 onMounted(async () => {
@@ -206,9 +213,19 @@ onMounted(async () => {
   }
 
   checkAndLoadMore();
+  if (footerRef.value) {
+    footerHeight.value = footerRef.value.getBoundingClientRect().height;
+    footerObserver = new ResizeObserver(() => {
+      footerHeight.value = footerRef.value?.getBoundingClientRect().height ?? 0;
+    });
+    footerObserver.observe(footerRef.value);
+  }
 });
 
 onUnmounted(() => {
+  footerObserver?.disconnect();
+  viewDisposed = true;
+  contentGeneration += 1;
   window.removeEventListener("vcp-button-click", handleVcpButtonClick);
 
   if (chatViewContainerRef.value) {
@@ -221,22 +238,27 @@ onUnmounted(() => {
 
 <template>
   <div ref="chatViewContainerRef" class="chat-view-container flex flex-col h-full w-full min-w-0 relative bg-transparent overflow-hidden"
-    :data-presentation-mode="themeStore.presentationMode" @touchmove="handleContainerTouchMove">
+    :data-presentation-mode="chatPreferences.presentationMode" :data-voice-active="voiceCall.active || undefined"
+    @touchmove="handleContainerTouchMove">
     <!-- 1. Header (强制保底高度 80px，确保刘海屏可见) -->
     <header class="vcp-header-fixed shrink-0 flex items-center justify-between gap-3 px-4 border-b border-white/5">
       <div class="flex items-center gap-3 min-w-0 flex-1">
         <!-- 侧边栏按钮 (使用内联 SVG 确保 100% 可见) -->
-        <button @click="layoutStore.toggleLeftDrawer()"
-          class="vcp-left-drawer-trigger w-10 h-10 shrink-0 flex items-center justify-center rounded-xl bg-black/5 dark:bg-white/10 active:scale-90 transition-all border border-black/5 dark:border-white/5"
-          aria-label="打开助手与话题侧栏"
-          aria-controls="agent-sidebar"
-          :aria-expanded="layoutStore.leftDrawerOpen">
-          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"
+        <button @click="voiceCall.active ? overlayStore.openVoiceStyleGuidance() : layoutStore.toggleLeftDrawer()"
+          class="w-10 h-10 shrink-0 flex items-center justify-center rounded-xl bg-black/5 dark:bg-white/10 active:opacity-60 transition-opacity border border-black/5 dark:border-white/5"
+          :class="{ 'vcp-left-drawer-trigger': !voiceCall.active }"
+          :aria-label="voiceCall.active ? '风格指导' : '打开助手与话题侧栏'"
+          :aria-controls="voiceCall.active ? undefined : 'agent-sidebar'"
+          :aria-expanded="voiceCall.active ? undefined : layoutStore.leftDrawerOpen">
+          <Transition name="voice-icon" mode="out-in">
+          <ListChecks v-if="voiceCall.active" :size="21" :stroke-width="1.8" aria-hidden="true" />
+          <svg v-else width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"
             stroke-linecap="round">
             <line x1="3" y1="12" x2="21" y2="12"></line>
             <line x1="3" y1="6" x2="21" y2="6"></line>
             <line x1="3" y1="18" x2="21" y2="18"></line>
           </svg>
+          </Transition>
         </button>
 
         <!-- 头像展示 -->
@@ -250,7 +272,7 @@ onUnmounted(() => {
 
         <div class="flex flex-col min-w-0 flex-1">
           <span 
-            class="font-bold text-sm truncate transition-colors duration-500"
+            class="font-bold text-sm truncate"
             :style="{ color: sessionStore.currentSelectedItem?.avatarCalculatedColor || 'var(--primary-text)' }"
           >
             {{ sessionStore.headerTitle }}
@@ -265,7 +287,7 @@ onUnmounted(() => {
         <!-- 黑白模式切换 (内联 SVG) -->
         <button @click="themeStore.toggleTheme()" v-longpress.suppress-click="openPresentationMenu"
           v-guide="'chat-theme-button'"
-          class="w-10 h-10 flex items-center justify-center rounded-xl bg-black/5 dark:bg-white/10 active:scale-90 transition-all border border-black/5 dark:border-white/5"
+          class="w-10 h-10 flex items-center justify-center rounded-xl bg-black/5 dark:bg-white/10 active:scale-90 transition-transform border border-black/5 dark:border-white/5"
           :class="themeStore.isDarkResolved ? 'text-blue-300/80' : 'text-yellow-500'
             " aria-label="切换深浅模式，长按切换消息呈现" aria-haspopup="dialog"
           :aria-expanded="isPresentationMenuOpen">
@@ -294,18 +316,22 @@ onUnmounted(() => {
           <div class="absolute top-1.5 right-1.5 w-2 h-2 rounded-full border-2 border-[var(--secondary-bg)] bg-blue-500"></div>
         </button>
         <!-- 通知中心按钮 -->
-        <button @click="layoutStore.toggleRightDrawer()"
-          class="vcp-right-drawer-trigger w-10 h-10 flex items-center justify-center rounded-xl bg-black/5 dark:bg-white/10 active:scale-90 transition-all border border-black/5 dark:border-white/5 relative"
-          aria-label="打开通知与工具侧栏"
-          aria-controls="notification-sidebar"
-          :aria-expanded="layoutStore.rightDrawerOpen">
-          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+        <button @click="voiceCall.active ? overlayStore.openVoiceSettings() : layoutStore.toggleRightDrawer()"
+          class="w-10 h-10 flex items-center justify-center rounded-xl bg-black/5 dark:bg-white/10 active:opacity-60 transition-opacity border border-black/5 dark:border-white/5 relative"
+          :class="{ 'vcp-right-drawer-trigger': !voiceCall.active }"
+          :aria-label="voiceCall.active ? '语音设置' : '打开通知与工具侧栏'"
+          :aria-controls="voiceCall.active ? undefined : 'notification-sidebar'"
+          :aria-expanded="voiceCall.active ? undefined : layoutStore.rightDrawerOpen">
+          <Transition name="voice-icon" mode="out-in">
+          <SlidersHorizontal v-if="voiceCall.active" :size="21" :stroke-width="1.8" aria-hidden="true" />
+          <svg v-else width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
             stroke-linecap="round" stroke-linejoin="round">
             <path d="M18 8A6 6 0 0 0 6 8c0 7-3 9-3 9h18s-3-2-3-9"></path>
             <path d="M13.73 21a2 2 0 0 1-3.46 0"></path>
           </svg>
+          </Transition>
           <!-- 当有未读通知时显示绿色指示点 -->
-          <div v-if="notificationStore.unreadCount > 0" 
+          <div v-if="!voiceCall.active && notificationStore.unreadCount > 0"
             class="absolute top-1.5 right-1.5 w-2 h-2 bg-emerald-500 rounded-full border-2 border-[var(--secondary-bg)] shadow-[0_0_8px_rgba(16,185,129,0.5)]">
           </div>
         </button>
@@ -315,8 +341,9 @@ onUnmounted(() => {
     <!-- 1.5 已打开话题标签栏（仅多于 1 个标签时显示） -->
     <OpenTabsBar />
 
+    <div class="chat-conversation-surface flex-1 min-h-0 min-w-0 flex flex-col relative">
     <!-- 2. 消息展示区 (确保 flex-1 撑开) -->
-    <div ref="messageListRef" class="flex-1 overflow-y-auto relative no-rubber-band">
+    <div ref="messageListRef" class="flex-1 min-h-0 overflow-y-auto relative no-rubber-band">
       <!-- 零数据引导状态 -->
       <div v-if="historyStore.currentChatHistory.length === 0"
         class="absolute inset-0 flex flex-col items-center justify-center text-center px-10">
@@ -359,24 +386,39 @@ onUnmounted(() => {
 
     <!-- 一键置底按钮 -->
     <Transition name="fade-slide-up">
-      <button v-if="showScrollToBottom || historyStore.hasEvictedNewer" @click="scrollToLatest(true)"
+      <button v-if="showScrollToBottom || historyStore.pinned || historyStore.anchored || historyStore.hasEvictedNewer" @click="scrollToLatest(true)"
         class="absolute right-4 w-10 h-10 bg-white/80 dark:bg-gray-800/80 rounded-full shadow-lg border border-black/10 dark:border-white/10 flex items-center justify-center text-primary-text z-local active:scale-90 transition-[bottom,transform,opacity] duration-300 ease-[cubic-bezier(0.34,1.56,0.64,1)]"
-        :style="{ bottom: `calc(var(--vcp-safe-bottom, 48px) + 6rem + ${isMenuExpanded ? 112 : 0}px + var(--keyboard-offset, 0px))` }"
+        :style="{ bottom: `${footerHeight + 12}px` }"
       >
         <ArrowDown :size="20" />
       </button>
     </Transition>
 
     <!-- 3. 输入增强区 (固定底部) -->
-    <footer class="vcp-input-footer px-4 py-1.5 border-t border-white/5 shrink-0">
-      <InputEnhancer 
+    <footer ref="footerRef" class="vcp-input-footer relative px-4 py-1.5 shrink-0"
+      :class="voiceCall.active ? 'voice-footer' : 'border-t border-white/5'">
+      <Transition name="voice-fade">
+      <div v-show="!voiceCall.active" :inert="voiceCall.active" :aria-hidden="voiceCall.active || undefined">
+      <InputEnhancer ref="inputRef"
         :disabled="!sessionStore.currentTopicId || !isConversationReady"
+        :suspended="voiceCall.active"
         @send="historyStore.sendMessage" 
-        @toggle-menu="handleMenuToggle" 
-        @focus-input="scrollToLatest(true)"
+        @start-call="startVoiceCall"
       />
-      <div class="h-[calc(var(--vcp-safe-bottom,48px)+var(--keyboard-offset,0px))] no-swipe pointer-events-none"></div>
+      </div>
+      </Transition>
+      <Transition name="voice-fade">
+        <VoiceCallControls v-if="voiceCall.active"
+          :microphone-state="voiceCall.microphoneState" :level="voiceCall.level" :bands="voiceCall.bands"
+          :error-message="voiceCall.errorMessage"
+          :service-state="voiceCall.serviceState" :service-message="voiceCall.serviceMessage" :partial-text="voiceCall.partialText"
+          @toggle-microphone="voiceCall.toggleMicrophone" @hangup="voiceCall.end" />
+      </Transition>
+      <div class="no-swipe pointer-events-none" :style="{ height: voiceCall.active
+        ? 'var(--vcp-safe-bottom, 0px)'
+        : 'calc(var(--vcp-safe-bottom, 48px) + var(--keyboard-offset, 0px))' }"></div>
     </footer>
+    </div>
 
     <!-- VCPChatTarven 规则快捷选择器 -->
     <TarvenSelector />
@@ -394,6 +436,34 @@ onUnmounted(() => {
 
 .vcp-input-footer {
   background-color: var(--vcp-panel-bg-90, var(--secondary-bg));
+}
+
+.vcp-input-footer.voice-footer {
+  background: transparent;
+  border: 0;
+}
+
+.voice-fade-enter-active, .voice-fade-leave-active {
+  transition: opacity 200ms ease;
+}
+.voice-fade-leave-active {
+  position: absolute;
+  width: auto;
+  top: 6px;
+  left: 16px;
+  right: 16px;
+  pointer-events: none;
+}
+.voice-fade-enter-from, .voice-fade-leave-to,
+.voice-icon-enter-from, .voice-icon-leave-to {
+  opacity: 0;
+}
+.voice-icon-enter-active, .voice-icon-leave-active {
+  transition: opacity 100ms ease;
+}
+@media (prefers-reduced-motion: reduce) {
+  .voice-fade-enter-active, .voice-fade-leave-active,
+  .voice-icon-enter-active, .voice-icon-leave-active { transition-duration: 0ms; }
 }
 
 @media (min-width: 1024px) {

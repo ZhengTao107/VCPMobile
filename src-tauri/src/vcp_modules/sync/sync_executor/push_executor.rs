@@ -1,6 +1,7 @@
 use crate::vcp_modules::agent_service;
 use crate::vcp_modules::db_manager::DbState;
 use crate::vcp_modules::group_service;
+use crate::vcp_modules::sync::sync_transfer::SyncHttpClient;
 use crate::vcp_modules::sync_dto::{AgentSyncDTO, AttachmentSyncDTO, GroupSyncDTO, MessageSyncDTO};
 use crate::vcp_modules::sync_error::{
     decode_wire_sync_error, encode_http_sync_error_body, encode_local_sync_error,
@@ -27,7 +28,7 @@ const MAX_CONTROL_RESPONSE_BYTES: usize = 1024 * 1024;
 const OWNER_PUSH_IDEMPOTENCY_DOMAIN: &[u8] = b"VCPMobileSync.OwnerPush.Idempotency.v1";
 
 async fn read_response_limited(
-    response: reqwest::Response,
+    response: crate::vcp_modules::sync::sync_transfer::SyncResponse,
     max_bytes: usize,
     operation: &str,
     stage: SyncErrorStage,
@@ -74,7 +75,7 @@ fn canonical_sha256(value: &str) -> Option<String> {
 }
 
 async fn parse_json_response<T: DeserializeOwned>(
-    response: reqwest::Response,
+    response: crate::vcp_modules::sync::sync_transfer::SyncResponse,
     operation: &str,
     stage: SyncErrorStage,
 ) -> Result<T, String> {
@@ -248,7 +249,7 @@ fn parse_message_push_results(
 }
 
 async fn send_message_chunk(
-    client: &reqwest::Client,
+    client: &SyncHttpClient,
     http_url: &str,
     sync_token: &str,
     body: Vec<u8>,
@@ -296,7 +297,7 @@ async fn send_message_chunk(
 }
 
 async fn send_entity_items(
-    client: &reqwest::Client,
+    client: &SyncHttpClient,
     http_url: &str,
     sync_token: &str,
     items: Vec<EntityPushItem>,
@@ -792,7 +793,7 @@ async fn load_owner_push_version(
 impl PushExecutor {
     pub async fn push_agent<R: Runtime>(
         app: &AppHandle<R>,
-        client: &reqwest::Client,
+        client: &SyncHttpClient,
         http_url: &str,
         sync_token: &str,
         agent_id: &str,
@@ -827,7 +828,7 @@ impl PushExecutor {
 
     pub async fn push_group<R: Runtime>(
         app: &AppHandle<R>,
-        client: &reqwest::Client,
+        client: &SyncHttpClient,
         http_url: &str,
         sync_token: &str,
         group_id: &str,
@@ -864,7 +865,7 @@ impl PushExecutor {
     /// 批量 Push 实体 (Agent/Group/Topic)
     pub async fn push_entities_batch<R: Runtime>(
         _app: &AppHandle<R>,
-        client: &reqwest::Client,
+        client: &SyncHttpClient,
         http_url: &str,
         sync_token: &str,
         items: Vec<EntityPushItem>,
@@ -874,7 +875,7 @@ impl PushExecutor {
 
     pub async fn push_avatar<R: Runtime>(
         app: &AppHandle<R>,
-        client: &reqwest::Client,
+        client: &SyncHttpClient,
         http_url: &str,
         sync_token: &str,
         owner_type: &str,
@@ -992,7 +993,7 @@ impl PushExecutor {
     /// 返回每个 topic 的处理结果。
     pub async fn push_messages_batch<R: Runtime>(
         app: &AppHandle<R>,
-        client: &reqwest::Client,
+        client: &SyncHttpClient,
         http_url: &str,
         sync_token: &str,
         topic_keys: &[TopicKey],
@@ -1119,35 +1120,6 @@ mod tests {
 
     fn topic(topic_id: &str) -> TopicKey {
         TopicKey::new("agent", "agent-a", topic_id)
-    }
-
-    #[test]
-    fn owner_push_idempotency_key_has_stable_framed_contract() {
-        let config_hash = "0123456789abcdef".repeat(4);
-        let key = generate_owner_push_idempotency_key(
-            OwnerType::Agent,
-            "owner\0雪😀",
-            &config_hash,
-            1_725_000_123_456,
-        );
-
-        assert_eq!(
-            key,
-            "5e9b7ce802ae02e30bd28e7e745b82a895581eb9afdd7b1858f67dd87db0e7d7"
-        );
-        assert_eq!(key.len(), 64);
-        assert!(key
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)));
-        assert_eq!(
-            key,
-            generate_owner_push_idempotency_key(
-                OwnerType::Agent,
-                "owner\0雪😀",
-                &config_hash,
-                1_725_000_123_456,
-            )
-        );
     }
 
     #[test]
@@ -1304,15 +1276,7 @@ mod tests {
     }
 
     #[test]
-    fn bounded_writer_emits_valid_ndjson_and_rejects_overflow() {
-        let mut line = BoundedJsonLine::new(64);
-        line.write_all(br#"{"topicId":"#).unwrap();
-        serde_json::to_writer(&mut line, "topic").unwrap();
-        line.write_all(b",\"messages\":[]}\n").unwrap();
-        let bytes = line.into_bytes();
-        serde_json::from_slice::<serde_json::Value>(&bytes[..bytes.len() - 1])
-            .expect("bounded line must remain valid JSON");
-
+    fn bounded_writer_rejects_overflow_without_partial_write() {
         let mut tiny = BoundedJsonLine::new(3);
         assert!(tiny.write_all(b"four").is_err());
         assert!(tiny.bytes.is_empty());

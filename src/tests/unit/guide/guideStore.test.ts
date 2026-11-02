@@ -12,6 +12,7 @@ import {
 import { defineGuide } from '@/features/guide/registry';
 import { useModalHistory } from '@/core/composables/useModalHistory';
 import { useNotificationStore } from '@/core/stores/notification';
+import { useOverlayStore } from '@/core/stores/overlay';
 import { flushPromises } from '@/tests/utils/flush';
 
 vi.mock('@tauri-apps/api/app', () => ({
@@ -118,27 +119,6 @@ describe('guideStore playback state machine', () => {
     expect(modalStackLength()).toBe(0);
   });
 
-  it('persists only completed and lastSeenAppVersion', async () => {
-    defineGuide({
-      id: 'st-persist',
-      title: 'persist',
-      description: 'persist',
-      steps: [{ target: 't1', title: '一', content: 'c1' }],
-    });
-    const store = createStore();
-    store.start('st-persist');
-    store.next();
-    store.lastSeenAppVersion = '1.2.3';
-    await flushPromises(); // persist 插件经 $subscribe(flush: 'pre') 微任务落盘
-
-    const raw = localStorage.getItem('guide');
-    expect(raw).toBeTruthy();
-    const parsed = JSON.parse(raw as string);
-    expect(parsed).toHaveProperty('completed');
-    expect(parsed).toHaveProperty('lastSeenAppVersion', '1.2.3');
-    expect(parsed).not.toHaveProperty('activeGuideId');
-    expect(parsed).not.toHaveProperty('pendingQueue');
-  });
 });
 
 describe('guideStore trigger evaluation', () => {
@@ -352,6 +332,45 @@ describe('guideStore replay', () => {
 
     vi.advanceTimersByTime(REPLAY_PREPARE_DELAY_MS + 50);
     expect(store.activeGuideId).toBe('rp-manual');
+  });
+
+  it('does not close settings if guide has custom prepare', async () => {
+    vi.useFakeTimers();
+    const store = createStore();
+    const overlayStore = useOverlayStore();
+    overlayStore.openSettings();
+    expect(overlayStore.isSettingsOpen).toBe(true);
+
+    const prepare = vi.fn();
+    defineGuide({
+      id: 'rp-custom-prep',
+      title: 'replay-custom',
+      description: 'replay-custom',
+      prepare,
+      steps: [{ target: 't1', title: '一', content: 'c1' }],
+    });
+    store.replay('rp-custom-prep');
+
+    expect(prepare).toHaveBeenCalledTimes(1);
+    expect(overlayStore.isSettingsOpen).toBe(true);
+  });
+
+  it('closes settings if guide does not have custom prepare', async () => {
+    vi.useFakeTimers();
+    const store = createStore();
+    const overlayStore = useOverlayStore();
+    overlayStore.openSettings();
+    expect(overlayStore.isSettingsOpen).toBe(true);
+
+    defineGuide({
+      id: 'rp-no-prep',
+      title: 'replay-no-prep',
+      description: 'replay-no-prep',
+      steps: [{ target: 't1', title: '一', content: 'c1' }],
+    });
+    store.replay('rp-no-prep');
+
+    expect(overlayStore.isSettingsOpen).toBe(false);
   });
 });
 

@@ -102,10 +102,10 @@ interface RenderBlockFields {
 export type ContentBlock =
   | (RenderBlockFields & { type: "markdown" })
   | (RenderBlockFields & {
-      type: "tool-use";
+      type: "tool-use" | "jev-tool-use";
       tool_name: string;
       content: string;
-      // StreamBlock 的 tool-use 没有此字段，持久化终态会补齐。
+      // 两种请求的 StreamBlock 均没有此字段，持久化终态会补齐。
       is_complete?: boolean;
     })
   | (RenderBlockFields & {
@@ -133,6 +133,11 @@ export type ContentBlock =
       content: string;
       is_complete: boolean;
     })
+  | (RenderBlockFields & {
+      type: "voice-guidance";
+      content: string;
+      is_complete: boolean;
+    })
   | (RenderBlockFields & { type: "button-click"; content: string })
   | (RenderBlockFields & { type: "html-preview"; content: string })
   | (RenderBlockFields & {
@@ -156,6 +161,7 @@ export interface Attachment {
   name: string;
   size: number;
   progress?: number; // 0-100 的真实上传进度
+  transferredBytes?: number; // 未知总量复制时已取得的字节，仅暂存卡片使用
   src: string; // 物理存储路径：真理之源。用于后续超栈文件追踪，或跨端同步时的原始路径参考
   resolvedSrc?: string; // Webview 可用的 asset:// 路径 (运行时动态生成，不进行持久化)
   hash?: string;
@@ -220,6 +226,8 @@ export interface ChatMessage {
   tailFrame?: TailFrame;
   tailSnapshot?: MarkdownNode[];
   isReconnecting?: boolean;  // 🆕 流接续重连中状态
+  streamRecoveryState?: "reconnecting" | "waiting_retry";
+  isStopping?: boolean;
 }
 
 export type AstMutation =
@@ -286,7 +294,12 @@ export type StreamBlock =
       is_complete: boolean;
     })
   | (StreamBlockFields & {
-      type: "tool-use";
+      type: "voice-guidance";
+      content: string;
+      is_complete: boolean;
+    })
+  | (StreamBlockFields & {
+      type: "tool-use" | "jev-tool-use";
       tool_name: string;
       content: string;
     })
@@ -324,7 +337,7 @@ export type StreamBlock =
     });
 
 export type TailRenderMode = "ast" | "plain";
-export type TailBlockType = "markdown" | "html-preview" | "thought";
+export type TailBlockType = "markdown" | "html-preview" | "thought" | "voice-guidance";
 
 export interface StableAppend {
   baseCount: number;
@@ -375,6 +388,8 @@ export interface AuroraRecoverySnapshot {
 }
 
 export interface StreamContextDto {
+  /** User message that owns this live request/relay, independent of output Channel. */
+  originUserMessageId?: string;
   topicId?: string;
   isGroupMessage?: boolean;
   groupId?: string;
@@ -382,12 +397,16 @@ export interface StreamContextDto {
   ownerId?: string;
   ownerType?: "agent" | "group";
   agentName?: string;
+  turnId?: string;
+  requestId?: string;
+  /** A persisted or offline-recovered terminal result, not a new live completion. */
+  replayed?: boolean;
   [key: string]: unknown;
 }
 
 /** Rust `StreamEvent` 的完整 Channel 载荷；Option 字段会被序列化为 null。 */
 export interface StreamEventDto {
-  type: "thinking" | "aurora" | "end" | "error";
+  type: "thinking" | "reconnecting" | "connected" | "stopping" | "group_turn" | "request_activity" | "aurora" | "end" | "error";
   chunk: unknown | null;
   messageId: string;
   context: StreamContextDto | null;
@@ -419,21 +438,51 @@ export interface ActiveGenerationDto {
   createdAt: number;
   agentId: string | null;
   agentName: string | null;
+  stopRequested: boolean;
 }
 
-export type RecoveryResultDto =
-  | { status: "attached" }
-  | { status: "completed"; content: string; finishReason?: string | null }
-  | { status: "failed" | "not_found"; content: string };
+/** Rust 群轮 owner 的展示快照；前端不据此自行推进队列。 */
+export interface GroupTurnSnapshotDto {
+  mode?: string;
+  phase?: "deciding" | "speaking" | "waiting" | "stopping" | "idle";
+  queuedAgentIds?: string[];
+  currentAgentId?: string | null;
+  autonomousRounds?: number;
+  revision?: number;
+  stopReason?: string | null;
+  error?: string | null;
+}
+
+export interface ActiveGroupTurnDto extends GroupTurnSnapshotDto {
+  ownerId: string;
+  ownerType: "group";
+  topicId: string;
+  turnId: string;
+}
+
+export interface ActiveRequestDto {
+  ownerId: string;
+  ownerType: "agent" | "group";
+  topicId: string;
+  requestId: string;
+}
+
+/** 连接建立收据仅用于对齐活动范围；正文与生成状态始终由 Channel 交付。 */
+export interface ReconnectChatStreamsDto {
+  generations: ActiveGenerationDto[];
+  groupTurns: ActiveGroupTurnDto[];
+  activeRequests: ActiveRequestDto[];
+}
+
+export interface InterruptRequestDto {
+  success: boolean;
+  status: "completed" | "cancelling";
+  finishReason?: string;
+}
 
 export type GroupChatResultDto =
-  | { status: "completed" }
-  | { status: "no_ai_response"; reason: "invite_only" | "no_speakers" }
-  | {
-      status: "no_ai_response";
-      reason: "mode_not_implemented";
-      mode: string;
-    };
+  | { status: "accepted" | "completed" | "cancelled" | "stopping" | "discarded" | "recovery_pending" }
+  | { status: "no_ai_response"; reason: "invite_only" | "no_speakers" };
 
 export interface RegenerateTopicResultDto {
   generation: unknown;

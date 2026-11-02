@@ -15,7 +15,13 @@ related: [aurora_pipeline.rs, media_processor/, content_parser.rs, agent_chat_ap
 
 `vcp_client.rs` 是 VCP Mobile 核心层（Rust 后端）的**统一 VCP 请求处理模块**，位于 `src-tauri/src/vcp_modules/infra/vcp_client.rs`（约 2100 行）。该模块对应原桌面端项目的 `modules/vcpClient.js`，负责处理所有与 VCP 服务器的通信，是前端对话引擎与后端网络层之间的唯一 HTTP 出入口。
 
-> **2026-08-10 生命周期收口**：Android SSE Helper 仍负责缓存与按事件索引续接，但恢复入口已合并为单个 `recover_active_generation`。它从 claim、query/cache、resume 一直持有同一 attempt lease 到 terminal DB commit，不再暴露独立 `resume_stream` Tauri Command。
+> **2026-10-17 生命周期收口**：前端统一调用 `reconnect_chat_streams`，Rust 协调活动 request、群聊换棒、helper 与离线结果。原 `get_active_generations`、`recover_active_generation` 及无消费者的 `sendToVCP` 不再是公开 IPC；内部恢复仍从 claim 到持久提交持有同一 attempt lease，不重发上游请求。正文只有生产者 buffer 一份权威流状态，消费者更换在该生产者锁下要求先 snapshot 后 delta。本文其余旧行号、事件索引及 `sse_cache` 描述属于历史实现；本轮具体契约和验证见 [阶段五记录](../../plan/vcpmobile-ios-compatibility-research/phase-5/01-SSE统一接管与操作边界重构.md)。
+
+> 2026-10-17 资源收尾：网络层以 `VcpResponse` 移交正文、结束原因和取消状态，单聊/群聊/恢复直接把正文移动到 finalizer；内部恢复返回 `RecoveryStatus`，权威正文仍只经原终态 Channel 交付。渲染缓存采用 JSON 直接写入 zstd 编码器，避免完整未压缩 JSON 中间缓冲；worker 输入与终态事件的共享优化未实施。范围及验证见 [资源收尾记录](../../plan/vcpmobile-ios-compatibility-research/phase-5/02-SSE资源收尾重构.md)。
+
+已经取得成功、取消或错误终态、但 SQLite 提交失败时，没有 helper 交接副本的路径由现有 `RequestOutput.pending_terminal` 保留共享的 `PendingStreamTerminal`（正文、结束原因、Agent 身份）。错误入口由调用方传入已有的发言者身份，在首次数据库访问前保留含原错误原因的正文；是否仍待提交、已经结束或被删除，统一由终态事务裁定。生成 lease 退出后只保留这一待提交 owner；同进程恢复先重新认领并重试原终态提交，不重新 POST，也不把已有正文替换为空的“后台进程销毁”错误。提交成功、已有持久终态、消息移除或显式删除后释放该 owner；晚到错误不计为新的群成员发言完成。Android 已有 helper handoff 或完成文件继续由其原有交接路径持有，不额外保留第二份。此机制只保留已取得的终态，不增加生成期间正文落盘，也不改变进程死亡后未持久化正文可能丢失的边界。
+
+Android helper 的 HTTP 失败诊断保留状态码，异常和 reason phrase 只使用非空文本；HTTP/2 没有 reason phrase 时仍能区分 401、429、500 等失败。错误正文不另行读取，终态与资源交接流程不变。
 
 其核心职责包括：
 - 使用 Rust 设置快照冻结本次 turn 的最终 Chat 端点并组装 HTTP 请求
@@ -24,6 +30,8 @@ related: [aurora_pipeline.rs, media_processor/, content_parser.rs, agent_chat_ap
 - 支持**流式（SSE）**与**非流式**双模式响应处理
 - 通过 `tokio::sync::oneshot` 实现全链路**请求中止机制**（含深层轮询捕获）
 - 向前端推送标准化的 `StreamEvent` 事件序列
+
+请求准备由一个可取消工作槽覆盖多模态处理与最终序列化，完成后释放，不占用整轮网络时长。音频 24 MiB、视觉 16 MiB 均按编码后的 data URL 字节计数；完整 HTTP JSON 通过有界 writer 写入私有文件，最终上限为 128 MiB。Android 控制帧只发送正文 token 与长度，Helper 原子认领文件并分块上传；Rust 直连传输以只读文件映射提供可重放正文，保留 307/308 重定向语义，不另建完整字符串或字节数组副本。正文文件随实际上传 owner 结束清理，与响应帧/离线结果的生命周期分开。
 
 ### 1.2 职责边界
 
@@ -35,10 +43,10 @@ related: [aurora_pipeline.rs, media_processor/, content_parser.rs, agent_chat_ap
 | 上下文注入 | 读取 `music_state.json`、`songlist.json`，注入 System Message | `perform_vcp_request:403` |
 | 流式 SSE 解析 | 使用 `LinesCodec` + `tokio::select!` 逐行解析 `data:` 事件 | `perform_vcp_request:536` |
 | Aurora 语义沉淀驱动 | 每收到文本 chunk 追加到 `AuroraBuffer`，触发增量块解析与推测渲染 | `perform_vcp_request:591` |
-| 请求中止 | `ActiveRequests` + attempt UUID + `oneshot::Sender` + RAII lease | `ActiveRequestEntry`, `ActiveRequestLease`, `interruptRequest` |
+| 请求中止 | `ActiveRequests` + attempt UUID + `CancellationToken` + RAII lease；pending 表保留明确停止意图 | `ActiveRequestEntry`, `ActiveRequestLease`, `interruptRequest` |
 | 连接测试 | 对齐桌面端逻辑的 `/v1/models` 探测与模型计数 | `test_vcp_connection:762` |
-| 活跃生成恢复 | 查询 `active_generations`、本地 `sse_cache` 及助手内存，恢复异常中断的流 | `get_active_generations:1611`, `recover_active_generation:1767` |
-| 流式断点续传 | `recover_active_generation` 在已 claim 的 attempt 内按 `startIndex` 续接 Helper 流 | `resume_claimed_generation`, `handle_streaming_request` |
+| 活跃生成恢复 | 统一绑定当前界面输出，按 pending、live owner 与离线 mailbox 安排对账 | `reconnect_chat_streams` |
+| 流式接管 | 内部恢复在同一 attempt 内接收 helper 的完整前缀快照，再消费后续增量 | `resume_claimed_generation`, `handle_streaming_request` |
 | 助手进程通信 | `LengthDelimitedCodec` 帧协议：4 字节大端长度 + JSON payload | `send_command_to_stream:705`, `connect_to_helper:612` |
 
 ### 1.3 调用入口
@@ -173,7 +181,7 @@ pub struct ActiveGroupTurns(Arc<DashMap<TopicKey, CancellationToken>>);
 ### 3.1 整体请求生命周期
 
 ```
-前端调用 sendToVCP(payload, channel)
+前端调用 handle_agent_chat_message / handle_group_chat_message
            │
            ▼
     ┌──────────────┐
@@ -224,20 +232,17 @@ pub struct ActiveGroupTurns(Arc<DashMap<TopicKey, CancellationToken>>);
 
 ### 3.2 多模态预处理（阶段 0）
 
-当 `content` 为数组且包含 `{"type": "local_file", "path": "file://..."}` 时，模块执行以下转换：
+当 `content` 数组包含 `{"type": "local_file", "hash": "..."}` 时，Rust 解析本机 CAS 记录，按实际 MIME 选择处理器；主机路径不进入模型消息。
 
-| 扩展名 | MIME | part_type | 处理方式 | 降级策略 |
-|--------|------|-----------|---------|---------|
-| png/jpg/jpeg/webp/gif/bmp/heic/heif/avif | image | `image_url` | ffmpeg 转 webp，长边缩放到 ≤1120px | 保留文本占位 `[附件文件: {path}]` |
-| mp4/webm/3gp/3g2/mov | video | `image_url` | 场景检测 + 均匀采样抽帧 → JPEG base64 | 同上 |
-| mp3/wav/ogg/flac/aac/m4a/opus/amr | audio | `input_audio` | ffmpeg 提取 MP3/AAC（32kbps）→ base64 | 同上 |
-| 其他 | application | `file_url` | 不支持多模态，直接降级为文本占位 | — |
+| MIME 类别 | 输出 | 处理方式 | 失败反馈 |
+|---|---|---|---|
+| image | `image_url`，真实 JPEG/PNG Data URI | 既有双端原生用途派生，图片实现保持不变 | 图片处理错误返回现有失败链 |
+| video | 多个 `image_url`，JPEG Data URI | Android 系统缩放抽帧；iOS AVAssetImageGenerator，最多 300 帧 | 抽帧、读取或预算失败阻止本次请求，不用文件名代替内容 |
+| audio | `image_url`，`data:audio/mp4;base64,...` | Android Media3 / iOS 原生转换为 AAC-LC、16 kHz、单声道、32 kbps，封装 M4A | 无原件直读回退；明确指出失败附件 |
 
-关键实现细节：
-- 路径清洗：`"file://"` 前缀被移除
-- 文件不存在或读取失败时，**静默降级为文本占位**，避免内容完全丢失（`if !converted` 分支）
-- 图片/视频/音频处理均在 `tokio::task::spawn_blocking` 中执行，避免阻塞 async 运行时
-- 视频抽帧有**硬上限 300 帧**，防止极端长视频导致 OOM 或 API 超时
+音频使用 VCP 桌面端及服务器多模态处理器已有的媒体 Data URI 契约；不是标准 OpenAI `input_audio`，不据此承诺所有直连模型均接收音频。编码、容器和 MIME 由原生结果与文件核对，不再把所有非 AAC 标成 MP3。
+
+音视频资源 worker 持有原生调用的接收端，执行登记、处理、取消、最终回调及清理。请求 CancellationToken 控制停止，准备结束后再次检查取消，未取消才发送网络请求。已保存的用户消息和附件保留。群聊成员的附件准备或模型请求失败时，Rust 将错误写入该成员的消息，再继续调度下一位成员。预算、缓存版本及临时资源细节见[双端实施记录](../../plan/vcpmobile-ios-compatibility-research/phase-5/05-双端音视频附件处理.md)。
 
 ### 3.3 Chat 端点路由（阶段 1–2）
 
@@ -249,7 +254,11 @@ pub struct ActiveGroupTurns(Arc<DashMap<TopicKey, CancellationToken>>);
 | `vcpTools` | 补全或替换为 `/v1/chatvcp/completions` | 标准 Chat |
 | `raw` | 完整 URL 原样使用 | 完整 URL 原样使用 |
 
-resolver 仅接受带 host 的 HTTP/HTTPS，拒绝用户信息、控制字符与 fragment；保留端口、query 和反向代理路径前缀。`/v1` 被视为 API 基址，已知 Chat 末尾只替换末尾段。正式请求、重试与 Android SSE Helper 均复用 turn 起点冻结的同一最终 URL。
+resolver 位于 `infra/vcp_http_endpoint.rs`，仅接受带 host 的 HTTP/HTTPS，拒绝用户信息、控制字符与 fragment；保留端口、query 和反向代理路径前缀。`/v1` 被视为 API 基址，已知 Chat 末尾只替换末尾段。正式请求、重试与 Android SSE Helper 均复用 turn 起点冻结的同一最终 URL。
+
+该纯模块也拥有 `resolve_service_base`、`resolve_http_origin` 和 `append_url_segments`。管理 API 与日记从同一基址规则剥离 `/v1`、标准或增强聊天后缀，保留部署前缀，但不继承 Chat 配置中的 query；各操作继续自行添加查询参数。Raw 根地址、`/v1` 或已知聊天端点可推导管理基址，未知 Raw 路径明确返回不可推导，主聊天仍按原地址请求。Raw 模型发现继续遵守原有更窄的规则，只从已知完整聊天端点派生。
+
+表情服务显式使用 `resolve_http_origin`，列表与图片均位于服务器根路径，不扩展子路径部署。路径段 API 接收原始值并编码一次，拒绝会被静默跳过的 `.` / `..` 段。HTTP 鉴权与请求执行留在各消费者：管理 Basic、Human Tool Bearer、图片 `pw=` 路径凭证；WebSocket 独立使用 `vcp_ws_endpoint.rs` 的协议规则。
 
 > **v1.1.3 变更说明**：历史版本中 `vcp_client.rs` 曾直接读取 `music_state.json` / `songlist.json` 并向 System Message 注入音乐状态与 UI 规范。当前代码中该逻辑已移除，所有上下文注入（System Prompt、Tavern 规则、历史消息压缩等）由 `context_assembler.rs` 在调用 `perform_vcp_request` 之前完成。`vcp_client.rs` 仅负责将已组装好的 `messages` 数组原样序列化并发送。
 
@@ -369,22 +378,13 @@ vcp_client.rs SSE 循环
 
 ## 4. 公共接口（Tauri Commands）
 
-### 4.1 sendToVCP
+### 4.1 reconnect_chat_streams
 
-```rust
-pub async fn sendToVCP<R: Runtime>(
-    app: AppHandle<R>,
-    state: tauri::State<'_, ActiveRequests>,
-    payload: VcpRequestPayload,
-    stream_channel: Channel<StreamEvent>,
-) -> Result<Value, String>
-```
+首次 `invoke('reconnect_chat_streams', { connectionId, channel })` 登记当前 WebView 的输出；后续同界面只传 `connectionId`，复用 Rust 持有的 Channel 实例。可选 Channel 由 `JavaScriptChannelId` 延迟创建，避免 Tauri 在重复反序列化时重置同一 JS 回调的消息序号。
 
-- **前端调用方式**：`invoke('sendToVCP', { payload, streamChannel })`
-- `stream_channel` 为 `Channel<StreamEvent>`，支持服务端向前端推送事件流
-- 流式模式下，函数返回后仍会通过 `stream_channel` 持续发送事件，直到 `end` 或 `error`
-- 返回的 `Value` 在流式模式下包含 `{ fullContent, streamingStarted, finishReason }`
-- 面向正式 Agent/Group 对话时，generation 的 pending/terminal 生命周期由 application service 的 `begin_stream_message` / `finalize_stream_message` 管理；`sendToVCP` 本身不再以 key-only 删除恢复记录。
+命令只返回活动消息/群轮的对账收据，不返回正文，也不等待生成结束。各条生成的接管状态、快照、增量和持久终态经 Channel 投递；前端不按收据再调用单消息恢复。新界面更换消费者，原 request owner 保留；旧连接的迟到工作不能重新取得输出所有权。
+
+正式生成继续通过 Agent/Group application service 建立 pending 消息并调用 finalizer。`sendToVCP` 无实际消费者，其专用包装及命令注册已移除。
 
 ### 4.2 interruptRequest
 
@@ -567,29 +567,22 @@ Helper 向主进程回传的事件帧：
 |------|------|---------|
 | 正常生成 | request lease 一直覆盖到 `finalize_stream_message` 原子提交 | Agent/Group application service |
 | 请求明确失败 | 写入简短错误原因并提交 `finish_reason=error`，同时删除 active row | Agent/Group application service, `mark_message_as_error` |
-| `recover_active_generation` | 先 claim attempt，再依次检查 DB pending、`sse_cache`、Helper，并在同一 lease 内完成续接/终态提交 | `vcp_client.rs` |
-| terminal 已存在 | 返回已有 content/finishReason，迟到恢复不得反向改写 error | `recover_active_generation`, `mark_message_as_error` |
+| 统一接管 | live owner 只更换消费者；缺 owner 的 pending/离线结果由内部恢复认领 lease 后收尾 | `reconnect_chat_streams`、内部 `recover_active_generation` |
+| terminal 已存在 | 向当前消费者发送持久 content/finishReason/timestamp，迟到结果不覆盖数据库 | `emit_persisted_terminal`、`finalize_stream_message` |
 
 ### 8.5 恢复流程
 
 ```text
-recover_active_generation(msg_id)
+reconnect_chat_streams(connectionId, 首次 channel)
     │
-    ├─ try_acquire attempt 失败 → 返回 { status: "already_running" }
-    ├─ DB 已无 pending active row → 幂等返回 terminal / not_found
-    │
-    ├─ 清理超过 24h 的本地 sse_cache 文件
-    │
-    ├─ 读取本地 sse_recovered_{hash}.json（24h 内有效）
-    │   └─ 命中 → finalize_stream_message → 返回 completed
-    │
-    ├─ Android: 通过 TCP 向 Helper 查询会话状态
-    │   ├─ completed → finalize → 返回 completed
-    │   ├─ streaming → 同一 command 内 resume_claimed_generation
-    │   └─ not_found → 继续下一步
-    │
-    └─ 在 pending 仍存在时原子标记 error；若其他 owner 已提交则幂等 no-op
-       └─ 返回 { status: "failed" }
+    ├─ 活动请求/群轮 → 绑定当前消费者，后续发言继承
+    ├─ pending / 离线文件 → 安排由 request lease 持有的内部恢复
+    │   ├─ 离线结果 → 原 finalizer 持久提交
+    │   ├─ helper 存活 → 前缀 snapshot → 后续 delta → terminal
+    │   ├─ 已请求停止 → 对账并取消，不恢复继续生成
+    │   ├─ 明确 not_found → 再查 mailbox 后按真实中断/停止收尾
+    │   └─ 暂时不可达 → 保留 pending，Channel 告知待重试/停止待确认
+    └─ 返回活动收据；各消息持久 end 仍经同一 Channel 投递
 ```
 
 ---
@@ -628,90 +621,23 @@ recover_active_generation(msg_id)
 
 ---
 
-## 10. 动态心跳与前后台状态（vcp_log_service）
+## 10. VCPLog 与 VCPInfo 的连接策略
 
-`vcp_log_service.rs` 与 `vcp_client.rs` 同属 `infra/` 领域，负责 WebSocket 日志通道的生命周期管理。v1.1.3 将心跳自适应逻辑从**前端主动调用**迁移到**后端根据生命周期状态自动调整**，减少前后台切换时的竞态窗口。
+两条 WebSocket 共用 Rust 的 `vcp_ws_activity`。单聊从请求准入到释放持续持有聊天计数，群聊从取得整轮租约到结束持有一次，覆盖非流式回复、JEV 决策和发言间隙。语音提交使用同一组请求和群轮。Android helper 的断开接管沿用其活动观察。
 
-### 10.1 运行时心跳配置
+| 状态 | 两条 WS 的行为 |
+|------|---------------|
+| 前台，或后台仍有活跃聊天 | 定期发送带序号的 Ping 并核对 Pong。失活后立即尝试替换一次；持续握手失败或接通即断时按退避策略重试。 |
+| 后台且最后一个聊天已结束 | 保留已连接的 socket，继续接收服务端消息，暂停主动 Ping 和重连。 |
+| 回到前台，或原生网络报告恢复可用且仍需连接 | 唤醒退避，复用正在进行的握手。已有连接立即探活。Ping 写出后等待匹配 Pong 5 秒，调度暂停时先处理已经到达的帧。 |
 
-保留 Tauri Command 供手动/调试覆盖：
+Android 和 iOS 使用同一连接策略。Android 聊天租约与 SSE helper、iOS 聊天音频租约继续由相应任务管理。日志连接本身不申请原生保活资源。
 
-```rust
-// src-tauri/src/vcp_modules/infra/vcp_log_service.rs:89
-#[tauri::command]
-pub async fn set_vcp_log_heartbeat(interval_ms: u64) -> Result<(), String>
-```
+Android 系统若限制应用 UID 的后台网络，前台服务运行期间也可能同时失去 WebSocket 和聊天 HTTP 连接。两条 WebSocket 恢复后可以继续接收日志和召回信息。若聊天 HTTP 在首个响应块前关闭且服务端已经取消生成，客户端保留该次请求的真实错误。
 
-- **默认值**：`HEARTBEAT_INTERVAL_MS = 15000`（AtomicU64，单位毫秒）
-- **动态生效**：调用后立即通过 `HEARTBEAT_RESET_TX` mpsc 通道向 WebSocket 监听循环发送重置信号
-- 监听循环内通过 `tokio::select!` 捕获 `reset_rx.recv()`，读取最新原子值后重新校准 `heartbeat_timer`（`tokio::time::Sleep::reset`），无需断开重连
+### 10.1 后台日志缓存
 
-> **注意**：v1.1.3 前端（`App.vue` / `useAppLifecycle`）不再在生命周期切换时调用此命令。日常运行的心跳调整由 Rust 侧的 `handle_foreground_state_change` 自动完成。
-
-### 10.2 前后台自适应（后端自动）
-
-Rust 生命周期控制器在收到 `set_app_foreground_state` 调用时，会同步调用 `vcp_log_service::handle_foreground_state_change`：
-
-```rust
-// src-tauri/src/vcp_modules/infra/vcp_log_service.rs:27
-pub async fn handle_foreground_state_change(_app: &AppHandle, is_foreground: bool) {
-    let heartbeat_ms = if is_foreground { 15000 } else { 120000 };
-    HEARTBEAT_INTERVAL_MS.store(heartbeat_ms, Ordering::SeqCst);
-    {
-        let tx_lock = HEARTBEAT_RESET_TX.lock().await;
-        if let Some(tx) = tx_lock.as_ref() {
-            let _ = tx.send(()).await;
-        }
-    }
-}
-```
-
-| 生命周期状态 | 心跳间隔 | 设计意图 |
-|-------------|---------|---------|
-| 前台 (`is_foreground = true`) | 15000 ms | 保持连接活性，确保日志与系统通知实时到达 |
-| 后台 (`is_foreground = false`) | 120000 ms | 降低功耗与网络占用，减少 OEM 杀后台概率 |
-
-触发链路：
-
-```
-Kotlin LifecycleBridge / App.vue visibilitychange
-    │
-    ▼
-Rust lifecycle_controller::set_app_foreground_state(is_foreground)
-    │
-    ▼
-vcp_log_service::handle_foreground_state_change(is_foreground)
-    │
-    ▼
-HEARTBEAT_INTERVAL_MS 原子更新 → WebSocket 循环 reset 心跳定时器
-```
-
-### 10.3 后台日志缓存
-
-为避免后台期间 WebView 积压消息，`vcp_log_service.rs` 在 `emit_log_event` 中增加了后台缓存逻辑：
-
-```rust
-// src-tauri/src/vcp_modules/infra/vcp_log_service.rs:59
-fn emit_log_event<R: tauri::Runtime>(app: &AppHandle<R>, payload: serde_json::Value) {
-    if !crate::vcp_modules::infra::lifecycle_manager::is_app_in_foreground(app) {
-        if let Ok(mut cache) = BACKGROUND_LOG_CACHE.lock() {
-            cache.push(payload);
-        }
-        return;
-    }
-    let _ = app.emit("vcp-system-event", payload);
-}
-```
-
-- 应用处于后台时，日志消息缓存在 Rust 侧 `BACKGROUND_LOG_CACHE`，不直接推送到 WebView
-- 返回前台后通过 `flush_background_logs` 一次性补发，防止内存泄漏和前端消息积压
-
-### 10.4 性能与稳定性收益
-
-- **后台降频**：120s 心跳使 WebSocket 在后台维持最低限度的 NAT/防火墙保活，避免高频 Ping 唤醒 CPU 与射频模块
-- **快速恢复**：前台切回时 15s 间隔立即恢复，日志通道无需重新握手
-- **状态一致性**：心跳调整与生命周期状态在同一 Rust 调用链中完成，避免前端调用 `set_vcp_log_heartbeat` 与 `vcp-lifecycle-changed` 事件之间的时序窗口
-- **与 StreamKeepaliveService 协同**：主进程前台保活服务维持进程存活，`:helper` 进程 SSE 代理维持流连接，自适应心跳降低网络层消耗
+后台收到的日志和审批进入 Rust 有界缓存，回前台后交给 WebView。连接状态根据当前快照刷新，以免缓存中的旧状态覆盖已恢复的连接。
 
 ---
 

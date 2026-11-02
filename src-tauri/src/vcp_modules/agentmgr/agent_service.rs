@@ -12,7 +12,7 @@
 //! - chineseName 重复时后写覆盖先写（运行时只剩一个）。
 
 use crate::vcp_modules::infra::admin_api;
-use crate::vcp_modules::settings_manager::{read_settings, Settings, SettingsState};
+use crate::vcp_modules::settings_manager::{read_config, Settings, SettingsState};
 use reqwest::{RequestBuilder, StatusCode};
 use serde_json::Value;
 use std::collections::HashSet;
@@ -77,8 +77,8 @@ async fn send_json(request: RequestBuilder, timeout: Duration) -> Result<Value, 
 async fn settings_of<R: Runtime>(
     app_handle: AppHandle<R>,
     settings_state: State<'_, SettingsState>,
-) -> Result<Settings, String> {
-    let settings = read_settings(app_handle, settings_state).await?;
+) -> Result<std::sync::Arc<Settings>, String> {
+    let settings = read_config(app_handle, settings_state).await?;
     admin_api::ensure_admin_config(&settings, "Agent 管理")?;
     Ok(settings)
 }
@@ -129,6 +129,12 @@ fn merge_top_level(base: &Value, incoming: &Value) -> Result<Value, String> {
     let incoming_obj = incoming
         .as_object()
         .ok_or_else(|| "提交的配置必须是 JSON 对象".to_string())?;
+    if let Some(agents) = incoming_obj.get("agents") {
+        let agents = agents
+            .as_array()
+            .ok_or_else(|| "agents 必须是数组，已中止保存".to_string())?;
+        validate_agents(agents)?;
+    }
     for (key, value) in incoming_obj {
         merged.insert(key.clone(), value.clone());
     }
@@ -158,10 +164,6 @@ pub async fn agentmgr_save_config<R: Runtime>(
 ) -> Result<Value, String> {
     let settings = settings_of(app_handle, settings_state).await?;
     let url = build_url(&settings, &["agent-assistant", "config"])?;
-
-    if let Some(agents) = config.get("agents").and_then(|a| a.as_array()) {
-        validate_agents(agents)?;
-    }
 
     let latest = send_json(admin_api::client_get(&settings, &url)?, DEFAULT_TIMEOUT).await?;
     let merged = merge_top_level(&latest, &config)?;
@@ -198,57 +200,29 @@ pub async fn agentmgr_list_models<R: Runtime>(
 }
 
 #[cfg(test)]
-mod tests {
+mod config_tests {
     use super::*;
     use serde_json::json;
 
     #[test]
-    fn validate_agents_accepts_well_formed() {
-        let agents = vec![
-            json!({"chineseName": "小娜", "modelId": "gpt-4o"}),
-            json!({"chineseName": "小冰", "modelId": "default"}),
-        ];
-        assert!(validate_agents(&agents).is_ok());
-    }
-
-    #[test]
-    fn validate_agents_rejects_missing_chinese_name() {
-        let agents = vec![json!({"modelId": "gpt-4o"})];
-        let err = validate_agents(&agents).unwrap_err();
-        assert!(err.contains("chineseName"));
-    }
-
-    #[test]
-    fn validate_agents_rejects_blank_model_id() {
-        let agents = vec![json!({"chineseName": "小娜", "modelId": "  "})];
-        let err = validate_agents(&agents).unwrap_err();
-        assert!(err.contains("小娜"));
-        assert!(err.contains("modelId"));
-    }
-
-    #[test]
-    fn validate_agents_rejects_duplicate_chinese_name_after_trim() {
-        let agents = vec![
-            json!({"chineseName": "小娜", "modelId": "a"}),
-            json!({"chineseName": " 小娜 ", "modelId": "b"}),
-        ];
-        let err = validate_agents(&agents).unwrap_err();
-        assert!(err.contains("重复"));
-    }
-
-    #[test]
-    fn merge_top_level_preserves_unknown_keys_from_server() {
-        let base = json!({"maxHistoryRounds": 7, "customFutureKey": {"x": 1}, "agents": []});
-        let incoming = json!({"agents": [{"chineseName": "小娜"}], "maxHistoryRounds": 9});
-        let merged = merge_top_level(&base, &incoming).unwrap();
-        assert_eq!(merged["maxHistoryRounds"], json!(9));
-        assert_eq!(merged["customFutureKey"], json!({"x": 1}));
-        assert_eq!(merged["agents"], json!([{"chineseName": "小娜"}]));
-    }
-
-    #[test]
-    fn merge_top_level_rejects_non_object_payloads() {
-        assert!(merge_top_level(&json!({}), &json!([])).is_err());
-        assert!(merge_top_level(&json!([]), &json!({})).is_err());
+    fn agent_list_type_errors_cannot_replace_remote_agents() {
+        let base = json!({"agents":[{"chineseName":"保留","modelId":"model"}],"maxHistoryRounds":7,"extra":"keep"});
+        for invalid in [Value::Null, json!(false), json!(0), json!(""), json!({})] {
+            assert!(merge_top_level(&base, &json!({"agents":invalid})).is_err());
+        }
+        assert!(
+            merge_top_level(&base, &json!({"agents":[{"chineseName":"missing model"}]})).is_err()
+        );
+        let updated = merge_top_level(&base, &json!({"maxHistoryRounds":12})).unwrap();
+        assert_eq!(updated["agents"], base["agents"]);
+        assert_eq!(updated["extra"], "keep");
+        assert_eq!(updated["maxHistoryRounds"], 12);
+        let cleared = merge_top_level(&base, &json!({"agents":[]})).unwrap();
+        assert_eq!(
+            cleared["agents"],
+            json!([]),
+            "an explicit empty list keeps its existing meaning"
+        );
+        assert_eq!(cleared["extra"], "keep");
     }
 }

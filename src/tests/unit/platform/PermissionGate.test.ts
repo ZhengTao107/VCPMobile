@@ -8,17 +8,21 @@ vi.mock('/vcpmobile.svg', () => ({ default: '/vcpmobile.svg' }));
 const native = vi.hoisted(() => ({ android: false, ios: false }));
 const bootstrap = vi.hoisted(() => vi.fn(async (_force: boolean) => {}));
 const continueFromPermissionGuide = vi.hoisted(() => vi.fn(async () => {}));
+const skipPermissionGuide = vi.hoisted(() => vi.fn(async () => {}));
 const phase = ref('active');
 vi.mock('../../../core/utils/platform', () => ({
   get isAndroid() { return native.android; },
   get isIOS() { return native.ios; },
 }));
 vi.mock('../../../core/stores/appLifecycle', () => ({
-  useAppLifecycleStore: () => ({ bootstrap, continueFromPermissionGuide, get lifecycleSnapshot() { return { phase: phase.value }; } }),
+  useAppLifecycleStore: () => ({ bootstrap, continueFromPermissionGuide, skipPermissionGuide, get lifecycleSnapshot() { return { phase: phase.value }; } }),
 }));
 
 describe('shared permission guide', () => {
   let wrapper: VueWrapper | undefined;
+  const currentButtons = () => wrapper!.findAll('button').filter(button => !button.element.closest('[inert]'));
+  const settingButtons = () => currentButtons().filter(button => /^去(授权|设置)$/.test(button.text()));
+  const next = () => currentButtons().find(button => button.text() === '下一步' && !button.element.disabled);
 
   beforeEach(() => {
     vi.useFakeTimers();
@@ -27,6 +31,7 @@ describe('shared permission guide', () => {
     phase.value = 'active';
     bootstrap.mockClear();
     continueFromPermissionGuide.mockClear();
+    skipPermissionGuide.mockClear();
   });
 
   afterEach(() => {
@@ -35,61 +40,125 @@ describe('shared permission guide', () => {
     vi.useRealTimers();
   });
 
-  it('continues startup without Android requests or a blocking surface when there are no current permission items', async () => {
-    wrapper = mount(PermissionGate);
-    await flushPromises();
-    document.dispatchEvent(new Event('visibilitychange'));
-    vi.advanceTimersByTime(30_000);
-    await flushPromises();
-
-    expect(wrapper.find('.vcp-permission-gate').exists()).toBe(false);
-    expect(invokeMock).not.toHaveBeenCalled();
-    expect(bootstrap).toHaveBeenCalledOnce();
-    expect(bootstrap).toHaveBeenCalledWith(true);
-  });
-
-  it('keeps Android permission requests and its existing storage check in the shared guide', async () => {
+  it('opens each Android setting but keeps denied permissions blocking when the user returns without changes', async () => {
     native.android = true;
+    let basicGranted = false;
     mockInvoke('plugin:vcp-mobile|check_all_permissions', () => ({
-      notification: false, storage: false, battery: false,
-      microphone: false, camera: false, location: false,
+      notification: basicGranted, battery: false, backgroundAllowed: basicGranted, notificationListener: false,
     }));
-    mockInvoke('plugin:vcp-mobile|check_notification_listener_permission', () => ({ enabled: false }));
+    mockInvoke('plugin:vcp-mobile|request_power_management_permission', () => true);
     mockInvoke('plugin:vcp-mobile|get_free_disk_space', () => ({ freeGb: 2, totalGb: 64 }));
-    mockInvoke('plugin:vcp-mobile|request_android_permission', () => undefined);
     wrapper = mount(PermissionGate);
     await flushPromises();
 
-    const requests = wrapper.findAll('button').filter(button => button.text() === '去授权');
-    expect(requests).toHaveLength(2);
-    await requests[0].trigger('click');
-    await requests[1].trigger('click');
-    expect(invokeMock).toHaveBeenCalledWith('plugin:vcp-mobile|request_android_permission', { pType: 'notification' });
+    expect(settingButtons()).toHaveLength(2);
+    for (const button of settingButtons()) {
+      await button.trigger('click');
+      document.dispatchEvent(new Event('visibilitychange'));
+      await flushPromises();
+    }
+    expect(next()).toBeUndefined();
+    basicGranted = true;
+    document.dispatchEvent(new Event('visibilitychange'));
+    await flushPromises();
+    await next()!.trigger('click');
+    expect(settingButtons()).toHaveLength(2);
+    for (const button of settingButtons()) {
+      await button.trigger('click');
+      document.dispatchEvent(new Event('visibilitychange'));
+      await flushPromises();
+    }
+    expect(invokeMock).toHaveBeenCalledWith('plugin:vcp-mobile|request_android_permission', { pType: 'notificationSettings' });
     expect(invokeMock).toHaveBeenCalledWith('plugin:vcp-mobile|request_android_permission', { pType: 'battery' });
-    expect(wrapper.find('.vcp-permission-gate').exists()).toBe(true);
-    expect(wrapper.findAll('button').some(button => button.text().includes('存储空间不足') && button.attributes('disabled') !== undefined)).toBe(true);
+    expect(invokeMock).toHaveBeenCalledWith('plugin:vcp-mobile|request_power_management_permission');
+    expect(invokeMock).toHaveBeenCalledWith('plugin:vcp-mobile|request_notification_listener_permission');
+    expect(wrapper.find('input[type="checkbox"]').exists()).toBe(false);
+    expect(settingButtons()).toHaveLength(2);
+    expect(next()).toBeUndefined();
     expect(bootstrap).not.toHaveBeenCalled();
   });
 
-  it('lets Android users defer the keep-alive guide and continue into the app', async () => {
+  it('hides an undetectable item, advances on a real grant and returns to the permission page on revocation', async () => {
+    native.android = true;
+    let notificationListener = false;
+    const snapshot = () => ({
+      notification: true, battery: null, backgroundAllowed: true, notificationListener,
+    });
+    mockInvoke('plugin:vcp-mobile|check_all_permissions', snapshot);
+    let freeGb = 2;
+    mockInvoke('plugin:vcp-mobile|get_free_disk_space', () => ({ freeGb, totalGb: 64 }));
+    wrapper = mount(PermissionGate);
+    await flushPromises();
+    expect(wrapper.text()).not.toContain('忽略电池优化');
+    await next()!.trigger('click');
+    expect(settingButtons()).toHaveLength(1);
+    await settingButtons()[0].trigger('click');
+    expect(invokeMock).toHaveBeenCalledWith('plugin:vcp-mobile|request_notification_listener_permission');
+    expect(next()).toBeUndefined();
+
+    notificationListener = true;
+    document.dispatchEvent(new Event('visibilitychange'));
+    await flushPromises();
+    await next()!.trigger('click');
+    expect(currentButtons().some(button => button.text().includes('存储空间不足') && button.element.disabled)).toBe(true);
+
+    notificationListener = false;
+    window.dispatchEvent(new CustomEvent('vcp-permission-change', { detail: snapshot() }));
+    await flushPromises();
+    expect(settingButtons()).toHaveLength(1);
+    expect(next()).toBeUndefined();
+    notificationListener = true;
+    freeGb = 12;
+    document.dispatchEvent(new Event('visibilitychange'));
+    await flushPromises();
+    await next()!.trigger('click');
+    const enter = wrapper.findAll('button').find(button => button.text() === '激活并进入应用' && !button.element.disabled)!;
+    await enter.trigger('click');
+    expect(continueFromPermissionGuide).toHaveBeenCalledOnce();
+  });
+
+  it('skips an empty permission page and ignores an older native read that arrives after returning', async () => {
+    native.android = true;
+    const unavailable = { notification: null, battery: null, backgroundAllowed: null, notificationListener: null };
+    let finishFirstRead!: () => void;
+    mockInvoke('plugin:vcp-mobile|check_all_permissions', () => new Promise(resolve => {
+      finishFirstRead = () => resolve({ ...unavailable, notification: false });
+    }));
+    mockInvoke('plugin:vcp-mobile|get_free_disk_space', () => ({ freeGb: 12, totalGb: 64 }));
+    wrapper = mount(PermissionGate);
+    await flushPromises();
+    expect(invokeMock).not.toHaveBeenCalledWith('plugin:vcp-mobile|get_free_disk_space');
+    mockInvoke('plugin:vcp-mobile|check_all_permissions', () => unavailable);
+    document.dispatchEvent(new Event('visibilitychange'));
+    await flushPromises();
+    finishFirstRead();
+    await flushPromises();
+    expect(wrapper.findAll('button').some(button => /^去(授权|设置)$/.test(button.text()))).toBe(false);
+    const enter = wrapper.findAll('button').find(button => button.text() === '激活并进入应用')!;
+    expect(enter.element.closest('[inert]')).toBeNull();
+    await enter.trigger('click');
+    expect(continueFromPermissionGuide).toHaveBeenCalledOnce();
+  });
+
+  // fork ptp4g#9：上游缺权限只能退出；Android 可"稍后再说"进入，走 skipPermissionGuide。
+  it('lets Android users defer missing keep-alive permissions and continue into the app', async () => {
     native.android = true;
     mockInvoke('plugin:vcp-mobile|check_all_permissions', () => ({
-      notification: false, storage: false, battery: false,
-      microphone: false, camera: false, location: false,
+      notification: false, battery: false, backgroundAllowed: false, notificationListener: false,
     }));
-    mockInvoke('plugin:vcp-mobile|check_notification_listener_permission', () => ({ enabled: false }));
     mockInvoke('plugin:vcp-mobile|get_free_disk_space', () => ({ freeGb: 2, totalGb: 64 }));
     wrapper = mount(PermissionGate);
     await flushPromises();
 
-    const defer = wrapper.findAll('button').find(button => button.text().includes('稍后再说'));
+    const defer = currentButtons().find(button => button.text().includes('稍后再说'));
     expect(defer).toBeTruthy();
+    expect(currentButtons().some(button => button.text().includes('退出应用'))).toBe(true);
     await defer!.trigger('click');
     await flushPromises();
-    expect(continueFromPermissionGuide).toHaveBeenCalledOnce();
+    expect(skipPermissionGuide).toHaveBeenCalledOnce();
+    expect(continueFromPermissionGuide).not.toHaveBeenCalled();
   });
-
-  it('offers one optional iOS notification item, reports refusal and still lets the user continue', async () => {
+  it('requires iOS notifications, reports refusal and only offers continuation after authorization', async () => {
     native.ios = true;
     mockInvoke('plugin:vcp-mobile|get_notification_permission', () => ({ authorization: 'notDetermined' }));
     mockInvoke('plugin:vcp-mobile|request_notification_permission', () => ({ authorization: 'denied' }));
@@ -102,7 +171,12 @@ describe('shared permission guide', () => {
     await flushPromises();
     expect(wrapper.text()).toContain('系统通知已关闭');
     expect(wrapper.findAll('button').some(button => button.text() === '系统设置')).toBe(true);
-    await wrapper.findAll('button').find(button => button.text().includes('继续进入应用'))!.trigger('click');
+    expect(currentButtons().some(button => button.text().includes('继续进入应用'))).toBe(false);
+    expect(continueFromPermissionGuide).not.toHaveBeenCalled();
+    mockInvoke('plugin:vcp-mobile|get_notification_permission', () => ({ authorization: 'authorized' }));
+    document.dispatchEvent(new Event('visibilitychange'));
+    await flushPromises();
+    await currentButtons().find(button => button.text() === '继续进入应用')!.trigger('click');
     expect(continueFromPermissionGuide).toHaveBeenCalledOnce();
     expect(invokeMock.mock.calls.some(([command]) => command.includes('android_permission') || command.includes('disk_space'))).toBe(false);
   });

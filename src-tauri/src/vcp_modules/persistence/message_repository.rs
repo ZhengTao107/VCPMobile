@@ -9,8 +9,122 @@ use sqlx::Row;
 use tauri::{AppHandle, Emitter, Manager};
 use tokio::sync::mpsc;
 
-pub const RENDERER_SCHEMA_VERSION: i64 = 1;
+// v3 derives dedicated JEV tool-use blocks from canonical text. Invalidate
+// only local render caches; message content and sync hashes stay unchanged.
+pub const RENDERER_SCHEMA_VERSION: i64 = 3;
 const MAX_SAFE_JSON_INTEGER: u64 = (1_u64 << 53) - 1;
+
+/// Resolve a stored message's author from its complete identity. A group
+/// assistant message uses its actual speaker, never the currently selected UI owner.
+pub(crate) async fn read_narration_author(
+    pool: &sqlx::SqlitePool,
+    key: &MessageKey,
+) -> Result<Option<String>, String> {
+    if !key.topic.is_valid() || key.msg_id.is_empty() {
+        return Err("朗读消息标识不完整".into());
+    }
+    let row = sqlx::query(
+        "SELECT role, agent_id FROM messages
+         WHERE owner_type = ? AND owner_id = ? AND topic_id = ? AND msg_id = ?
+           AND deleted_at IS NULL",
+    )
+    .bind(&key.topic.owner_type)
+    .bind(&key.topic.owner_id)
+    .bind(&key.topic.topic_id)
+    .bind(&key.msg_id)
+    .fetch_optional(pool)
+    .await
+    .map_err(|error| error.to_string())?
+    .ok_or_else(|| "朗读消息已不存在".to_string())?;
+    if row
+        .try_get::<String, _>("role")
+        .map_err(|error| error.to_string())?
+        != "assistant"
+    {
+        return Ok(None);
+    }
+    if key.topic.owner_type == "agent" {
+        return Ok(Some(key.topic.owner_id.clone()));
+    }
+    let author = row
+        .try_get::<Option<String>, _>("agent_id")
+        .map_err(|error| error.to_string())?
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| "群聊消息缺少发言助手，无法确定朗读音色".to_string())?;
+    Ok(Some(author))
+}
+
+#[cfg(test)]
+mod narration_author_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn narration_uses_persisted_speaker_and_complete_message_identity() {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .expect("database");
+        sqlx::query(
+            "CREATE TABLE messages (owner_type TEXT, owner_id TEXT, topic_id TEXT,
+                msg_id TEXT, role TEXT, agent_id TEXT, deleted_at INTEGER);
+             INSERT INTO messages VALUES
+                ('agent','solo','topic','same','assistant',NULL,NULL),
+                ('group','room','topic','same','assistant','speaker-b',NULL),
+                ('group','room','topic','user','user','ignored',NULL),
+                ('group','room','topic','unknown','assistant',NULL,NULL),
+                ('group','room','topic','bad-role',x'ff',NULL,NULL),
+                ('group','room','topic','bad-author','assistant',x'ff',NULL),
+                ('group','room','topic','gone','assistant','speaker-b',1);",
+        )
+        .execute(&pool)
+        .await
+        .expect("seed messages");
+        let group = TopicKey::new("group", "room", "topic");
+        assert_eq!(
+            read_narration_author(&pool, &MessageKey::new(group.clone(), "same"))
+                .await
+                .expect("group speaker"),
+            Some("speaker-b".into())
+        );
+        assert_eq!(
+            read_narration_author(
+                &pool,
+                &MessageKey::new(TopicKey::new("agent", "solo", "topic"), "same")
+            )
+            .await
+            .expect("solo speaker"),
+            Some("solo".into())
+        );
+        assert_eq!(
+            read_narration_author(&pool, &MessageKey::new(group.clone(), "user"))
+                .await
+                .expect("user"),
+            None
+        );
+        assert!(
+            read_narration_author(&pool, &MessageKey::new(group.clone(), "unknown"))
+                .await
+                .expect_err("missing speaker")
+                .contains("发言助手")
+        );
+        for id in ["bad-role", "bad-author"] {
+            assert!(
+                read_narration_author(&pool, &MessageKey::new(group.clone(), id))
+                    .await
+                    .is_err()
+            );
+        }
+        for id in ["gone", "missing"] {
+            assert!(
+                read_narration_author(&pool, &MessageKey::new(group.clone(), id))
+                    .await
+                    .expect_err("missing message")
+                    .contains("不存在")
+            );
+        }
+    }
+}
 
 pub(crate) fn resolve_message_updated_at(
     explicit_updated_at: Option<u64>,
@@ -19,6 +133,8 @@ pub(crate) fn resolve_message_updated_at(
     existing: Option<(&str, i64)>,
     now: i64,
 ) -> Result<i64, String> {
+    i64::try_from(message_timestamp)
+        .map_err(|_| "message timestamp exceeds the SQLite integer range".to_string())?;
     if let Some((previous_hash, previous_updated_at)) = existing {
         let resolved = if previous_hash == content_hash {
             previous_updated_at
@@ -159,11 +275,13 @@ impl MessageRenderCompiler {
 
     /// Serializes AST blocks to compressed binary (JSON + zstd)
     pub fn serialize(blocks: &[ContentBlock]) -> Result<Vec<u8>, String> {
-        let json_bytes =
-            serde_json::to_vec(blocks).map_err(|e| format!("json serialize failed: {}", e))?;
-        let compressed = zstd::bulk::compress(&json_bytes, 3)
+        let mut encoder = zstd::stream::write::Encoder::new(Vec::new(), 3)
             .map_err(|e| format!("zstd compress failed: {}", e))?;
-        Ok(compressed)
+        serde_json::to_writer(&mut encoder, blocks)
+            .map_err(|e| format!("json serialize failed: {}", e))?;
+        encoder
+            .finish()
+            .map_err(|e| format!("zstd compress failed: {}", e))
     }
 
     /// Deserializes compressed binary back to AST blocks (JSON + zstd)
@@ -200,6 +318,7 @@ type RenderCacheWrite = (MessageKey, String, Vec<u8>);
 
 fn open_maintenance_rusqlite(db_path: &std::path::Path) -> Result<rusqlite::Connection, String> {
     let conn = rusqlite::Connection::open(db_path).map_err(|e| e.to_string())?;
+    super::db_health::protect_rusqlite(&conn).map_err(|error| error.to_string())?;
     let journal_mode: String = conn
         .pragma_query_value(None, "journal_mode", |row| row.get(0))
         .map_err(|error| error.to_string())?;
@@ -320,6 +439,8 @@ fn run_render_cache_update_writer(
             tokio::task::spawn_blocking(move || -> Result<(), String> {
                 let mut write_lease = write_lease;
                 write_lease.mark_outcome("transaction_failed");
+                let _database_scope = super::db_health::MainRusqliteScope::enter();
+                super::db_health::ensure_writable()?;
                 let mut connection = connection
                     .lock()
                     .map_err(|_| "预渲染缓存连接锁已损坏".to_string())?;
@@ -370,6 +491,34 @@ fn run_render_cache_update_writer(
 }
 
 #[cfg(test)]
+mod render_compression_tests {
+    use super::MessageRenderCompiler;
+
+    #[test]
+    fn streaming_encoder_preserves_the_existing_render_cache_format() {
+        let blocks = MessageRenderCompiler::compile(
+            "中文 🦀 **正文**\n\n```rust\nlet text = \"quote\\slash\";\n```\n\n<think>思考\n内容</think>",
+        );
+        let expected_json = serde_json::to_vec(&blocks).expect("legacy JSON encoding");
+        let legacy_frame = zstd::bulk::compress(&expected_json, 3).expect("legacy bulk frame");
+        let streamed_frame = MessageRenderCompiler::serialize(&blocks).expect("streamed frame");
+
+        // Existing bulk readers must read frames without a pledged content size.
+        let decoded = zstd::bulk::decompress(&streamed_frame, 16 * 1024 * 1024)
+            .expect("existing cache reader accepts streaming frames");
+        assert_eq!(decoded, expected_json);
+        for frame in [&legacy_frame, &streamed_frame] {
+            let restored = MessageRenderCompiler::deserialize(frame).expect("cache compatibility");
+            assert_eq!(serde_json::to_vec(&restored).unwrap(), expected_json);
+        }
+        assert!(
+            MessageRenderCompiler::deserialize(&streamed_frame[..streamed_frame.len() / 2])
+                .is_err()
+        );
+    }
+}
+
+#[cfg(test)]
 mod rebuild_cache_tests {
     use super::{resolve_message_updated_at, update_render_cache_if_current};
     use crate::vcp_modules::topic_types::{MessageKey, TopicKey};
@@ -400,6 +549,9 @@ mod rebuild_cache_tests {
             resolve_message_updated_at(None, 100, "new", None, 400).expect("new message timestamp"),
             100
         );
+        for (explicit, existing) in [(None, None), (Some(1), None), (Some(1), Some(("same", 1)))] {
+            assert!(resolve_message_updated_at(explicit, u64::MAX, "same", existing, 400).is_err());
+        }
     }
 
     #[test]
@@ -472,7 +624,7 @@ pub async fn rebuild_all_pre_renders(app_handle: AppHandle) -> Result<(), String
         return Ok(());
     }
 
-    #[cfg(target_os = "android")]
+    #[cfg(any(target_os = "android", target_os = "ios"))]
     let foreground_lease = tauri_plugin_vcp_mobile::stream::ForegroundLease::acquire(
         &app_handle,
         tauri_plugin_vcp_mobile::stream::ForegroundTask::Prerender,
@@ -567,7 +719,7 @@ pub async fn rebuild_all_pre_renders(app_handle: AppHandle) -> Result<(), String
         Err(error) => Err(format!("预渲染缓存写入任务失败: {error}")),
     };
 
-    #[cfg(target_os = "android")]
+    #[cfg(any(target_os = "android", target_os = "ios"))]
     if let Some(lease) = foreground_lease {
         let _ = lease.release();
     }
@@ -707,6 +859,12 @@ impl MessageRepository {
         render_content: &[u8],
         skip_bubble: bool,
     ) -> Result<Option<TopicActivityDto>, String> {
+        let message_timestamp = i64::try_from(message.timestamp)
+            .map_err(|_| "message timestamp exceeds the SQLite integer range".to_string())?;
+        for attachment in message.attachments.iter().flatten() {
+            i64::try_from(attachment.size)
+                .map_err(|_| "attachment size exceeds the SQLite integer range".to_string())?;
+        }
         // 1. 计算核心内容指纹 (通过 HashAggregator)
         let attachment_hashes: Vec<String> = message
             .attachments
@@ -740,7 +898,6 @@ impl MessageRepository {
         )
         .map_err(|error| format!("message {} {error}", message.id))?;
         let is_group_message = message.is_group_message.unwrap_or(false);
-        let message_timestamp = message.timestamp as i64;
         let fingerprint_changed = existing
             .as_ref()
             .is_none_or(|state| state.content_hash != content_hash);
@@ -867,7 +1024,7 @@ impl MessageRepository {
                 tx,
                 key,
                 &message.id,
-                message.timestamp as i64,
+                message_timestamp,
                 attachments,
             )
             .await?;
@@ -902,6 +1059,8 @@ impl MessageRepository {
     ) -> Result<(), String> {
         for (i, att) in attachments.iter().enumerate() {
             let hash = Self::attachment_hash(att)?;
+            let size = i64::try_from(att.size)
+                .map_err(|_| "attachment size exceeds the SQLite integer range".to_string())?;
 
             let image_frames = att
                 .image_frames
@@ -933,7 +1092,7 @@ impl MessageRepository {
             )
             .bind(hash)
             .bind(&att.r#type)
-            .bind(att.size as i64)
+            .bind(size)
             .bind(&att.internal_path)
             .bind(&att.extracted_text)
             .bind(image_frames)
@@ -1006,6 +1165,67 @@ mod tombstone_tests {
             .connect("sqlite::memory:")
             .await
             .expect("open test database")
+    }
+
+    #[tokio::test]
+    async fn overflowing_message_metadata_rolls_back_the_sqlx_write() {
+        use crate::vcp_modules::chat_manager::{Attachment, ChatMessage};
+        let pool = test_pool().await;
+        sqlx::raw_sql(include_str!("../../../migrations/0100_baseline_v2.sql"))
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO agents(owner_type,agent_id,name,model,updated_at) VALUES ('agent','owner','Owner','',1); INSERT INTO topics(owner_type,owner_id,topic_id,title,created_at,updated_at) VALUES ('agent','owner','topic','Topic',1,1)")
+            .execute(&pool).await.unwrap();
+        let key = TopicKey::new("agent", "owner", "topic");
+        for bad_timestamp in [false, true] {
+            let valid = ChatMessage {
+                id: "valid".into(),
+                role: "user".into(),
+                content: "keep".into(),
+                timestamp: 1,
+                updated_at: Some(1),
+                ..Default::default()
+            };
+            let invalid = ChatMessage {
+                id: "invalid".into(),
+                role: "user".into(),
+                content: "invalid".into(),
+                timestamp: if bad_timestamp { u64::MAX } else { 1 },
+                updated_at: Some(1),
+                attachments: (!bad_timestamp).then(|| {
+                    vec![Attachment {
+                        size: u64::MAX,
+                        hash: Some("a".repeat(64)),
+                        ..Default::default()
+                    }]
+                }),
+                ..Default::default()
+            };
+            let result: Result<(), String> = async {
+                let mut tx = pool.begin().await.map_err(|error| error.to_string())?;
+                MessageRepository::upsert_message(&mut tx, &valid, &key, &[], true).await?;
+                MessageRepository::upsert_message(&mut tx, &invalid, &key, &[], true).await?;
+                tx.commit().await.map_err(|error| error.to_string())
+            }
+            .await;
+            assert!(result.unwrap_err().contains("SQLite integer range"));
+            for table in [
+                "messages",
+                "attachments",
+                "message_attachments",
+                "render_cache",
+                "messages_fts",
+            ] {
+                let count: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+                    "SELECT COUNT(*) FROM {table}"
+                )))
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+                assert_eq!(count, 0, "{table}");
+            }
+        }
     }
 
     #[tokio::test]

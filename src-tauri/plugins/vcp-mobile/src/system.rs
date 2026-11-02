@@ -9,13 +9,12 @@ use tauri::{AppHandle, Runtime};
 // The explicit host branches below are development fixtures. iOS must use
 // its own adapter or return an unavailable error; it never consumes fixtures.
 
-#[cfg(target_os = "android")]
+#[cfg(any(target_os = "android", target_os = "ios"))]
 const TEMP_FILE_MAX_BYTES: usize = 20 * 1024 * 1024;
-// 与 Kotlin ShareIntentHandler.MAX_SHARE_FILES 保持一致
 #[cfg(target_os = "android")]
 const MAX_SHARED_FILES: usize = 100;
 
-#[cfg(any(target_os = "android", test))]
+#[cfg(any(target_os = "android", target_os = "ios", test))]
 fn safe_leaf_name(file_name: &str) -> Result<&str, String> {
     let path = std::path::Path::new(file_name);
     if file_name.is_empty()
@@ -32,7 +31,7 @@ fn safe_leaf_name(file_name: &str) -> Result<&str, String> {
     Ok(file_name)
 }
 
-#[cfg(any(target_os = "android", test))]
+#[cfg(any(target_os = "android", target_os = "ios", test))]
 fn canonical_file_in(root: &std::path::Path, path: &std::path::Path) -> Result<bool, String> {
     if !path.exists() {
         return Ok(false);
@@ -45,13 +44,34 @@ fn canonical_file_in(root: &std::path::Path, path: &std::path::Path) -> Result<b
 }
 
 #[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct PermissionStatus {
-    pub notification: bool,
+    pub notification: Option<bool>,
     pub storage: bool,
-    pub battery: bool,
+    pub battery: Option<bool>,
+    pub background_allowed: Option<bool>,
+    pub notification_listener: Option<bool>,
     pub microphone: bool,
     pub camera: bool,
     pub location: bool,
+}
+
+#[cfg(any(target_os = "android", test))]
+#[derive(Debug, Deserialize)]
+struct PermissionPageResult {
+    success: bool,
+}
+
+#[cfg(any(target_os = "android", test))]
+#[derive(Debug, Deserialize)]
+struct AutoStartPermissionResult {
+    status: String,
+}
+
+#[cfg(any(target_os = "android", test))]
+#[derive(Debug, Deserialize)]
+struct InstallPackagesPermissionResult {
+    allowed: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -68,6 +88,47 @@ pub enum NotificationAuthorization {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct NotificationPermission {
     pub authorization: NotificationAuthorization,
+}
+
+#[cfg(test)]
+mod permission_result_tests {
+    use super::{AutoStartPermissionResult, InstallPackagesPermissionResult, PermissionPageResult};
+    use serde_json::json;
+
+    #[test]
+    fn malformed_native_permission_results_are_not_reported_as_denied_or_unsupported() {
+        for invalid in [
+            json!({}),
+            json!({"success":null}),
+            json!({"success":"false"}),
+        ] {
+            assert!(serde_json::from_value::<PermissionPageResult>(invalid).is_err());
+        }
+        for invalid in [json!({}), json!({"allowed":null}), json!({"allowed":0})] {
+            assert!(serde_json::from_value::<InstallPackagesPermissionResult>(invalid).is_err());
+        }
+        for invalid in [json!({}), json!({"status":null}), json!({"status":false})] {
+            assert!(serde_json::from_value::<AutoStartPermissionResult>(invalid).is_err());
+        }
+        assert!(
+            !serde_json::from_value::<PermissionPageResult>(json!({"success":false}))
+                .unwrap()
+                .success
+        );
+        assert!(
+            !serde_json::from_value::<InstallPackagesPermissionResult>(json!({"allowed":false}))
+                .unwrap()
+                .allowed
+        );
+        for status in ["true", "false", "unsupported"] {
+            assert_eq!(
+                serde_json::from_value::<AutoStartPermissionResult>(json!({"status":status}))
+                    .unwrap()
+                    .status,
+                status
+            );
+        }
+    }
 }
 
 #[tauri::command]
@@ -134,9 +195,11 @@ pub fn check_all_permissions<R: Runtime>(app: AppHandle<R>) -> Result<Permission
     {
         let _ = app;
         Ok(PermissionStatus {
-            notification: true,
+            notification: Some(true),
             storage: true,
-            battery: true,
+            battery: Some(true),
+            background_allowed: Some(true),
+            notification_listener: Some(true),
             microphone: true,
             camera: true,
             location: true,
@@ -145,7 +208,7 @@ pub fn check_all_permissions<R: Runtime>(app: AppHandle<R>) -> Result<Permission
 }
 
 #[tauri::command]
-pub fn request_android_permission<R: Runtime>(
+pub async fn request_android_permission<R: Runtime>(
     app: AppHandle<R>,
     p_type: String,
 ) -> Result<(), String> {
@@ -155,10 +218,11 @@ pub fn request_android_permission<R: Runtime>(
         let plugin_handle = state.mobile_plugin_handle()?;
 
         plugin_handle
-            .run_mobile_plugin::<serde_json::Value>(
+            .run_mobile_plugin_async::<serde_json::Value>(
                 "requestAndroidPermission",
                 serde_json::json!({ "type": p_type }),
             )
+            .await
             .map_err(|e| format!("run_mobile_plugin failed: {}", e))?;
     }
     #[cfg(target_os = "ios")]
@@ -199,7 +263,7 @@ pub fn move_task_to_back<R: Runtime>(app: AppHandle<R>) -> Result<(), String> {
 
 #[derive(Serialize, Deserialize)]
 pub struct ListenerPermissionResponse {
-    pub enabled: bool,
+    pub enabled: Option<bool>,
 }
 
 #[tauri::command]
@@ -227,12 +291,14 @@ pub fn check_notification_listener_permission<R: Runtime>(
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
     {
         let _ = app;
-        Ok(ListenerPermissionResponse { enabled: true })
+        Ok(ListenerPermissionResponse {
+            enabled: Some(true),
+        })
     }
 }
 
 #[tauri::command]
-pub fn request_notification_listener_permission<R: Runtime>(
+pub async fn request_notification_listener_permission<R: Runtime>(
     app: AppHandle<R>,
 ) -> Result<(), String> {
     #[cfg(target_os = "android")]
@@ -241,10 +307,11 @@ pub fn request_notification_listener_permission<R: Runtime>(
         let plugin_handle = state.mobile_plugin_handle()?;
 
         plugin_handle
-            .run_mobile_plugin::<serde_json::Value>(
+            .run_mobile_plugin_async::<serde_json::Value>(
                 "request_notification_listener_permission",
                 serde_json::json!({}),
             )
+            .await
             .map_err(|e| format!("run_mobile_plugin failed: {}", e))?;
     }
     #[cfg(target_os = "ios")]
@@ -267,17 +334,13 @@ pub fn request_auto_start_permission<R: Runtime>(app: AppHandle<R>) -> Result<bo
         let plugin_handle = state.mobile_plugin_handle()?;
 
         let res = plugin_handle
-            .run_mobile_plugin::<serde_json::Value>(
+            .run_mobile_plugin::<PermissionPageResult>(
                 "requestAutoStartPermission",
                 serde_json::json!({}),
             )
             .map_err(|e| format!("run_mobile_plugin failed: {}", e))?;
 
-        let success = res
-            .get("success")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false);
-        Ok(success)
+        Ok(res.success)
     }
     #[cfg(target_os = "ios")]
     {
@@ -292,24 +355,23 @@ pub fn request_auto_start_permission<R: Runtime>(app: AppHandle<R>) -> Result<bo
 }
 
 #[tauri::command]
-pub fn request_power_management_permission<R: Runtime>(app: AppHandle<R>) -> Result<bool, String> {
+pub async fn request_power_management_permission<R: Runtime>(
+    app: AppHandle<R>,
+) -> Result<bool, String> {
     #[cfg(target_os = "android")]
     {
         let state = app.state::<VcpMobileState<R>>();
         let plugin_handle = state.mobile_plugin_handle()?;
 
         let res = plugin_handle
-            .run_mobile_plugin::<serde_json::Value>(
+            .run_mobile_plugin_async::<PermissionPageResult>(
                 "requestPowerManagementPermission",
                 serde_json::json!({}),
             )
+            .await
             .map_err(|e| format!("run_mobile_plugin failed: {}", e))?;
 
-        let success = res
-            .get("success")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false);
-        Ok(success)
+        Ok(res.success)
     }
     #[cfg(target_os = "ios")]
     {
@@ -331,18 +393,13 @@ pub fn check_auto_start_permission<R: Runtime>(app: AppHandle<R>) -> Result<Stri
         let plugin_handle = state.mobile_plugin_handle()?;
 
         let res = plugin_handle
-            .run_mobile_plugin::<serde_json::Value>(
+            .run_mobile_plugin::<AutoStartPermissionResult>(
                 "checkAutoStartPermission",
                 serde_json::json!({}),
             )
             .map_err(|e| format!("run_mobile_plugin failed: {}", e))?;
 
-        let status = res
-            .get("status")
-            .and_then(|v| v.as_str())
-            .unwrap_or("unsupported")
-            .to_string();
-        Ok(status)
+        Ok(res.status)
     }
     #[cfg(target_os = "ios")]
     {
@@ -405,200 +462,270 @@ pub struct PickedFileInfo {
     pub size: u64,
     pub hash: String,
     pub thumbnail_path: Option<String>,
-    /// 仅 picker 多选批次返回，供前端按卡片对账；单选与分享结果不带此字段。
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub staging_ticket: Option<String>,
 }
 
-/// 单次 picker 多选硬上限；与 Kotlin `VcpMobilePlugin.MAX_PICK_FILES`、前端 `NATIVE_PICK_MAX_ITEMS` 保持一致。
-/// Android 13+ 照片选择器在 Kotlin 侧另与系统 `getPickImagesMaxLimit()` 取小。
-#[cfg(any(target_os = "android", test))]
-const MAX_PICK_FILES: u32 = 100;
-/// 未传 maxItems 时的默认值：等于硬上限，实际能选多少由系统选择器决定。
-#[cfg(any(target_os = "android", test))]
-const DEFAULT_PICK_ITEMS: u32 = MAX_PICK_FILES;
-
-#[cfg(any(target_os = "android", test))]
-fn pick_limit(requested: Option<u32>) -> u32 {
-    requested.unwrap_or(DEFAULT_PICK_ITEMS).clamp(1, MAX_PICK_FILES)
-}
-
-/// 与 Kotlin `isMultiPick` 同一判定：决定原生返回单对象还是批次。avatar/camera 永远单选。
-#[cfg(any(target_os = "android", test))]
-fn is_multi_pick(mode: &str, multiple: bool, limit: u32) -> bool {
-    multiple && mode != "avatar" && mode != "camera" && limit > 1
-}
-
-/// picker 多选批次中处理失败的单项；与 Kotlin `onPickFileResult` 的 failed 项同形。
 #[derive(Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct PickFailure {
-    pub staging_ticket: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub name: Option<String>,
-    pub reason: String,
+pub struct PickedFileFailure {
+    pub name: String,
+    pub message: String,
 }
 
-/// 多选批次回执：成功文件、逐项失败、因上限截断的数量全部随 invoke 返回，前端以此为准。
 #[derive(Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct PickedFileBatch {
+pub struct PickedFilesInfo {
     pub files: Vec<PickedFileInfo>,
-    #[serde(default)]
-    pub failed: Vec<PickFailure>,
-    #[serde(default)]
-    pub skipped: u32,
+    pub errors: Vec<PickedFileFailure>,
 }
 
-/// 未请求多选时保持旧的单对象形状；多选返回 `{files, failed, skipped}`。
-#[derive(Serialize)]
+// Single-resource consumers (avatar/config/camera/CLI) and attachment batches
+// share the same native acquisition owner, with explicit result shapes.
+#[derive(Serialize, Deserialize)]
 #[serde(untagged)]
-pub enum PickFileOutput {
+pub enum PickFileResult {
     Single(PickedFileInfo),
-    Multiple(PickedFileBatch),
+    Multiple(PickedFilesInfo),
 }
 
 #[tauri::command]
-pub fn pick_file<R: Runtime>(
+pub async fn prepare_file_operation<R: Runtime>(
     app: AppHandle<R>,
-    mode: Option<String>,
-    multiple: Option<bool>,
-    max_items: Option<u32>,
-) -> Result<PickFileOutput, String> {
-    #[cfg(target_os = "android")]
-    {
-        let state = app.state::<VcpMobileState<R>>();
-        let plugin_handle = state.mobile_plugin_handle()?;
-        let mode = mode.unwrap_or_else(|| "file".to_string());
-        let limit = pick_limit(max_items);
-
-        if !is_multi_pick(&mode, multiple.unwrap_or(false), limit) {
-            let file_info = plugin_handle
-                .run_mobile_plugin::<PickedFileInfo>(
-                    "pickFile",
-                    serde_json::json!({
-                        "mode": mode
-                    }),
-                )
-                .map_err(|e| format!("run_mobile_plugin failed: {}", e))?;
-            return Ok(PickFileOutput::Single(file_info));
-        }
-
-        let batch = plugin_handle
-            .run_mobile_plugin::<PickedFileBatch>(
-                "pickFile",
-                serde_json::json!({
-                    "mode": mode,
-                    "multiple": true,
-                    "maxItems": limit,
-                }),
-            )
-            .map_err(|e| format!("run_mobile_plugin failed: {}", e))?;
-        Ok(PickFileOutput::Multiple(batch))
-    }
+    webview: tauri::Webview<R>,
+    operation_id: String,
+) -> Result<serde_json::Value, String> {
     #[cfg(target_os = "ios")]
     {
-        let _ = (app, mode, multiple, max_items);
-        crate::ios_not_implemented("pick_file")
+        validate_operation_id(&operation_id)?;
+        // Bind admission to the requesting WKWebView, not whichever replacement
+        // happens to be attached when the queued native call is finally handled.
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        webview
+            .with_webview(move |view| {
+                let _ = sender.send(format!("{:x}", view.inner() as usize));
+            })
+            .map_err(|error| format!("cancelled: requesting WebView is unavailable: {error}"))?;
+        let source_webview = receiver
+            .await
+            .map_err(|_| "cancelled: requesting WebView was detached".to_string())?;
+        crate::ios::run_async(
+            app,
+            "prepareFileOperation",
+            serde_json::json!({
+                "operationId": operation_id, "sourceWebView": source_webview,
+            }),
+        )
+        .await
     }
-    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    #[cfg(not(target_os = "ios"))]
     {
-        let _ = app;
-        let _ = mode;
-        let _ = (multiple, max_items);
-        Err("该接口仅在 Android 物理端可用".to_string())
+        let _ = (app, webview, operation_id);
+        Err("Picker admission is only used on iOS".into())
     }
 }
 
-#[cfg(test)]
-mod pick_file_shape_tests {
-    use super::*;
-
-    fn info(ticket: Option<&str>) -> PickedFileInfo {
-        PickedFileInfo {
-            path: "p".into(),
-            name: "n".into(),
-            mime: "m".into(),
-            size: 1,
-            hash: "h".into(),
-            thumbnail_path: None,
-            staging_ticket: ticket.map(str::to_string),
+#[tauri::command]
+pub async fn pick_file<R: Runtime>(
+    app: AppHandle<R>,
+    mode: Option<String>,
+    operation_id: Option<String>,
+    max_bytes: Option<u64>,
+    multiple: Option<bool>,
+    reservation_token: Option<String>,
+) -> Result<PickFileResult, String> {
+    #[cfg(any(target_os = "android", target_os = "ios"))]
+    {
+        let mode = mode.unwrap_or_else(|| "file".into());
+        if !matches!(
+            mode.as_str(),
+            "file" | "camera" | "gallery" | "avatar" | "config" | "voiceSample"
+        ) {
+            return Err("invalid_picker_mode".into());
         }
-    }
-
-    #[test]
-    fn avatar_and_camera_never_multi() {
-        assert!(!is_multi_pick("avatar", true, 9));
-        assert!(!is_multi_pick("camera", true, 9));
-    }
-
-    #[test]
-    fn gallery_and_file_multi_only_when_requested() {
-        assert!(is_multi_pick("gallery", true, 9));
-        assert!(is_multi_pick("file", true, 2));
-        assert!(!is_multi_pick("gallery", false, 9));
-        assert!(!is_multi_pick("file", true, 1));
-    }
-
-    #[test]
-    fn pick_limit_clamps() {
-        assert_eq!(MAX_PICK_FILES, 100);
-        assert_eq!(pick_limit(None), MAX_PICK_FILES);
-        assert_eq!(pick_limit(Some(0)), 1);
-        assert_eq!(pick_limit(Some(9)), 9);
-        assert_eq!(pick_limit(Some(999)), MAX_PICK_FILES);
-    }
-
-    #[test]
-    fn single_output_shape_unchanged() {
-        let value = serde_json::to_value(PickFileOutput::Single(info(None))).unwrap();
-        assert_eq!(
-            value,
-            serde_json::json!({"path":"p","name":"n","mime":"m","size":1,"hash":"h","thumbnailPath":null})
-        );
-    }
-
-    #[test]
-    fn multiple_output_carries_failed_and_skipped() {
-        let batch = PickedFileBatch {
-            files: vec![info(Some("t1"))],
-            failed: vec![
-                PickFailure {
-                    staging_ticket: "t2".into(),
-                    name: Some("b.png".into()),
-                    reason: "copy failed".into(),
-                },
-                PickFailure { staging_ticket: "t3".into(), name: None, reason: "io".into() },
-            ],
-            skipped: 2,
+        let max_files = if multiple.unwrap_or(false) && matches!(mode.as_str(), "file" | "gallery")
+        {
+            100
+        } else {
+            1
         };
-        let value = serde_json::to_value(PickFileOutput::Multiple(batch)).unwrap();
-        assert_eq!(value["files"][0]["stagingTicket"], "t1");
-        assert_eq!(
-            value["failed"][0],
-            serde_json::json!({"stagingTicket":"t2","name":"b.png","reason":"copy failed"})
-        );
-        assert_eq!(value["failed"][1], serde_json::json!({"stagingTicket":"t3","reason":"io"}));
-        assert_eq!(value["skipped"], 2);
+        let operation_id = operation_id.unwrap_or_else(native_operation_id);
+        validate_operation_id(&operation_id)?;
+        #[cfg(target_os = "ios")]
+        if reservation_token.as_deref().is_none_or(str::is_empty) {
+            return Err("cancelled: picker must be prepared before starting".into());
+        }
+        let max_bytes = max_bytes.unwrap_or(if mode == "config" {
+            1024 * 1024
+        } else {
+            512 * 1024 * 1024
+        });
+        if max_bytes == 0 || max_bytes > 512 * 1024 * 1024 {
+            return Err("invalid_file_budget".into());
+        }
+        let staging = app
+            .path()
+            .app_cache_dir()
+            .map_err(|e| e.to_string())?
+            .join("uploads");
+        let state = app.state::<VcpMobileState<R>>();
+        let plugin_handle = state.mobile_plugin_handle()?;
+        tauri::async_runtime::spawn_blocking(move || {
+            plugin_handle
+                .run_mobile_plugin::<PickFileResult>(
+                    "pickFile",
+                    serde_json::json!({
+                        "mode": mode, "operationId": operation_id,
+                        "stagingDir": staging, "maxBytes": max_bytes, "maxFiles": max_files,
+                        "reservationToken": reservation_token,
+                    }),
+                )
+                .map_err(|e| format!("native_picker: {e}"))
+        })
+        .await
+        .map_err(|e| format!("native_picker_worker: {e}"))?
     }
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    {
+        let _ = (
+            app,
+            mode,
+            operation_id,
+            max_bytes,
+            multiple,
+            reservation_token,
+        );
+        Err("文件选择仅在移动端可用".to_string())
+    }
+}
 
-    #[test]
-    fn native_batch_deserializes_with_defaults() {
-        let batch: PickedFileBatch = serde_json::from_value(serde_json::json!({
-            "files": [{"path":"p","name":"n","mime":"m","size":1,"hash":"h","thumbnailPath":null,"stagingTicket":"t1"}],
-            "failed": [{"stagingTicket":"t2","reason":"copy failed"}],
-            "skipped": 3
-        }))
-        .unwrap();
-        assert_eq!(batch.files[0].staging_ticket.as_deref(), Some("t1"));
-        assert_eq!(batch.failed[0].staging_ticket, "t2");
-        assert!(batch.failed[0].name.is_none());
-        assert_eq!(batch.skipped, 3);
+#[cfg(any(target_os = "android", target_os = "ios"))]
+fn native_operation_id() -> String {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    format!(
+        "native-{}-{}",
+        std::process::id(),
+        NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    )
+}
 
-        let minimal: PickedFileBatch =
-            serde_json::from_value(serde_json::json!({"files": []})).unwrap();
-        assert!(minimal.failed.is_empty());
-        assert_eq!(minimal.skipped, 0);
+#[cfg(any(target_os = "android", target_os = "ios"))]
+fn validate_operation_id(id: &str) -> Result<(), String> {
+    if id.is_empty()
+        || id.len() > 100
+        || !id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+    {
+        return Err("invalid_operation_id".into());
+    }
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn cancel_file_operation<R: Runtime>(
+    app: AppHandle<R>,
+    operation_id: String,
+) -> Result<(), String> {
+    #[cfg(any(target_os = "android", target_os = "ios"))]
+    {
+        validate_operation_id(&operation_id)?;
+        let handle = app.state::<VcpMobileState<R>>().mobile_plugin_handle()?;
+        tauri::async_runtime::spawn_blocking(move || {
+            handle
+                .run_mobile_plugin::<serde_json::Value>(
+                    "cancelFileOperation",
+                    serde_json::json!({"operationId":operation_id}),
+                )
+                .map(|_| ())
+                .map_err(|e| e.to_string())
+        })
+        .await
+        .map_err(|e| e.to_string())?
+    }
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    {
+        let _ = (app, operation_id);
+        Ok(())
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DerivedImageInfo {
+    pub path: String,
+    pub mime: String,
+    pub size: u64,
+    pub width: u32,
+    pub height: u32,
+}
+
+#[tauri::command]
+pub async fn get_webview_geometry<R: Runtime>(
+    app: AppHandle<R>,
+    sample_id: u64,
+    viewport_revision: u64,
+) -> Result<serde_json::Value, String> {
+    #[cfg(target_os = "ios")]
+    {
+        crate::ios::run_async(
+            app,
+            "getWebViewGeometry",
+            serde_json::json!({"sampleId":sample_id,"viewportRevision":viewport_revision}),
+        )
+        .await
+    }
+    #[cfg(not(target_os = "ios"))]
+    {
+        let _ = (app, sample_id, viewport_revision);
+        Err("WebView geometry sampling requires iOS".into())
+    }
+}
+
+pub fn clear_webview_cache_native<R: Runtime>(app: &AppHandle<R>) -> Result<(), String> {
+    #[cfg(target_os = "ios")]
+    {
+        crate::ios::run::<R, serde_json::Value>(
+            app.clone(),
+            "clearWebViewCache",
+            serde_json::json!({}),
+        )
+        .map(|_| ())
+    }
+    #[cfg(not(target_os = "ios"))]
+    {
+        let _ = app;
+        Err("This WebView cache adapter requires iOS".into())
+    }
+}
+
+/// Called from the file domain's serial blocking image worker.
+#[allow(clippy::too_many_arguments)]
+pub fn derive_image<R: Runtime>(
+    app: &AppHandle<R>,
+    source_path: &str,
+    output_path: &str,
+    max_dimension: u32,
+    max_pixels: u64,
+    max_bytes: u64,
+    quality: f64,
+    preserve_alpha: bool,
+) -> Result<DerivedImageInfo, String> {
+    #[cfg(any(target_os = "android", target_os = "ios"))]
+    {
+        app.state::<VcpMobileState<R>>().mobile_plugin_handle()?.run_mobile_plugin("deriveImage", serde_json::json!({
+            "sourcePath":source_path,"outputPath":output_path,"maxDimension":max_dimension,"maxPixels":max_pixels,"maxBytes":max_bytes,"quality":quality,"preserveAlpha":preserve_alpha
+        })).map_err(|e| e.to_string())
+    }
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    {
+        let _ = (
+            app,
+            source_path,
+            output_path,
+            max_dimension,
+            max_pixels,
+            max_bytes,
+            quality,
+            preserve_alpha,
+        );
+        Err("图像派生仅在移动端可用".into())
     }
 }
 
@@ -723,12 +850,20 @@ pub fn get_device_snapshot<R: Runtime>(app: AppHandle<R>) -> Result<DeviceSnapsh
     }
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NativeFileActionResult {
+    pub outcome: String,
+}
+
 #[tauri::command]
-pub fn open_file_native<R: Runtime>(
+pub async fn open_file_native<R: Runtime>(
     app: AppHandle<R>,
     path: String,
     action: Option<String>,
-) -> Result<(), String> {
+    operation_id: Option<String>,
+    file_name: Option<String>,
+) -> Result<NativeFileActionResult, String> {
     let action = action.unwrap_or_else(|| "view".to_string());
     if action != "view" && action != "share" {
         return Err("Unsupported native file action".to_string());
@@ -739,28 +874,32 @@ pub fn open_file_native<R: Runtime>(
         let state = app.state::<VcpMobileState<R>>();
         let plugin_handle = state.mobile_plugin_handle()?;
 
-        plugin_handle
-            .run_mobile_plugin::<serde_json::Value>(
-                "openFile",
-                serde_json::json!({ "path": path, "action": action }),
-            )
-            .map_err(|e| format!("run_mobile_plugin failed: {}", e))?;
+        tauri::async_runtime::spawn_blocking(move || {
+            plugin_handle
+                .run_mobile_plugin::<serde_json::Value>(
+                    "openFile",
+                    serde_json::json!({ "path": path, "action": action, "fileName":file_name }),
+                )
+                .map_err(|e| format!("run_mobile_plugin failed: {}", e))
+        })
+        .await
+        .map_err(|e| e.to_string())??;
+        let _ = operation_id;
+        Ok(NativeFileActionResult {
+            outcome: "opened".into(),
+        })
     }
     #[cfg(target_os = "ios")]
     {
-        let _ = (app, path);
-        if action == "share" {
-            return crate::ios_not_implemented("open_file_native.share");
-        }
-        crate::ios_not_implemented::<()>("open_file_native")?;
+        let operation_id = operation_id.unwrap_or_else(native_operation_id);
+        validate_operation_id(&operation_id)?;
+        crate::ios::run_async(app, "openFile", serde_json::json!({"path":path,"action":action,"operationId":operation_id,"fileName":file_name})).await
     }
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
     {
-        let _ = app;
-        let _ = path;
-        let _ = action;
+        let _ = (app, path, action, operation_id, file_name);
+        Err("原生文件操作仅在移动端可用".into())
     }
-    Ok(())
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -782,12 +921,12 @@ pub fn verify_apk_signature<R: Runtime>(
         let state = app.state::<VcpMobileState<R>>();
         let plugin_handle = state.mobile_plugin_handle()?;
 
-        return plugin_handle
+        plugin_handle
             .run_mobile_plugin::<ApkSignatureVerification>(
                 "verifyApkSignature",
                 serde_json::json!({ "path": path }),
             )
-            .map_err(|e| format!("run_mobile_plugin failed: {}", e));
+            .map_err(|e| format!("run_mobile_plugin failed: {}", e))
     }
     #[cfg(target_os = "ios")]
     {
@@ -811,12 +950,12 @@ pub fn can_install_packages<R: Runtime>(app: AppHandle<R>) -> Result<bool, Strin
         let plugin_handle = state.mobile_plugin_handle()?;
 
         let result = plugin_handle
-            .run_mobile_plugin::<serde_json::Value>("canInstallPackages", serde_json::json!({}))
+            .run_mobile_plugin::<InstallPackagesPermissionResult>(
+                "canInstallPackages",
+                serde_json::json!({}),
+            )
             .map_err(|e| format!("run_mobile_plugin failed: {}", e))?;
-        return Ok(result
-            .get("allowed")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false));
+        Ok(result.allowed)
     }
     #[cfg(target_os = "ios")]
     {
@@ -956,7 +1095,7 @@ pub struct GallerySaveResult {
     pub size: i32,
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn save_image_to_gallery<R: Runtime>(
     app: AppHandle<R>,
     source_url: String,
@@ -977,8 +1116,11 @@ pub fn save_image_to_gallery<R: Runtime>(
     }
     #[cfg(target_os = "ios")]
     {
-        let _ = (app, source_url, file_name);
-        crate::ios_not_implemented("save_image_to_gallery")
+        crate::ios::run(
+            app,
+            "saveImageToGallery",
+            serde_json::json!({"sourceUrl":source_url,"fileName":file_name}),
+        )
     }
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
     {
@@ -989,7 +1131,7 @@ pub fn save_image_to_gallery<R: Runtime>(
     }
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn save_image_from_path<R: Runtime>(
     app: AppHandle<R>,
     image_path: String,
@@ -1010,8 +1152,11 @@ pub fn save_image_from_path<R: Runtime>(
     }
     #[cfg(target_os = "ios")]
     {
-        let _ = (app, image_path, file_name);
-        crate::ios_not_implemented("save_image_from_path")
+        crate::ios::run(
+            app,
+            "saveImageFromPath",
+            serde_json::json!({"imagePath":image_path,"fileName":file_name}),
+        )
     }
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
     {
@@ -1031,15 +1176,67 @@ pub struct DownloadsSaveResult {
     pub size: i32,
 }
 
-#[tauri::command]
+/// Export an operation-owned file without routing its bytes through the WebView.
+/// The caller keeps the source alive until this completes and owns its cleanup.
+pub async fn save_file_to_downloads<R: Runtime>(
+    app: AppHandle<R>,
+    file_path: String,
+    file_name: String,
+    mime_type: Option<String>,
+    max_bytes: u64,
+) -> Result<DownloadsSaveResult, String> {
+    #[cfg(target_os = "android")]
+    {
+        if max_bytes == 0 || max_bytes > i32::MAX as u64 {
+            return Err("下载导出大小限制无效".to_string());
+        }
+        let state = app.state::<VcpMobileState<R>>();
+        let plugin_handle = state.mobile_plugin_handle()?;
+        tauri::async_runtime::spawn_blocking(move || {
+            plugin_handle
+                .run_mobile_plugin::<DownloadsSaveResult>(
+                    "saveFileToDownloads",
+                    serde_json::json!({
+                        "filePath": file_path,
+                        "fileName": file_name,
+                        "mimeType": mime_type,
+                        "maxBytes": max_bytes,
+                    }),
+                )
+                .map_err(|error| format!("run_mobile_plugin failed: {error}"))
+        })
+        .await
+        .map_err(|error| format!("downloads export worker failed: {error}"))?
+    }
+    #[cfg(target_os = "ios")]
+    {
+        crate::ios::run_async(app, "saveFileToDownloads", serde_json::json!({
+            "filePath":file_path,"fileName":file_name,"mimeType":mime_type,"maxBytes":max_bytes,"operationId":native_operation_id()
+        })).await
+    }
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    {
+        let _ = (app, file_path, file_name, mime_type, max_bytes);
+        Err("该接口仅在 Android 物理端可用".to_string())
+    }
+}
+
+#[tauri::command(async)]
 pub fn save_to_downloads<R: Runtime>(
     app: AppHandle<R>,
     file_name: String,
     content_base64: String,
     mime_type: Option<String>,
+    purpose: Option<String>,
+    operation_id: Option<String>,
+    reservation_token: Option<String>,
 ) -> Result<DownloadsSaveResult, String> {
+    if purpose.as_deref().is_some_and(|value| value != "config") {
+        return Err("invalid_export_purpose".into());
+    }
     #[cfg(target_os = "android")]
     {
+        let _ = (operation_id, reservation_token);
         let state = app.state::<VcpMobileState<R>>();
         let plugin_handle = state.mobile_plugin_handle()?;
 
@@ -1057,8 +1254,21 @@ pub fn save_to_downloads<R: Runtime>(
     }
     #[cfg(target_os = "ios")]
     {
-        let _ = (app, file_name, content_base64, mime_type);
-        crate::ios_not_implemented("save_to_downloads.files_export")
+        let operation_id = operation_id.unwrap_or_else(native_operation_id);
+        validate_operation_id(&operation_id)?;
+        if purpose.as_deref() == Some("config")
+            && reservation_token.as_deref().is_none_or(str::is_empty)
+        {
+            return Err("cancelled: config export must be prepared before starting".into());
+        }
+        crate::ios::run(
+            app,
+            "saveToDownloads",
+            serde_json::json!({
+                "fileName":file_name,"contentBase64":content_base64,"mimeType":mime_type,
+                "purpose":purpose,"operationId":operation_id,"reservationToken":reservation_token
+            }),
+        )
     }
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
     {
@@ -1066,17 +1276,18 @@ pub fn save_to_downloads<R: Runtime>(
         let _ = file_name;
         let _ = content_base64;
         let _ = mime_type;
+        let _ = (operation_id, reservation_token);
         Err("该接口仅在 Android 物理端可用".to_string())
     }
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn write_temp_file<R: Runtime>(
     app: AppHandle<R>,
     bytes: Vec<u8>,
     file_name: String,
 ) -> Result<String, String> {
-    #[cfg(target_os = "android")]
+    #[cfg(any(target_os = "android", target_os = "ios"))]
     {
         use tauri::Manager;
         if bytes.len() > TEMP_FILE_MAX_BYTES {
@@ -1098,11 +1309,6 @@ pub fn write_temp_file<R: Runtime>(
         std::fs::write(&temp_path, bytes).map_err(|e| e.to_string())?;
         Ok(temp_path.to_string_lossy().to_string())
     }
-    #[cfg(target_os = "ios")]
-    {
-        let _ = (app, bytes, file_name);
-        crate::ios_not_implemented("write_temp_file")
-    }
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
     {
         let _ = app;
@@ -1112,9 +1318,9 @@ pub fn write_temp_file<R: Runtime>(
     }
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn delete_temp_file<R: Runtime>(app: AppHandle<R>, file_path: String) -> Result<(), String> {
-    #[cfg(target_os = "android")]
+    #[cfg(any(target_os = "android", target_os = "ios"))]
     {
         use std::path::Path;
         let path = Path::new(&file_path);
@@ -1126,16 +1332,17 @@ pub fn delete_temp_file<R: Runtime>(app: AppHandle<R>, file_path: String) -> Res
         if !path.exists() {
             return Ok(());
         }
-        if !path.is_absolute() || !canonical_file_in(&temp_dir, path)? {
+        let uploads = app
+            .path()
+            .app_cache_dir()
+            .map_err(|e| e.to_string())?
+            .join("uploads");
+        let in_uploads = uploads.exists() && canonical_file_in(&uploads, path)?;
+        if !path.is_absolute() || (!canonical_file_in(&temp_dir, path)? && !in_uploads) {
             return Err("拒绝删除非 bridge staging 文件".to_string());
         }
         std::fs::remove_file(path).map_err(|e| e.to_string())?;
         Ok(())
-    }
-    #[cfg(target_os = "ios")]
-    {
-        let _ = (app, file_path);
-        crate::ios_not_implemented("delete_temp_file")
     }
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
     {
@@ -1221,32 +1428,6 @@ pub fn cancel_download_notification<R: Runtime>(app: AppHandle<R>) -> Result<(),
     {
         let _ = app;
         crate::ios_unsupported::<()>("cancel_download_notification")?;
-    }
-    #[cfg(not(any(target_os = "android", target_os = "ios")))]
-    {
-        let _ = app;
-    }
-    Ok(())
-}
-
-#[tauri::command]
-pub fn request_overlay_permission<R: Runtime>(app: AppHandle<R>) -> Result<(), String> {
-    #[cfg(target_os = "android")]
-    {
-        let state = app.state::<VcpMobileState<R>>();
-        let plugin_handle = state.mobile_plugin_handle()?;
-
-        plugin_handle
-            .run_mobile_plugin::<serde_json::Value>(
-                "requestOverlayPermission",
-                serde_json::json!({}),
-            )
-            .map_err(|e| format!("run_mobile_plugin failed: {}", e))?;
-    }
-    #[cfg(target_os = "ios")]
-    {
-        let _ = app;
-        crate::ios_unsupported::<()>("request_overlay_permission")?;
     }
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
     {
@@ -1375,39 +1556,6 @@ mod file_boundary_tests {
         assert_eq!(canonical_file_in(&root, &inside_file), Ok(true));
         assert_eq!(canonical_file_in(&root, &outside_file), Ok(false));
         let _ = fs::remove_dir_all(temp);
-    }
-}
-
-#[tauri::command]
-pub fn toggle_floating_ball<R: Runtime>(app: AppHandle<R>, show: bool) -> Result<bool, String> {
-    #[cfg(target_os = "android")]
-    {
-        let state = app.state::<VcpMobileState<R>>();
-        let plugin_handle = state.mobile_plugin_handle()?;
-
-        #[derive(Deserialize)]
-        struct ToggleResult {
-            success: bool,
-        }
-
-        let res = plugin_handle
-            .run_mobile_plugin::<ToggleResult>(
-                "toggleFloatingBall",
-                serde_json::json!({ "show": show }),
-            )
-            .map_err(|e| format!("run_mobile_plugin failed: {}", e))?;
-        Ok(res.success)
-    }
-    #[cfg(target_os = "ios")]
-    {
-        let _ = (app, show);
-        crate::ios_unsupported("toggle_floating_ball")
-    }
-    #[cfg(not(any(target_os = "android", target_os = "ios")))]
-    {
-        let _ = app;
-        let _ = show;
-        Ok(false)
     }
 }
 
@@ -1692,6 +1840,35 @@ pub fn send_notification_native<R: Runtime>(
     Ok(())
 }
 
+/// Called by the successful chat commit owner. UIKit decides whether this app
+/// is in the background before scheduling the local notification.
+#[cfg(target_os = "ios")]
+pub fn notify_committed_reply<R: Runtime>(
+    app: &AppHandle<R>,
+    owner_type: &str,
+    owner_id: &str,
+    topic_id: &str,
+    message_id: &str,
+    speaker_name: &str,
+) {
+    let app = app.clone();
+    let args = serde_json::json!({
+        "title": format!("{speaker_name} 已回复"),
+        "body": "点击查看这条回复。",
+        "reply": {
+            "ownerType": owner_type,
+            "ownerId": owner_id,
+            "topicId": topic_id,
+            "messageId": message_id,
+        },
+    });
+    tauri::async_runtime::spawn_blocking(move || {
+        if let Err(error) = crate::ios::run::<_, ()>(app, "sendLocalNotification", args) {
+            log::warn!("[iOS Chat] Could not deliver completed reply notification: {error}");
+        }
+    });
+}
+
 #[derive(Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LaunchRootManagerResult {
@@ -1830,60 +2007,47 @@ pub fn get_pending_notification<R: Runtime>(
     }
 }
 
-#[cfg(test)]
-mod device_result_tests {
-    use super::{BatteryStatus, NetworkStatus};
-    use serde_json::json;
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HapticFeedbackArgs {
+    pub r#type: String,
+    pub effect: Option<String>,
+    pub duration_ms: Option<u64>,
+    pub amplitude: Option<i32>,
+    pub intensity: Option<f64>,
+}
 
-    #[test]
-    fn battery_keeps_a_real_zero_distinct_from_an_unavailable_native_reading() {
-        let android: BatteryStatus = serde_json::from_value(json!({
-            "level": 0, "isPowerSaveMode": true,
-            "status": "未充电", "temperature": 23.5
-        }))
-        .unwrap();
-        assert_eq!(android.level, Some(0));
-        assert!(android.unavailable.is_empty());
+#[tauri::command(async)]
+pub fn trigger_haptic_feedback<R: Runtime>(
+    app: AppHandle<R>,
+    payload: HapticFeedbackArgs,
+) -> Result<serde_json::Value, String> {
+    #[cfg(target_os = "android")]
+    {
+        let state = app.state::<VcpMobileState<R>>();
+        let plugin_handle = state.mobile_plugin_handle()?;
 
-        // Swift synthesized Encodable omits nil fields. Rust's frontend result
-        // must still express an unknown reading as null, rather than 0 or 100.
-        let ios: BatteryStatus = serde_json::from_value(json!({
-            "isPowerSaveMode": false,
-            "unavailable": {"level": "系统尚未提供电量读数", "temperature": "iOS 未公开电池温度"}
-        }))
-        .unwrap();
-        assert_eq!(ios.level, None);
-        assert_eq!(ios.temperature, None);
-        let result = serde_json::to_value(ios).unwrap();
-        assert!(result["level"].is_null());
-        assert_eq!(result["unavailable"]["level"], "系统尚未提供电量读数");
+        plugin_handle
+            .run_mobile_plugin::<serde_json::Value>(
+                "triggerHapticFeedback",
+                serde_json::to_value(&payload).map_err(|e| e.to_string())?,
+            )
+            .map_err(|e| format!("run_mobile_plugin triggerHapticFeedback failed: {}", e))
     }
-
-    #[test]
-    fn network_path_without_speed_does_not_become_a_zero_speed_measurement() {
-        let android: NetworkStatus = serde_json::from_value(json!({
-            "connected": true, "type": "wifi", "downSpeedKbps": 0,
-            "upSpeedKbps": 1200, "ip": "192.168.1.2"
+    #[cfg(target_os = "ios")]
+    {
+        crate::ios::run(
+            app,
+            "triggerHapticFeedback",
+            serde_json::to_value(&payload).map_err(|error| error.to_string())?,
+        )
+    }
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    {
+        let _ = (app, payload);
+        Ok(serde_json::json!({
+            "submitted": false,
+            "reason": "host_mock"
         }))
-        .unwrap();
-        assert_eq!(android.down_speed_kbps, Some(0));
-        assert_eq!(android.up_speed_kbps, Some(1200));
-        assert_eq!(android.ip.as_deref(), Some("192.168.1.2"));
-
-        let ios: NetworkStatus = serde_json::from_value(json!({
-            "connected": true, "type": "Wi-Fi", "isExpensive": false,
-            "isConstrained": true, "unavailable": {
-                "downSpeedKbps": "NWPath 不提供链路下行速率",
-                "ip": "未取得活动接口地址"
-            }
-        }))
-        .unwrap();
-        assert!(ios.connected);
-        assert_eq!(ios.down_speed_kbps, None);
-        assert_eq!(ios.ip, None);
-        assert_eq!(ios.is_constrained, Some(true));
-        let result = serde_json::to_value(ios).unwrap();
-        assert!(result["downSpeedKbps"].is_null());
-        assert_eq!(result["unavailable"]["ip"], "未取得活动接口地址");
     }
 }

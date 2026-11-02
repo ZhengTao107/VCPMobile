@@ -5,6 +5,15 @@ import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { useDataReload } from "../composables/useDataReload";
 import { waitUntil } from "../sync/autoSyncTrigger";
 import { useNotificationStore } from "./notification";
+import { useOverlayStore } from "./overlay";
+import { useAssistantStore } from "./assistant";
+import { useChatSessionStore } from "./chatSessionStore";
+import { useSettingsStore } from "./settings";
+import {
+  clearStagedEntityBackup,
+  readStagedEntityBackup,
+  writeStagedEntityBackup,
+} from "../../features/settings/useConfigBackup";
 import { isAndroid, isIOS } from "../utils/platform";
 import type { BatteryStatusDto } from "../types/native";
 import { createSyncForegroundNotice, formatSyncBatchNoticeLabel, formatSyncNoticeLabel } from "../sync/syncForegroundNotice";
@@ -31,6 +40,12 @@ interface SyncSummary {
 interface DesktopSyncInfo {
   packageVersion: string;
   backendMode: "legacy" | "cds";
+}
+
+interface SyncTransferSnapshot {
+  uploadedBytes: number;
+  downloadedBytes: number;
+  activeDurationMs: number;
 }
 
 interface SyncTerminalError {
@@ -70,7 +85,7 @@ interface SyncTerminalError {
 }
 
 type BufferedSessionEvent = {
-  kind: "status" | "progress" | "completed" | "log";
+  kind: "status" | "progress" | "completed" | "log" | "transfer";
   payload: Record<string, unknown>;
 };
 
@@ -327,7 +342,10 @@ const parseCommandError = (
         JSON.parse(raw.slice(markerIndex + marker.length)),
       );
       if (parsed) return parsed;
-    } catch {}
+    } catch {
+      // A malformed structured suffix still belongs to the original command error.
+      // Fall back to that complete message below instead of losing the failure.
+    }
   }
   return localTerminalError(fallbackCode, raw);
 };
@@ -361,6 +379,65 @@ const emptySummary = (): SyncSummary => ({
   failedTopicIds: [],
 });
 
+export async function checkAndPromptPendingConfigRestore(): Promise<boolean> {
+  const staged = readStagedEntityBackup();
+  if (!staged) return false;
+
+  const assistantStore = useAssistantStore();
+  const totalEntities = assistantStore.agents.length + assistantStore.groups.length;
+  if (totalEntities === 0) {
+    return false;
+  }
+
+  const confirmed = await useOverlayStore().showConfirm({
+    title: '发现待生效的实体配置',
+    message: '检测到您之前导入了智能体与群组的本地偏好（提示词、温度、音色、运行模式等），是否立即应用到刚同步的数据？',
+  });
+
+  if (confirmed) {
+    const settingsStore = useSettingsStore();
+    // Entity-only restoration has no configuration-domain patches or revisions.
+    const { result, missingGroups, missingAgents } = await settingsStore.importBackup(
+      { patches: [] },
+      staged.groupPreferences ?? {},
+      staged.agentPreferences ?? {},
+    );
+    if (result.status !== 'saved') {
+      const issues = result.status === 'rejected' ? result.issues : result.conflicts;
+      throw new Error(issues.map(issue => `${issue.domain}.${issue.field}: ${issue.message}`).join('\n'));
+    }
+
+    const hasMissing = missingGroups || missingAgents;
+    if (hasMissing) {
+      // Rust reports missing entities per category, not per ID. Keep those
+      // categories pending without extending the original backup's TTL.
+      writeStagedEntityBackup({
+        groupPreferences: missingGroups ? staged.groupPreferences : undefined,
+        agentPreferences: missingAgents ? staged.agentPreferences : undefined,
+      }, staged.timestamp);
+    } else {
+      clearStagedEntityBackup();
+    }
+    try {
+      await assistantStore.fetchAgentsAndGroups();
+      useChatSessionStore().reconcileCurrentConversation();
+    } catch {
+      // ignore
+    }
+    useNotificationStore().addNotification({
+      type: hasMissing ? 'info' : 'success',
+      title: hasMissing ? '仍有配置待恢复' : '配置已恢复',
+      message: hasMissing
+        ? '已应用本机现有实体的偏好；仍有智能体或群聊尚未同步，相关配置已保留，待后续同步后继续恢复'
+        : '已成功应用智能体与群组的本地偏好',
+      toastOnly: true,
+    });
+    return true;
+  }
+
+  return false;
+}
+
 export const useSyncSessionStore = defineStore("syncSession", () => {
   // --- 视图状态 ---
   const isOpen = ref(false);
@@ -372,6 +449,7 @@ export const useSyncSessionStore = defineStore("syncSession", () => {
   const summary = ref<SyncSummary>(emptySummary());
   const terminalError = ref<SyncTerminalError | null>(null);
   const desktopInfo = ref<DesktopSyncInfo | null>(null);
+  const transfer = ref<SyncTransferSnapshot | null>(null);
   const retryInFlight = ref(false);
 
   // --- 面板视图 ---
@@ -444,6 +522,7 @@ export const useSyncSessionStore = defineStore("syncSession", () => {
     summary.value = emptySummary();
     terminalError.value = null;
     desktopInfo.value = null;
+    transfer.value = null;
     retryInFlight.value = false;
     awaitingSessionId = false;
     bufferedSessionEvents = [];
@@ -499,6 +578,11 @@ export const useSyncSessionStore = defineStore("syncSession", () => {
             ));
           if (!incremental) await reload.performFullReload();
           needsReload.value = false;
+          try {
+            await checkAndPromptPendingConfigRestore();
+          } catch (restoreError) {
+            console.warn('[SyncSession] checkAndPromptPendingConfigRestore failed:', restoreError);
+          }
         } catch (error) {
           console.error("[SyncSession] Failed to reload synchronized data:", error);
           if (!quietRun) useNotificationStore().addNotification({
@@ -523,6 +607,7 @@ export const useSyncSessionStore = defineStore("syncSession", () => {
     const generation = viewGeneration;
     const attempt = ++startAttempt;
 
+    transfer.value = null;
     if (!preserveLogs) logs.value = [];
     progressData.value = {
       phase: "initialization",
@@ -888,6 +973,30 @@ export const useSyncSessionStore = defineStore("syncSession", () => {
     };
   };
 
+  const applyTransferSnapshot = (value: unknown) => {
+    if (!value || typeof value !== "object" || Array.isArray(value)) return;
+    const { uploadedBytes, downloadedBytes, activeDurationMs } = value as Record<string, unknown>;
+    if (
+      typeof uploadedBytes !== "number" ||
+      !Number.isSafeInteger(uploadedBytes) || uploadedBytes < 0 ||
+      typeof downloadedBytes !== "number" ||
+      !Number.isSafeInteger(downloadedBytes) || downloadedBytes < 0 ||
+      typeof activeDurationMs !== "number" ||
+      !Number.isFinite(activeDurationMs) || activeDurationMs < 0
+    ) {
+      return;
+    }
+    const previous = transfer.value;
+    if (previous && (
+      uploadedBytes < previous.uploadedBytes ||
+      downloadedBytes < previous.downloadedBytes ||
+      activeDurationMs < previous.activeDurationMs
+    )) {
+      return;
+    }
+    transfer.value = { uploadedBytes, downloadedBytes, activeDurationMs };
+  };
+
   const readProgressSummary = (
     payload: Record<string, unknown>,
   ): Omit<SyncSummary, "failedTopicIds"> | null => {
@@ -954,6 +1063,11 @@ export const useSyncSessionStore = defineStore("syncSession", () => {
     kind: BufferedSessionEvent["kind"],
     payload: Record<string, unknown>,
   ) => {
+    if (kind === "transfer") {
+      if (!isTerminal()) applyTransferSnapshot(payload);
+      return;
+    }
+
     if (kind === "log") {
       if (
         payload.audience === "operator" &&
@@ -1045,6 +1159,7 @@ export const useSyncSessionStore = defineStore("syncSession", () => {
         ) {
           return;
         }
+        if (!isTerminal()) applyTransferSnapshot(payload.transfer);
         terminalError.value = readTerminalError(payload);
         pushLog("error", terminalError.value.message);
         const failedTopics = Math.max(
@@ -1086,6 +1201,7 @@ export const useSyncSessionStore = defineStore("syncSession", () => {
         nextStatus === "completed" ||
         nextStatus === "completed_with_warnings"
       ) {
+        applyTransferSnapshot(payload.transfer);
         // The completed event carries the mandatory summary and is the only
         // authoritative success transition. A status-only terminal frame cannot
         // manufacture success or bypass summary validation.
@@ -1130,6 +1246,7 @@ export const useSyncSessionStore = defineStore("syncSession", () => {
       );
       return;
     }
+    if (!isTerminal()) applyTransferSnapshot(payload.transfer);
     summary.value = completedSummary;
     noChangeConfirmed = !changeSignalSeen && completedSummary.totalTopics === 0;
     status.value = payload.status;
@@ -1195,6 +1312,10 @@ export const useSyncSessionStore = defineStore("syncSession", () => {
         routeSessionEvent("progress", payload),
       ),
 
+      registerListener(generation, "vcp-sync-transfer", (payload) =>
+        routeSessionEvent("transfer", payload),
+      ),
+
       registerListener(generation, "vcp-sync-status", (payload) =>
         routeSessionEvent("status", payload),
       ),
@@ -1235,6 +1356,7 @@ export const useSyncSessionStore = defineStore("syncSession", () => {
     summary,
     terminalError,
     desktopInfo,
+    transfer,
     retryInFlight,
     needsReload,
     logs,
@@ -1248,5 +1370,6 @@ export const useSyncSessionStore = defineStore("syncSession", () => {
     retrySync,
     runAutoSync,
     switchTab,
+    checkAndPromptPendingConfigRestore,
   };
 });

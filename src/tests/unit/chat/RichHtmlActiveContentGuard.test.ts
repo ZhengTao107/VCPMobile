@@ -1,17 +1,10 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { mount } from '@vue/test-utils';
 import { createPinia, setActivePinia } from 'pinia';
+import { marked } from 'marked';
 import ToolBlock from '@/features/chat/blocks/ToolBlock.vue';
 import HtmlPreviewBlock from '@/features/chat/blocks/HtmlPreviewBlock.vue';
-import AssistantMessageCard from '@/features/assistant/AssistantMessageCard.vue';
 import RagPayloadDetail from '@/features/rag/RagPayloadDetail.vue';
-import { router } from '@/core/router';
-import appSource from '@/App.vue?raw';
-import appLifecycleSource from '@/core/composables/useAppLifecycle.ts?raw';
-import viteConfigSource from '../../../../vite.config.ts?raw';
-import defaultCapability from '../../../../src-tauri/capabilities/default.json';
-import commandsSource from '../../../../src-tauri/src/commands.rs?raw';
-import lifecycleManagerSource from '../../../../src-tauri/src/vcp_modules/infra/lifecycle_manager.rs?raw';
 import {
   clearHtmlCache,
   filterTrustedRichHtml,
@@ -205,46 +198,54 @@ describe('trusted-circle rich HTML active-content guard', () => {
     expect(invokeMock).not.toHaveBeenCalled();
   });
 
-  it('applies the same rich-HTML guard to dormant assistant cards and reachable RAG details', () => {
+  it('keeps the tool HTML guard when Markdown parsing fails', () => {
+    const parse = vi.spyOn(marked, 'parse').mockImplementation(() => {
+      throw new Error('Markdown parser failed');
+    });
+    const log = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const block: ContentBlock = {
+      type: 'tool-result',
+      tool_name: 'ParseFailure',
+      status: 'success',
+      details: [{
+        key: 'result',
+        value: `<section data-parse-fallback onclick="this.hidden=true"><b>kept on parse failure</b><img src="x" onerror="${HOST_HANDLER}"><script>${HOST_HANDLER}</script></section>`,
+      }],
+      footer: '',
+    };
+    let wrapper: ReturnType<typeof mount> | undefined;
+    try {
+      wrapper = mount(ToolBlock, {
+        props: { type: 'tool-result', block, defaultExpanded: true },
+      });
+      const rendered = wrapper.get('.vcp-markdown-block').element;
+      expect(parse).toHaveBeenCalled();
+      expect(rendered.querySelector('b')?.textContent).toBe('kept on parse failure');
+      expect(rendered.querySelector('[data-parse-fallback]')?.getAttribute('onclick')).toBe('this.hidden=true');
+      expectHostCapabilityBlocked(rendered);
+    } finally {
+      wrapper?.unmount();
+      parse.mockRestore();
+      log.mockRestore();
+    }
+  });
+
+  it('applies the rich-HTML guard to RAG details', () => {
     const richPayload = `## Rich payload
 
 <custom-panel id="local-panel" onclick="this.classList.toggle('active')">
   <img src="x" onerror="${HOST_HANDLER}">
   <script>${HOST_HANDLER}</script>
 </custom-panel>`;
-    const assistant = mount(AssistantMessageCard, {
-      props: {
-        message: {
-          id: 'dormant-assistant-message',
-          role: 'assistant',
-          content: richPayload,
-          timestamp: 0,
-        },
-      },
-    });
     const rag = mount(RagPayloadDetail, {
       props: { text: richPayload },
     });
 
-    for (const host of [assistant.element, rag.element]) {
-      expect(host.querySelector('h2')?.textContent).toBe('Rich payload');
-      expect(host.querySelector('#local-panel')?.getAttribute('onclick'))
-        .toBe("this.classList.toggle('active')");
-      expectHostCapabilityBlocked(host);
-    }
-  });
-
-  it('keeps the dormant assistant source out of runtime and production build entry points', () => {
-    expect(router.getRoutes().some((route) => route.path === '/assistant')).toBe(false);
-    expect(router.getRoutes().some((route) => route.name === 'assistant')).toBe(false);
-    expect(appSource).not.toContain('vcp-floating-ball-click');
-    expect(appSource).not.toContain('new WebviewWindow');
-    expect(appSource).not.toContain('mode=floating');
-    expect(appLifecycleSource).not.toContain('mode=floating');
-    expect(viteConfigSource).not.toMatch(/floating\s*:\s*["']floating\.html["']/);
-    expect(defaultCapability.windows).not.toContain('assistant');
-    expect(commandsSource).not.toContain('reconcile_local_server_cmd');
-    expect(lifecycleManagerSource).not.toContain('reconcile_local_server(&handle');
+    const host = rag.element;
+    expect(host.querySelector('h2')?.textContent).toBe('Rich payload');
+    expect(host.querySelector('#local-panel')?.getAttribute('onclick'))
+      .toBe("this.classList.toggle('active')");
+    expectHostCapabilityBlocked(host);
   });
 
   it('keeps unrestricted scripts inside the existing sandboxed HTML Preview', async () => {

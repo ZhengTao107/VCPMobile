@@ -7,7 +7,9 @@ import { useChatSessionStore } from "../../core/stores/chatSessionStore";
 import { useLayoutStore } from "../../core/stores/layout";
 import { useOverlayStore } from "../../core/stores/overlay";
 import { useNotificationStore } from "../../core/stores/notification";
-import { Edit3, Lock, LockOpen, CheckCircle, Trash2, Copy, Pin, PinOff } from "lucide-vue-next";
+import { allowChatMutation, chatMutationBlockReason } from "../chat/chatMutationPolicy";
+import type { OverlayActionItem } from "../../core/types/overlay";
+import { Edit3, Lock, LockOpen, CheckCircle, Trash2, Copy, Pin, PinOff } from "@lucide/vue";
 
 const emit = defineEmits<{
   (e: "select-topic"): void;
@@ -84,7 +86,8 @@ const showTopicContextMenu = (topicId: string) => {
   const itemId = topic.ownerId;
   const ownerType = topic.ownerType;
 
-  const menuItems: any[] = [
+  const mutationScope = { ownerId: itemId, ownerType, topicId: topic.id };
+  const menuItems: OverlayActionItem[] = [
     {
       label: "修改标题",
       icon: Edit3,
@@ -160,7 +163,9 @@ const showTopicContextMenu = (topicId: string) => {
     label: "删除话题",
     icon: Trash2,
     danger: true,
+    get disabled() { return chatMutationBlockReason(mutationScope) !== null; },
     handler: async () => {
+      if (!allowChatMutation(mutationScope)) return;
       const confirm1 = await overlayStore.showConfirm({
         title: "删除话题",
         message: `确定要删除话题 "${topic.name}" 吗？此操作不可逆转。`,
@@ -173,7 +178,7 @@ const showTopicContextMenu = (topicId: string) => {
           isDanger: true
         });
         if (confirm2) {
-          topicListStore.deleteTopic(itemId, ownerType, topic.id);
+          await topicListStore.deleteTopic(itemId, ownerType, topic.id);
         }
       }
     },
@@ -208,21 +213,32 @@ watch(
   { immediate: true },
 );
 
+let disposed = false;
+let pendingIntent: number | null = null;
+
 const selectTopic = async (
   itemId: string,
   ownerType: "agent" | "group",
   topicId: string,
 ) => {
-  if (router.currentRoute.value.path !== "/chat") {
-    await router.push("/chat");
+  const intent = sessionStore.beginNavigation();
+  pendingIntent = intent;
+  const isCurrent = () => !disposed && sessionStore.isNavigationCurrent(intent);
+  try {
+    const result = await sessionStore.selectTopicById(itemId, ownerType, topicId, intent);
+    if (!isCurrent()) return;
+    if (result !== "accepted") {
+      sessionStore.notifyNavigationResult(result);
+      return;
+    }
+    layoutStore.setLeftDrawer(false);
+    if (router.currentRoute.value.path !== "/chat") await router.push("/chat");
+    if (isCurrent()) emit("select-topic");
+  } catch (error) {
+    if (isCurrent()) notificationStore.addNotification({ type: 'error', title: '打开话题失败', message: String(error), toastOnly: true });
+  } finally {
+    if (pendingIntent === intent) pendingIntent = null;
   }
-
-  await sessionStore.selectTopicById(itemId, ownerType, topicId);
-
-  // 在移动端，选择话题后自动关闭侧边栏
-  layoutStore.setLeftDrawer(false);
-
-  emit("select-topic");
 };
 
 // 话题搜索逻辑集成
@@ -241,6 +257,8 @@ watch(
 );
 
 onUnmounted(() => {
+  disposed = true;
+  if (pendingIntent !== null && sessionStore.isNavigationCurrent(pendingIntent)) sessionStore.beginNavigation();
   topicListStore.searchTerm = "";
 });
 </script>

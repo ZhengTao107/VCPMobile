@@ -3,6 +3,7 @@ import { computed, ref, shallowRef } from "vue";
 import { invoke } from "@tauri-apps/api/core";
 import { useAvatarStore } from "./avatar";
 import { useNotificationStore } from "./notification";
+import { allowChatMutation, notifyCallDeletionBlocked } from "../../features/chat/chatMutationPolicy";
 import type {
   AgentConfigDto,
   AgentListItemDto,
@@ -106,6 +107,7 @@ export const useAssistantStore = defineStore("assistant", () => {
   };
 
   const deleteAgent = async (id: string) => {
+    if (!allowChatMutation({ ownerId: id, ownerType: "agent" })) return false;
     try {
       await invoke("delete_agent", { agentId: id });
       invalidateSnapshotLoads();
@@ -121,7 +123,9 @@ export const useAssistantStore = defineStore("assistant", () => {
         message: "助手已从列表中移除",
         toastOnly: true,
       });
+      return true;
     } catch (e: any) {
+      if (notifyCallDeletionBlocked(e)) return false;
       console.error("[AssistantStore] Failed to delete agent:", e);
       throw e;
     }
@@ -134,7 +138,7 @@ export const useAssistantStore = defineStore("assistant", () => {
       invalidateSnapshotLoads();
       notificationStore.addNotification({
         type: "success",
-        title: "Group 创建成功",
+        title: "群组已创建",
         message: `群组 "${name}" 已创建`,
         toastOnly: true,
       });
@@ -149,6 +153,7 @@ export const useAssistantStore = defineStore("assistant", () => {
   };
 
   const deleteGroup = async (id: string) => {
+    if (!allowChatMutation({ ownerId: id, ownerType: "group" })) return false;
     try {
       await invoke("delete_group", { groupId: id });
       invalidateSnapshotLoads();
@@ -156,19 +161,21 @@ export const useAssistantStore = defineStore("assistant", () => {
       groups.value = groups.value.filter((g) => g.id !== id);
       notificationStore.addNotification({
         type: "success",
-        title: "Group 删除成功",
+        title: "群组已解散",
         message: "群组已解散",
         toastOnly: true,
       });
+      return true;
     } catch (e: any) {
+      if (notifyCallDeletionBlocked(e)) return false;
       console.error("[AssistantStore] Failed to delete group:", e);
       throw e;
     }
   };
 
-  const saveAgent = async (agent: AgentConfigDto) => {
+  const saveAgent = async (agent: AgentConfigDto, baseline: AgentConfigDto): Promise<AgentConfigDto> => {
     try {
-      await invoke("save_agent_config", { agent });
+      const canonical = await invoke<AgentConfigDto>("save_agent_config", { agent, baseline });
       invalidateSnapshotLoads();
       
       // 点对点局部更新（仅更新轻量列表渲染字段，防止大提示词等字段污染全局列表轻量缓存）
@@ -177,9 +184,9 @@ export const useAssistantStore = defineStore("assistant", () => {
         const updated = [...agents.value];
         updated[index] = {
           ...updated[index],
-          name: agent.name,
-          model: agent.model,
-          avatarCalculatedColor: agent.avatarCalculatedColor || updated[index].avatarCalculatedColor,
+          name: canonical.name,
+          model: canonical.model,
+          avatarCalculatedColor: canonical.avatarCalculatedColor,
         };
         agents.value = updated;
       }
@@ -190,15 +197,28 @@ export const useAssistantStore = defineStore("assistant", () => {
         message: "助手的最新设置已同步到核心",
         toastOnly: true,
       });
+      return canonical;
     } catch (e: any) {
       error.value = e.toString();
       throw e;
     }
   };
 
-  const saveGroup = async (group: GroupConfigDto) => {
+  const saveGroup = async (group: GroupConfigDto, baseline?: GroupConfigDto) => {
     try {
-      const canonical = await invoke<GroupConfigDto>("save_group_config", { group });
+      // A local behavior edit must not write back shared fields captured before
+      // a concurrent sync. Send only the fields this editor actually changed.
+      const editableFields = [
+        "name", "members", "memberTags", "groupPrompt", "invitePrompt",
+        "useUnifiedModel", "unifiedModel", "tagMatchMode", "chatMode",
+        "modeSettings", "enableContextMessageWindow", "contextMessageWindowSize",
+      ] as const;
+      const updates = baseline ? Object.fromEntries(editableFields
+        .filter(field => JSON.stringify(group[field]) !== JSON.stringify(baseline[field]))
+        .map(field => [field, group[field]])) : undefined;
+      const canonical = baseline
+        ? await invoke<GroupConfigDto>("update_group_config", { groupId: group.id, updates })
+        : await invoke<GroupConfigDto>("save_group_config", { group });
       invalidateSnapshotLoads();
 
       // 点对点局部更新（仅更新轻量列表渲染字段）
@@ -209,8 +229,8 @@ export const useAssistantStore = defineStore("assistant", () => {
           ...updated[index],
           name: canonical.name,
           members: canonical.members,
-          // mode 被邀请横条与 @提及 选择器消费，必须随保存同步
-          mode: canonical.mode,
+          // 群聊模式独立保存，同步的 mode 不参与运行或列表呈现。
+          mode: canonical.chatMode,
           avatarCalculatedColor: canonical.avatarCalculatedColor || updated[index].avatarCalculatedColor,
         };
         groups.value = updated;
@@ -218,7 +238,7 @@ export const useAssistantStore = defineStore("assistant", () => {
 
       notificationStore.addNotification({
         type: "success",
-        title: "Group 配置保存成功",
+        title: "群组设置已保存",
         message: "群组设置已更新",
         toastOnly: true,
       });
@@ -239,7 +259,7 @@ export const useAssistantStore = defineStore("assistant", () => {
       });
       await avatarStore.refreshAvatar(ownerType, ownerId, hash);
       
-      const label = ownerType === 'agent' ? 'Agent' : ownerType === 'group' ? 'Group' : '用户';
+      const label = ownerType === 'agent' ? 'Agent' : ownerType === 'group' ? '群组' : '用户';
       notificationStore.addNotification({
         type: "success",
         title: `${label} 头像更新成功`,
@@ -250,7 +270,7 @@ export const useAssistantStore = defineStore("assistant", () => {
       return hash;
     } catch (e: any) {
       console.error(`[AssistantStore] Failed to save avatar for ${ownerType}:`, e);
-      const label = ownerType === 'agent' ? 'Agent' : ownerType === 'group' ? 'Group' : '用户';
+      const label = ownerType === 'agent' ? 'Agent' : ownerType === 'group' ? '群组' : '用户';
       notificationStore.addNotification({
         type: "error",
         title: `${label} 头像更新失败`,

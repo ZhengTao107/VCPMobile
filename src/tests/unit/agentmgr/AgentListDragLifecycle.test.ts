@@ -1,9 +1,31 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
-import { mount } from "@vue/test-utils";
-import { createPinia, setActivePinia } from "pinia";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { flushPromises, mount } from "@vue/test-utils";
+import { createPinia, disposePinia, setActivePinia, type Pinia } from "pinia";
+import { invoke } from "@tauri-apps/api/core";
 
 import AgentList from "@/features/agent/AgentList.vue";
 import { useAssistantStore } from "@/core/stores/assistant";
+import { useChatStreamStore } from "@/core/stores/chatStreamStore";
+import { useSettingsStore } from "@/core/stores/settings";
+import type { StreamEventDto } from "@/core/types/chat";
+import type { ConfigUpdate } from "@/core/config/generated/config";
+import { applyConfigRequest, makeConfigSnapshot } from '../../helpers/config';
+import { mockInvoke } from '../../mocks/tauri';
+
+const streamEvent = (partial: Partial<StreamEventDto> & Pick<StreamEventDto, "type">): StreamEventDto => ({
+  messageId: "",
+  chunk: null,
+  content: null,
+  finishReason: null,
+  error: null,
+  aurora: null,
+  blocks: null,
+  timestamp: null,
+  topicUpdatedAt: null,
+  consumerRevision: 1,
+  context: null,
+  ...partial,
+});
 
 const sortableHarness = vi.hoisted(() => ({
   create: vi.fn(),
@@ -18,8 +40,10 @@ vi.mock("sortablejs", () => ({
 }));
 
 describe("AgentList drag lifecycle", () => {
+  let pinia: Pinia;
   beforeEach(() => {
-    setActivePinia(createPinia());
+    pinia = createPinia();
+    setActivePinia(pinia);
     sortableHarness.instances.length = 0;
     sortableHarness.create.mockReset();
     sortableHarness.create.mockImplementation(() => {
@@ -30,6 +54,56 @@ describe("AgentList drag lifecycle", () => {
       sortableHarness.instances.push(instance);
       return instance;
     });
+  });
+
+  afterEach(() => {
+    disposePinia(pinia);
+    vi.useRealTimers();
+  });
+
+  it('keeps the final visible order and pending save across a sidebar tab unmount', async () => {
+    vi.useFakeTimers();
+    let snapshot = makeConfigSnapshot();
+    const requests: ConfigUpdate[] = [];
+    mockInvoke('read_settings', () => snapshot);
+    mockInvoke('update_settings', args => {
+      const request = args!.request as ConfigUpdate;
+      requests.push(request);
+      snapshot = applyConfigRequest(snapshot, request);
+      return { status: 'saved', snapshot };
+    });
+    await useSettingsStore().fetchSettings();
+    useAssistantStore().agents = ['a', 'b', 'c'].map(id => ({ id, name: id, model: 'test', avatarCalculatedColor: null }));
+    const render = () => mount(AgentList, {
+      props: { searchQuery: '' },
+      global: { stubs: { VcpAvatar: true }, directives: { guide: {} } },
+    });
+    const wrapper = render();
+    await flushPromises();
+    const [list, handlers] = sortableHarness.create.mock.calls[0];
+    const move = async (from: number, to: number) => {
+      const item = list.children[from];
+      item.remove();
+      list.insertBefore(item, list.children[to] ?? null);
+      handlers.onEnd({ from: list, item, oldIndex: from, newIndex: to });
+      await wrapper.vm.$nextTick();
+    };
+    const visible = () => Array.from(list.children, child => (child as HTMLElement).dataset.ownerId);
+    await move(0, 1);
+    expect(visible()).toEqual(['b', 'a', 'c']);
+    await vi.advanceTimersByTimeAsync(200);
+    await move(2, 1);
+    expect(visible()).toEqual(['b', 'c', 'a']);
+    wrapper.unmount();
+    const reopened = render();
+    await flushPromises();
+    expect(reopened.findAll('[data-owner-id]').map(row => row.attributes('data-owner-id'))).toEqual(['b', 'c', 'a']);
+    await vi.advanceTimersByTimeAsync(299);
+    expect(requests).toHaveLength(0);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(requests).toHaveLength(1);
+    expect(requests[0].patches[0].changes).toEqual({ agentOrder: ['b', 'c', 'a'] });
+    reopened.unmount();
   });
 
   it("rebinds Sortable when a loading refresh replaces the list DOM", async () => {
@@ -67,5 +141,119 @@ describe("AgentList drag lifecycle", () => {
 
     wrapper.unmount();
     expect(reboundInstance.destroy).toHaveBeenCalledTimes(1);
+  });
+
+  it("projects cross-topic generation and group turns onto sidebar avatar slots without false positives before inventory recovery", async () => {
+    vi.mocked(invoke).mockImplementation(async (cmd) => {
+      if (cmd === "get_unread_counts") return {};
+      if (cmd === "increment_topic_unread_count") return { unreadCount: 1, updatedAt: 1 };
+      return undefined;
+    });
+    const assistantStore = useAssistantStore();
+    const streamStore = useChatStreamStore();
+    assistantStore.agents = [
+      { id: "agent-a", name: "Agent A", model: "m1", avatarCalculatedColor: null },
+      { id: "agent-b", name: "Agent B", model: "m2", avatarCalculatedColor: null },
+    ];
+    assistantStore.groups = [
+      { id: "group-1", name: "Group 1", members: ["agent-a", "agent-b"], mode: "sequential", avatarCalculatedColor: null },
+    ];
+
+    const wrapper = mount(AgentList, {
+      props: { searchQuery: "" },
+      global: {
+        stubs: { VcpAvatar: true },
+        directives: { guide: {} },
+      },
+    });
+
+    const getSlots = () => wrapper.findAll(".vcp-sidebar-avatar-slot");
+    // 初始未恢复完成 (activityInventoryKnown === false) 时，绝不误判为正在生成
+    expect(streamStore.activityInventoryKnown).toBe(false);
+    expect(getSlots().map((s) => s.attributes("data-generating"))).toEqual([
+      "false", // group-1
+      "false", // agent-a
+      "false", // agent-b
+    ]);
+
+    // 1. 多话题汇总：agent-a 的 topic-1 与 topic-2 同时活动，一个结束不熄灭另一个
+    const releaseOp = streamStore.beginConversationOperation("agent-a", "agent", "topic-1");
+    await wrapper.vm.$nextTick();
+    expect(getSlots().map((s) => s.attributes("data-generating"))).toEqual([
+      "false",
+      "true",
+      "false",
+    ]);
+
+    await streamStore.processStreamEvent(streamEvent({
+      type: "thinking",
+      messageId: "msg-2",
+      consumerRevision: 1,
+      context: { ownerId: "agent-a", ownerType: "agent", topicId: "topic-2" },
+    }));
+    releaseOp();
+    await wrapper.vm.$nextTick();
+    expect(streamStore.isOwnerGenerating("agent-a", "agent")).toBe(true);
+
+    // 可恢复中断 waiting_retry 时暂停生成态指示；重连恢复时重新点亮
+    await streamStore.processStreamEvent(streamEvent({
+      type: "error",
+      messageId: "msg-2",
+      consumerRevision: 2,
+      error: "network blip",
+      context: { ownerId: "agent-a", ownerType: "agent", topicId: "topic-2" },
+    }));
+    await wrapper.vm.$nextTick();
+    expect(streamStore.isOwnerGenerating("agent-a", "agent")).toBe(false);
+
+    await streamStore.processStreamEvent(streamEvent({
+      type: "reconnecting",
+      messageId: "msg-2",
+      consumerRevision: 3,
+      context: { ownerId: "agent-a", ownerType: "agent", topicId: "topic-2" },
+    }));
+    await wrapper.vm.$nextTick();
+    expect(streamStore.isOwnerGenerating("agent-a", "agent")).toBe(true);
+
+    await streamStore.processStreamEvent(streamEvent({
+      type: "end",
+      messageId: "msg-2",
+      consumerRevision: 4,
+      content: "done",
+      blocks: [],
+      finishReason: "completed",
+      context: { ownerId: "agent-a", ownerType: "agent", topicId: "topic-2" },
+    }));
+    await wrapper.vm.$nextTick();
+    expect(streamStore.isOwnerGenerating("agent-a", "agent")).toBe(false);
+
+    // 2. 群聊轮次连续性：归属于 group-1，不污染成员 agent-a / agent-b 的私聊条目
+    await streamStore.processStreamEvent(streamEvent({
+      type: "group_turn",
+      consumerRevision: 10,
+      context: { ownerId: "group-1", ownerType: "group", topicId: "g-topic", turnId: "turn-1" },
+      chunk: { active: true, phase: "arbitrating", revision: 1 } as any,
+    }));
+    await wrapper.vm.$nextTick();
+    expect(getSlots().map((s) => s.attributes("data-generating"))).toEqual([
+      "true",  // group-1
+      "false", // agent-a
+      "false", // agent-b
+    ]);
+
+    await streamStore.processStreamEvent(streamEvent({
+      type: "group_turn",
+      consumerRevision: 11,
+      context: { ownerId: "group-1", ownerType: "group", topicId: "g-topic", turnId: "turn-1" },
+      chunk: { active: false, revision: 2 } as any,
+    }));
+    await wrapper.vm.$nextTick();
+    expect(getSlots().map((s) => s.attributes("data-generating"))).toEqual([
+      "false",
+      "false",
+      "false",
+    ]);
+
+    wrapper.unmount();
   });
 });

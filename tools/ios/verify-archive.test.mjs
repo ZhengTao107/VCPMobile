@@ -1,0 +1,285 @@
+import assert from 'node:assert/strict';
+import { execFileSync, spawnSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
+import { existsSync } from 'node:fs';
+import { chmod, cp, lstat, mkdir, mkdtemp, readFile, readdir, readlink, rm, symlink, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { basename, dirname, join } from 'node:path';
+import test from 'node:test';
+import { fileURLToPath } from 'node:url';
+import { verifyAndPackage } from './verify-archive.mjs';
+
+const digest = data => createHash('sha256').update(data).digest('hex');
+const mac = process.platform === 'darwin';
+
+// Exercise real ZIP archives on every host. On macOS use the same ditto as the workflow.
+async function ditto(args) {
+  if (mac) return execFileSync('ditto', args);
+  const [source, target] = args.slice(-2);
+  if (args[0] === '-c') {
+    if (process.platform === 'win32') return execFileSync('tar', ['--format', 'zip', '-cf', target, '-C', dirname(source), basename(source)]);
+    return execFileSync('zip', ['-q', '-r', '-y', target, basename(source)], { cwd: dirname(source) });
+  }
+  if (args[0] === '-x') {
+    if (process.platform === 'win32') return execFileSync('tar', ['-xf', source, '-C', target]);
+    return execFileSync('unzip', ['-q', source, '-d', target]);
+  }
+  return cp(source, target, { recursive: true, verbatimSymlinks: true });
+}
+
+async function writePlist(file, info) {
+  const input = JSON.stringify(info);
+  if (mac) execFileSync('plutil', ['-convert', 'binary1', '-o', file, '--', '-'], { input });
+  else await writeFile(file, input);
+}
+
+async function fixture(t, bundleVersion) {
+  const work = await mkdtemp(join(tmpdir(), 'vcp-ios-archive-'));
+  t.after(() => rm(work, { force: true, recursive: true }));
+  const root = join(work, 'src-tauri');
+  const project = join(root, 'gen', 'Apple Project');
+  const archive = join(project, 'build', 'sample_iOS.xcarchive');
+  const app = join(archive, 'Products', 'Applications', 'Example.app');
+  const share = join(app, 'PlugIns', 'VCPShare.appex');
+  const output = join(work, 'publish');
+  const sources = join(root, 'runtime-assets', 'voice');
+  const assets = join(sources, 'assets', 'voice');
+  for (const dir of [assets, share, join(app, 'voice')]) await mkdir(dir, { recursive: true });
+
+  const main = {
+    CFBundleIdentifier: 'com.example.test', CFBundleExecutable: 'Example',
+    CFBundleShortVersionString: '1.2.3', CFBundleVersion: bundleVersion ?? '1.2.3',
+    VCPShareAppGroup: 'group.com.example.test', MinimumOSVersion: '26.0',
+    DTSDKName: 'iphoneos26.2', DTXcodeBuild: '17C52',
+  };
+  const extension = {
+    ...main, CFBundleIdentifier: 'com.example.test.share', CFBundleExecutable: 'VCPShare',
+    NSExtension: { NSExtensionPointIdentifier: 'com.apple.share-services' },
+  };
+  await writeFile(join(root, 'tauri.conf.json'), JSON.stringify({ identifier: main.CFBundleIdentifier, version: '1.2.3' }));
+  await writeFile(join(root, 'tauri.ios.conf.json'), JSON.stringify({ bundle: { iOS: { minimumSystemVersion: '26.0', bundleVersion } } }));
+  await writePlist(join(root, 'Info.ios.plist'), { VCPShareAppGroup: main.VCPShareAppGroup });
+  for (const [dir, info] of [[app, main], [share, extension]]) {
+    await writePlist(join(dir, 'Info.plist'), info);
+    await writeFile(join(dir, info.CFBundleExecutable), 'fixture executable');
+    await writePlist(join(dir, 'PrivacyInfo.xcprivacy'), {});
+  }
+  const resources = {
+    'silero_vad.ort': 'fixture model', 'SILERO-LICENSE': 'silero license',
+    'ONNXRUNTIME-LICENSE': 'runtime license', 'ONNXRUNTIME-ThirdPartyNotices.txt': 'third-party notices',
+  };
+  for (const [name, data] of Object.entries(resources)) {
+    await writeFile(join(assets, name), data);
+    await writeFile(join(app, 'voice', name), data);
+  }
+  await writeFile(join(sources, 'runtime.lock.json'), JSON.stringify({ ortModelSha256: digest(resources['silero_vad.ort']) }));
+
+  // Metadata validation, file hashing and publication use the real temporary tree.
+  // Most cases only need metadata. The platform-recording test supplies its own binaries.
+  let compressions = 0;
+  const run = async (command, args) => {
+    if (command === 'xcodebuild') return 'Xcode 26.2\nBuild version 17C52';
+    if (command === 'xcrun' && args[0] === '--sdk') return '26.2';
+    if (command === 'xcrun' && args[0] === 'lipo') return 'arm64';
+    if (command === 'xcrun' && args[0] === 'vtool') return 'Load command 1\n      cmd LC_BUILD_VERSION\n platform IOS';
+    if (command === 'ditto') {
+      if (args[0] === '-c') compressions++;
+      return ditto(args);
+    }
+    if (command === 'unzip') {
+      return process.platform === 'win32'
+        ? execFileSync('tar', ['-tf', args.at(-1)], { encoding: 'utf8' })
+        : execFileSync(command, args, { encoding: 'utf8' });
+    }
+    if (mac) return execFileSync(command, args, { encoding: 'utf8' });
+    if (command === 'plutil') return readFile(args.at(-1), 'utf8');
+    throw new Error(`Unexpected command: ${command}`);
+  };
+  const publish = (runner = run, profile = 'release') => verifyAndPackage(project, output, { root, commit: 'test-revision', profile }, runner);
+  return { work, project, sources, assets, app, share, main, extension, output, publish, run, compressions: () => compressions };
+}
+
+for (const bundleVersion of [undefined, '42']) {
+  test(`publishes the checked archive, IPA, app ZIP and checksums (build ${bundleVersion ?? 'from version'})`, async t => {
+    const f = await fixture(t, bundleVersion);
+    const profile = bundleVersion ? 'debug' : 'release';
+    const prefix = `VCPMobile_v1.2.3_ios-arm64${bundleVersion ? '-debug' : ''}`;
+    const expectedAppZip = `${prefix}.app.zip`;
+    const expectedIpa = `${prefix}.unsigned.ipa`;
+    const nested = join('Frameworks', 'Included.framework');
+    await mkdir(join(f.app, nested), { recursive: true });
+    await writeFile(join(f.app, nested, 'Included'), 'independent framework contents');
+    if (process.platform !== 'win32') {
+      await chmod(join(f.app, nested, 'Included'), 0o751);
+      await symlink('Included', join(f.app, nested, 'Current'));
+    }
+    // A nested archive from a different build tool must not become the Tauri product.
+    await mkdir(join(f.project, 'DerivedData', 'wrong.xcarchive'), { recursive: true });
+    await f.publish(f.run, profile);
+    const manifest = JSON.parse(await readFile(join(f.output, 'manifest.json'), 'utf8'));
+    assert.deepEqual((await readdir(f.output)).sort(), [
+      'manifest.json', 'sample_iOS.xcarchive.zip', expectedAppZip, expectedIpa,
+      `${expectedAppZip}.sha256`, `${expectedIpa}.sha256`,
+    ].sort());
+    const zip = await readFile(join(f.output, manifest.archive.file));
+    assert.equal(manifest.archive.sha256, digest(zip));
+    assert.equal(manifest.archive.bytes, zip.length);
+    assert.equal(manifest.commit, 'test-revision');
+    assert.equal(manifest.profile, profile);
+    assert.equal(manifest.app.bundleVersion, bundleVersion ?? '1.2.3');
+    assert.equal(manifest.share.identifier, 'com.example.test.share');
+    assert.equal(manifest.share.minimumOSVersion, '26.0');
+    assert.equal(manifest.app.xcodeBuild, '17C52');
+    assert.equal(manifest.share.sdkName, 'iphoneos26.2');
+    assert.equal(manifest.voiceResources.find(r => r.file === 'voice/silero_vad.ort').sha256, digest('fixture model'));
+    for (const [record, filename, ipa] of [[manifest.appZip, expectedAppZip, false], [manifest.ipa, expectedIpa, true]]) {
+      assert.equal(record.file, filename);
+      const path = join(f.output, filename);
+      const data = await readFile(path);
+      assert.equal(record.bytes, data.length);
+      assert.equal(record.sha256, digest(data));
+      assert.equal(await readFile(path + '.sha256', 'utf8'), `${digest(data)}  ${filename}\n`);
+      const extracted = await mkdtemp(join(f.work, 'check-'));
+      await ditto(['-x', '-k', path, extracted]);
+      const parent = ipa ? join(extracted, 'Payload') : extracted;
+      if (ipa) assert.deepEqual(await readdir(extracted), ['Payload']);
+      assert.deepEqual(await readdir(parent), ['Example.app']);
+      const bundled = join(parent, 'Example.app');
+      assert.equal(await readFile(join(bundled, nested, 'Included'), 'utf8'), 'independent framework contents');
+      assert.deepEqual(await readFile(join(bundled, 'PlugIns', 'VCPShare.appex', 'VCPShare')), await readFile(join(f.share, 'VCPShare')));
+      if (process.platform !== 'win32') {
+        assert.equal((await lstat(join(bundled, nested, 'Included'))).mode & 0o777, 0o751);
+        assert.equal(await readlink(join(bundled, nested, 'Current')), 'Included');
+      }
+    }
+    assert.equal(f.compressions(), 3);
+  });
+}
+
+test('records the actual platform of each bundled executable independently of its SDK plist', async t => {
+  const f = await fixture(t);
+  const main = join(f.app, f.main.CFBundleExecutable);
+  const share = join(f.share, f.extension.CFBundleExecutable);
+  if (mac) {
+    for (const [sdk, target, binary] of [
+      ['iphoneos', 'arm64-apple-ios26.0', main],
+      ['iphonesimulator', 'arm64-apple-ios26.0-simulator', share],
+    ]) {
+      const sysroot = execFileSync('xcrun', ['--sdk', sdk, '--show-sdk-path'], { encoding: 'utf8' }).trim();
+      execFileSync('xcrun', ['--sdk', sdk, 'clang', '-target', target, '-isysroot', sysroot, '-x', 'c', '-', '-o', binary],
+        { input: 'int main(void) { return 0; }' });
+    }
+  }
+  const report = await f.publish(async (command, args) => {
+    if (command !== 'xcrun' || args[0] === '--sdk') return f.run(command, args);
+    if (mac) return execFileSync(command, args, { encoding: 'utf8' });
+    const binary = args.at(-1);
+    assert([main, share].includes(binary));
+    if (args[0] === 'lipo') {
+      assert.deepEqual(args, ['lipo', '-archs', binary]);
+      return 'arm64\n';
+    }
+    assert.deepEqual(args, ['vtool', '-arch', 'arm64', '-show-build', binary]);
+    return `Load command 1\n      cmd LC_BUILD_VERSION\n platform ${binary === main ? 'IOS' : 'IOSSIMULATOR'}\n`;
+  });
+  assert.deepEqual(report.app.machO.slices, [{ architecture: 'arm64', platforms: ['IOS'] }]);
+  assert.deepEqual(report.share.machO.slices, [{ architecture: 'arm64', platforms: ['IOSSIMULATOR'] }]);
+});
+
+test('records which executable could not be inspected without inventing a platform', async t => {
+  const f = await fixture(t);
+  const report = await f.publish((command, args) => {
+    if (args[0] === 'vtool' && args.at(-1) === join(f.share, f.extension.CFBundleExecutable)) {
+      throw new Error('unreadable load commands');
+    }
+    return f.run(command, args);
+  });
+  assert.deepEqual(report.app.machO.slices[0].platforms, ['IOS']);
+  assert.deepEqual(report.share.machO.slices, [
+    { architecture: 'arm64', error: { tool: 'vtool', reason: 'unreadable load commands' } },
+  ]);
+});
+
+const wrongPlists = [
+  ['app', 'CFBundleIdentifier', 'com.example.foreign'],
+  ['share', 'CFBundleIdentifier', 'com.example.other-extension'],
+  ['app', 'CFBundleShortVersionString', '1.0.0'],
+  ['share', 'CFBundleVersion', '41'],
+  ['share', 'VCPShareAppGroup', 'group.other'],
+  ['app', 'DTSDKName', 'iphonesimulator26.2'],
+  ['share', 'DTXcodeBuild', '16F6'],
+  ['app', 'MinimumOSVersion', '15.0'],
+  ['share', 'NSExtension', { NSExtensionPointIdentifier: 'com.apple.widgetkit-extension' }],
+];
+for (const [target, key, value] of wrongPlists) {
+  test(`rejects wrong ${target} ${key} before compression`, async t => {
+    const f = await fixture(t, '42');
+    const info = target === 'app' ? f.main : f.extension;
+    await writePlist(join(f[target], 'Info.plist'), { ...info, [key]: value });
+    await assert.rejects(f.publish(), key === 'NSExtension' ? /Share Extension point/ : new RegExp(key));
+    assert.equal(f.compressions(), 0);
+    assert.equal(existsSync(f.output), false);
+  });
+}
+
+test('rejects a different model even when its staged source was also replaced', async t => {
+  const f = await fixture(t);
+  for (const dir of [f.assets, join(f.app, 'voice')]) await writeFile(join(dir, 'silero_vad.ort'), 'different model');
+  await assert.rejects(f.publish(), /silero_vad\.ort/);
+  assert.equal(f.compressions(), 0);
+  assert.equal(existsSync(f.output), false);
+});
+
+for (const [target, file] of [['app', 'voice/ONNXRUNTIME-LICENSE'], ['share', 'PrivacyInfo.xcprivacy'], ['app', 'Example']]) {
+  test(`missing ${target} ${file} prevents publication`, async t => {
+    const f = await fixture(t);
+    await rm(join(f[target], file));
+    await assert.rejects(f.publish(), /ENOENT/);
+    assert.equal(f.compressions(), 0);
+    assert.equal(existsSync(f.output), false);
+  });
+}
+
+test('rejects ambiguous Tauri archive selection', async t => {
+  const f = await fixture(t);
+  await mkdir(join(f.project, 'build', 'stale.xcarchive'));
+  await assert.rejects(f.publish(), /Expected one .xcarchive/);
+  assert.equal(existsSync(f.output), false);
+});
+
+test('the CLI exits unsuccessfully when a build has no archive to publish', async t => {
+  const f = await fixture(t);
+  await rm(join(f.project, 'build', 'sample_iOS.xcarchive'), { recursive: true });
+  const cli = spawnSync(process.execPath, [fileURLToPath(new URL('./verify-archive.mjs', import.meta.url)), f.project, f.output], {
+    env: { ...process.env, GITHUB_SHA: 'test-revision', IOS_ARCHIVE_PROFILE: 'debug' }, encoding: 'utf8',
+  });
+  assert.equal(cli.status, 1);
+  assert.match(cli.stderr, /Expected one .xcarchive/);
+  assert.equal(existsSync(f.output), false);
+});
+
+test('a compressor failure after writing bytes never publishes a partial archive', async t => {
+  const f = await fixture(t);
+  await assert.rejects(f.publish(async (command, args) => {
+    if (command !== 'ditto') return f.run(command, args);
+    await writeFile(args.at(-1), 'partial zip');
+    throw new Error('ditto failed');
+  }), /ditto failed/);
+  assert.deepEqual(await readdir(f.work), ['src-tauri']);
+});
+
+for (const corrupt of ['second app', 'missing extension binary']) {
+  test(`rejects an actually zipped IPA with ${corrupt}, leaving no artifacts`, async t => {
+    const f = await fixture(t);
+    await assert.rejects(f.publish(async (command, args) => {
+      if (command === 'ditto' && args[0] === '-c' && args.at(-1).endsWith('.unsigned.ipa')) {
+        const payload = args.at(-2);
+        if (corrupt === 'second app') await mkdir(join(payload, 'Wrong.app'));
+        else await rm(join(payload, 'Example.app', 'PlugIns', 'VCPShare.appex', 'VCPShare'));
+      }
+      return f.run(command, args);
+    }), corrupt === 'second app' ? /exactly Payload\/Example\.app/ : /Missing IPA entry:.*VCPShare/);
+    assert.equal(f.compressions(), 3);
+    assert.deepEqual(await readdir(f.work), ['src-tauri']);
+  });
+}

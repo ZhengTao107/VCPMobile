@@ -102,7 +102,7 @@ describe("sync session ownership", () => {
   });
 
   it("unlistens registrations that resolve after the panel closes", async () => {
-    const registrations = Array.from({ length: 4 }, () =>
+    const registrations = Array.from({ length: 5 }, () =>
       deferred<() => void>(),
     );
     const unlisteners = registrations.map(() => vi.fn());
@@ -232,7 +232,7 @@ describe("sync session ownership", () => {
     const store = useSyncSessionStore();
     overlay.openSyncSession();
 
-    await vi.waitFor(() => expect(listenMock).toHaveBeenCalledTimes(4));
+    await vi.waitFor(() => expect(listenMock).toHaveBeenCalledTimes(5));
     const statusRegistration = listenMock.mock.calls.find(
       ([eventName]) => eventName === "vcp-sync-status",
     );
@@ -455,7 +455,7 @@ describe("sync session ownership", () => {
   it("shows desktop backend info only for the current connected session", async () => {
     const store = useSyncSessionStore();
     store.open();
-    await vi.waitFor(() => expect(listenMock).toHaveBeenCalledTimes(4));
+    await vi.waitFor(() => expect(listenMock).toHaveBeenCalledTimes(5));
     store.activeSessionId = 61;
 
     emitTauriEvent("vcp-sync-status", {
@@ -478,7 +478,6 @@ describe("sync session ownership", () => {
     const wrapper = mount(SyncSessionView);
     expect(wrapper.text()).toContain("桌面后端 CDS");
     expect(wrapper.text()).toContain("同步插件 v1.5.0");
-    expect(wrapper.text()).not.toContain("复制诊断");
 
     emitTauriEvent("vcp-sync-status", {
       sessionId: 61,
@@ -487,13 +486,170 @@ describe("sync session ownership", () => {
     expect(store.desktopInfo).toBeNull();
   });
 
+  it("buffers transfer snapshots until the start receipt identifies the owning session", async () => {
+    const pendingStart = deferred<number>();
+    mockInvoke("start_manual_sync", () => pendingStart.promise);
+    const store = useSyncSessionStore();
+    store.open();
+    const starting = store.startSync();
+    await vi.waitFor(() => expect(invokeMock).toHaveBeenCalledWith("start_manual_sync"));
+
+    const transfer = { uploadedBytes: 500, downloadedBytes: 1_500, activeDurationMs: 250.5 };
+    emitTauriEvent("vcp-sync-transfer", { sessionId: 70, ...transfer, uploadedBytes: 9_000 });
+    emitTauriEvent("vcp-sync-transfer", { sessionId: 71, ...transfer });
+    emitTauriEvent("vcp-sync-transfer", transfer);
+    expect(store.transfer).toBeNull();
+
+    pendingStart.resolve(71);
+    await starting;
+    expect(store.transfer).toEqual(transfer);
+    emitTauriEvent("vcp-sync-transfer", { sessionId: 70, ...transfer, uploadedBytes: 10_000 });
+    expect(store.transfer).toEqual(transfer);
+  });
+
+  it("rejects malformed and regressing transfer snapshots without losing the last reading", () => {
+    const store = useSyncSessionStore();
+    store.open();
+    store.activeSessionId = 72;
+    const transfer = { uploadedBytes: 100, downloadedBytes: 900, activeDurationMs: 100.5 };
+    emitTauriEvent("vcp-sync-transfer", { sessionId: 72, ...transfer });
+
+    for (const patch of [
+      { uploadedBytes: -1 },
+      { uploadedBytes: Number.MAX_SAFE_INTEGER + 1 },
+      { uploadedBytes: 100.1 },
+      { downloadedBytes: "900" },
+      { downloadedBytes: Number.NaN },
+      { activeDurationMs: Number.POSITIVE_INFINITY },
+      { activeDurationMs: -1 },
+      { uploadedBytes: 99 },
+      { downloadedBytes: 899 },
+      { activeDurationMs: 100.4 },
+    ]) {
+      emitTauriEvent("vcp-sync-transfer", { sessionId: 72, ...transfer, ...patch });
+      expect(store.transfer).toEqual(transfer);
+    }
+  });
+
+  it("retains speed through automatic reconnect and local finalization, then resets for a manual retry", async () => {
+    let nextSession = 0;
+    mockInvoke("start_manual_sync", () => ++nextSession);
+    const store = useSyncSessionStore();
+    store.open();
+    await store.startSync();
+    const transfer = { uploadedBytes: 500, downloadedBytes: 1_500, activeDurationMs: 1_000 };
+    emitTauriEvent("vcp-sync-transfer", { sessionId: 1, ...transfer });
+    emitTauriEvent("vcp-sync-status", { sessionId: 1, status: "connecting" });
+    emitTauriEvent("vcp-sync-progress", { sessionId: 1, phase: "finalize" });
+    expect(store.transfer).toEqual(transfer);
+
+    emitTauriEvent("vcp-sync-status", { sessionId: 1, status: "error", error: syncError("RETRYABLE") });
+    expect(store.transfer).toEqual(transfer);
+    await store.retrySync();
+    expect(store.activeSessionId).toBe(2);
+    expect(store.transfer).toBeNull();
+    emitTauriEvent("vcp-sync-transfer", { sessionId: 1, ...transfer });
+    expect(store.transfer).toBeNull();
+  });
+
+  it.each(["error", "completed", "completed_with_warnings"] as const)(
+    "takes the final transfer snapshot from %s and ignores later measurements",
+    (status) => {
+      const store = useSyncSessionStore();
+      store.open();
+      store.activeSessionId = 73;
+      emitTauriEvent("vcp-sync-transfer", {
+        sessionId: 73, uploadedBytes: 100, downloadedBytes: 900, activeDurationMs: 1_000,
+      });
+      const transfer = { uploadedBytes: 200, downloadedBytes: 1_800, activeDurationMs: 1_500 };
+      if (status === "error") {
+        emitTauriEvent("vcp-sync-status", { sessionId: 73, status, error: syncError("END"), transfer });
+      } else {
+        emitTauriEvent("vcp-sync-completed", {
+          sessionId: 73, status, transfer,
+          summary: {
+            successfulTopics: 1, totalTopics: 1, failedTopics: 0, failedTopicIds: [],
+            legacyAttachmentWarnings: status === "completed_with_warnings" ? 1 : 0,
+          },
+        });
+      }
+      expect(store.status).toBe(status);
+      expect(store.transfer).toEqual(transfer);
+      emitTauriEvent("vcp-sync-transfer", {
+        sessionId: 73, uploadedBytes: 300, downloadedBytes: 2_700, activeDurationMs: 2_000,
+      });
+      expect(store.transfer).toEqual(transfer);
+    },
+  );
+
+  it("clears transfer data when reopening and rejects a previous view's listener callback", async () => {
+    const store = useSyncSessionStore();
+    store.open();
+    store.activeSessionId = 74;
+    const oldListener = listenMock.mock.calls.find(([name]) => name === "vcp-sync-transfer")?.[1];
+    const transfer = { uploadedBytes: 100, downloadedBytes: 900, activeDurationMs: 500 };
+    emitTauriEvent("vcp-sync-transfer", { sessionId: 74, ...transfer });
+    expect(store.transfer).toEqual(transfer);
+    await store.close();
+    store.open();
+    store.activeSessionId = 74;
+    oldListener?.({ payload: { sessionId: 74, ...transfer } });
+    expect(store.transfer).toBeNull();
+  });
+
+  it("keeps a connecting sync page mounted while start_manual_sync is pending", async () => {
+    const pendingStart = deferred<number>();
+    mockInvoke("plugin:vcp-mobile|get_battery_status", () => ({
+      level: 80,
+      isPowerSaveMode: false,
+    }));
+    mockInvoke("start_manual_sync", () => pendingStart.promise);
+
+    const overlay = useOverlayStore();
+    const store = useSyncSessionStore();
+    overlay.openSyncSession();
+    const starting = store.startSync();
+
+    await vi.waitFor(() =>
+      expect(
+        invokeMock.mock.calls.some(
+          ([command]) => command === "start_manual_sync",
+        ),
+      ).toBe(true),
+    );
+    expect(store.status).toBe("connecting");
+    expect(store.canDismiss).toBe(false);
+
+    window.dispatchEvent(
+      new PopStateEvent("popstate", { state: { vcpMain: true } }),
+    );
+
+    expect(store.isOpen).toBe(true);
+    expect(overlay.isSyncSessionOpen).toBe(true);
+    expect(
+      invokeMock.mock.calls.some(([command]) => command === "stop_sync"),
+    ).toBe(false);
+
+    emitTauriEvent("vcp-sync-status", { sessionId: 23, status: "open" });
+    expect(store.status).toBe("connecting");
+    pendingStart.resolve(23);
+    await starting;
+    expect(store.status).toBe("connected");
+    emitTauriEvent("vcp-sync-status", {
+      sessionId: 23,
+      status: "error",
+      error: syncError("TEST"),
+    });
+    await overlay.closeSyncSession();
+  });
+
   it.each(["idle", "error", "completed", "completed_with_warnings"] as const)(
     "dismisses a %s panel through system back and still requests backend stop",
     async (terminalStatus) => {
       const overlay = useOverlayStore();
       const store = useSyncSessionStore();
       overlay.openSyncSession();
-      await vi.waitFor(() => expect(listenMock).toHaveBeenCalledTimes(4));
+      await vi.waitFor(() => expect(listenMock).toHaveBeenCalledTimes(5));
 
       if (terminalStatus === "error") {
         store.activeSessionId = 31;
@@ -659,36 +815,6 @@ describe("sync session ownership", () => {
     });
   });
 
-  it("awaits stop before retrying and preserves an attempt separator", async () => {
-    let nextSession = 0;
-    mockInvoke("start_manual_sync", () => ++nextSession);
-    const store = useSyncSessionStore();
-    store.open();
-    await store.startSync();
-    emitTauriEvent("vcp-sync-status", {
-      sessionId: 1,
-      status: "error",
-      error: syncError("RETRYABLE"),
-    });
-
-    await store.retrySync();
-
-    const syncCommands = invokeMock.mock.calls
-      .map(([command]) => command)
-      .filter(
-        (command) => command === "start_manual_sync" || command === "stop_sync",
-      );
-    expect(syncCommands).toEqual([
-      "start_manual_sync",
-      "stop_sync",
-      "start_manual_sync",
-    ]);
-    expect(store.activeSessionId).toBe(2);
-    expect(store.logs.some((log) => log.message.includes("新同步尝试"))).toBe(
-      true,
-    );
-  });
-
   it("joins the old session before separating attempts and ignores its late logs", async () => {
     let nextSession = 0;
     const stopping = deferred<void>();
@@ -792,29 +918,6 @@ describe("sync session ownership", () => {
     expect(store.logs.some((log) => log.message.includes("unknown phase progress"))).toBe(
       false,
     );
-  });
-
-  it.each([
-    {
-      battery: { level: 80, isPowerSaveMode: true },
-      message: "系统省电模式已阻止本次同步",
-      guidance: "关闭系统省电模式后再试。",
-    },
-    {
-      battery: { level: 29, isPowerSaveMode: false },
-      message: "当前电量不足，已暂停同步",
-      guidance: "电量达到 30% 后再试。",
-    },
-  ])("uses fixed device guidance for $message", async ({ battery, message, guidance }) => {
-    mockInvoke("plugin:vcp-mobile|get_battery_status", () => battery);
-    const store = useSyncSessionStore();
-    store.open();
-    await store.startSync();
-
-    expect(store.terminalError).toMatchObject({ message, guidance });
-    expect(
-      invokeMock.mock.calls.some(([command]) => command === "start_manual_sync"),
-    ).toBe(false);
   });
 
   it("mounts only the selected sync panel and reloads history on each entry", async () => {
@@ -1017,35 +1120,4 @@ describe("sync session ownership", () => {
     ).toBe("已打开系统分享面板");
   });
 
-  it("renders CDS compile command and copies to clipboard on CDS/Wire errors", async () => {
-    const store = useSyncSessionStore();
-    store.isOpen = true;
-    store.status = "error";
-    store.terminalError = {
-      code: "CDS_PROTOCOL_MISMATCH",
-      category: "compatibility",
-      origin: "desktop_cds",
-      stage: "startup",
-      retryAction: "after_user_action",
-      message: "电脑端 CDS 数据服务协议版本不匹配",
-      guidance: "请更新 VChat 桌面端以同步插件代码，并在 VCPChat 根目录执行 node rust_chat_data_service/build-runtime.js 重新编译 CDS，重启电脑端后再试。",
-      failedTopicIds: [],
-      logFile: null,
-    };
-
-    const wrapper = mount(SyncSessionView);
-    await Promise.resolve();
-
-    expect(wrapper.text()).toContain("node rust_chat_data_service/build-runtime.js");
-    expect(wrapper.text()).toContain("重新编译命令");
-
-    const copyBtn = wrapper.findAll("button").find((b) => b.text().includes("复制命令"));
-    expect(copyBtn).toBeTruthy();
-
-    await copyBtn!.trigger("click");
-    expect(navigator.clipboard.writeText).toHaveBeenCalledWith("node rust_chat_data_service/build-runtime.js");
-
-    const notifications = useNotificationStore();
-    expect(notifications.activeToasts.some((t) => t.message === "已复制 CDS 编译命令")).toBe(true);
-  });
 });

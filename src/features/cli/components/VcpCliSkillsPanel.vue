@@ -6,7 +6,7 @@ import {
   Copy,
   FolderInput,
   PackageCheck,
-} from "lucide-vue-next";
+} from "@lucide/vue";
 import RefreshButton from "../../../components/ui/RefreshButton.vue";
 import { useVcpCliStore } from "../vcpCliStore";
 
@@ -114,7 +114,7 @@ watch(selectedSkillId, () => {
     </div>
 
     <div
-      v-if="skillLoading"
+      v-if="skillLoading && !selectedSkill"
       class="flex min-h-0 flex-1 items-center justify-center text-[10px] opacity-45"
       role="status"
     >

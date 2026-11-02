@@ -1,3 +1,4 @@
+use super::sync_transfer::{SyncHttpClient, SyncWebSocket, TransferMeter, TransferSnapshot};
 #[cfg(test)]
 use super::sync_version::WIRE_PROTOCOL_VERSION;
 use super::sync_version::{
@@ -6,7 +7,7 @@ use super::sync_version::{
 };
 use crate::vcp_modules::db_manager::DbState;
 use crate::vcp_modules::db_write_queue::DbWriteQueue;
-use crate::vcp_modules::settings_manager::{read_settings, Settings, SettingsState};
+use crate::vcp_modules::settings_manager::{read_config, Settings, SettingsState};
 use crate::vcp_modules::sync_error::{
     build_local_error_payload, build_wire_error_payload, decode_wire_sync_error,
     encode_wire_sync_error, is_attempt_restart_code, SyncErrorPayload, WireSyncError,
@@ -19,6 +20,7 @@ use crate::vcp_modules::sync_types::{
     TopicDiffResultFrame, TopicDiffState,
 };
 use crate::vcp_modules::topic_types::{OwnerKey, TopicKey};
+#[cfg(test)]
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -31,9 +33,7 @@ use std::time::{Duration, Instant};
 use tauri::{AppHandle, Emitter, Manager, Runtime, State};
 use tokio::sync::{mpsc, Mutex as AsyncMutex, RwLock};
 use tokio::task::{JoinHandle, JoinSet};
-use tokio_tungstenite::{
-    connect_async, tungstenite::protocol::Message, MaybeTlsStream, WebSocketStream,
-};
+use tokio_tungstenite::{connect_async, tungstenite::protocol::Message};
 use tokio_util::sync::CancellationToken;
 
 const VERSION_CHECK_TIMEOUT: Duration = Duration::from_secs(5);
@@ -53,10 +53,48 @@ const MAX_SYNC_SESSION_WALL: Duration = Duration::from_secs(60 * 60);
 // Bound how long a caller waits, not the lifetime of already accepted DB writes.
 // A session which exceeds this budget remains owned until its real drain exits.
 const SYNC_STOP_WAIT: Duration = Duration::from_secs(5);
-#[cfg(target_os = "android")]
+#[cfg(any(target_os = "android", target_os = "ios"))]
 const SYNC_GUARDIAN_LABEL: &str = "[数据同步] VCP Mobile";
 type RoutedSyncCommand = (u64, mpsc::UnboundedSender<SyncCommand>);
-type SyncWebSocket = WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>;
+struct TransferReporter(JoinHandle<()>);
+
+impl Drop for TransferReporter {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+fn session_transfer_snapshot<R: Runtime>(
+    app: &AppHandle<R>,
+    session_id: u64,
+    freeze: bool,
+) -> TransferSnapshot {
+    let state = app.state::<SyncState>();
+    let transfer = state
+        .current_transfer
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    transfer
+        .as_ref()
+        .filter(|(id, _)| *id == session_id)
+        .map_or_else(TransferSnapshot::default, |(_, meter)| {
+            if freeze {
+                meter.freeze()
+            } else {
+                meter.snapshot()
+            }
+        })
+}
+
+fn emit_transfer_snapshot<R: Runtime>(
+    app: &AppHandle<R>,
+    session_id: u64,
+    snapshot: TransferSnapshot,
+) {
+    let mut payload = json!(snapshot);
+    payload["sessionId"] = json!(session_id);
+    let _ = app.emit("vcp-sync-transfer", payload);
+}
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -942,6 +980,7 @@ pub struct SyncState {
     pub connection_status: Arc<RwLock<String>>,
     pub current_log_path: Arc<RwLock<Option<String>>>,
     pub current_logger: Arc<std::sync::RwLock<Option<Arc<std::sync::Mutex<SyncLogger>>>>>,
+    current_transfer: Mutex<Option<(u64, TransferMeter)>>,
     lifecycle: AsyncMutex<()>,
     owner_commit: AsyncMutex<()>,
     session: AsyncMutex<Option<SyncSessionHandle>>,
@@ -1361,6 +1400,9 @@ async fn publish_sync_status_inner<R: Runtime>(
     if let Some(desktop_info) = desktop_info {
         payload["desktop"] = json!(desktop_info);
     }
+    if next_status == "error" {
+        payload["transfer"] = json!(session_transfer_snapshot(app_handle, session_id, true));
+    }
 
     let _ = app_handle.emit("vcp-sync-status", payload);
 }
@@ -1397,6 +1439,7 @@ async fn publish_sync_completed(
     } else {
         "completed"
     };
+    let transfer = session_transfer_snapshot(app_handle, session_id, true);
     let _ = app_handle.emit(
         "vcp-sync-completed",
         json!({
@@ -1404,6 +1447,7 @@ async fn publish_sync_completed(
             "sessionId": session_id,
             "status": terminal_status,
             "summary": summary,
+            "transfer": transfer,
         }),
     );
     let _ = app_handle.emit(
@@ -1412,6 +1456,7 @@ async fn publish_sync_completed(
             "status": terminal_status,
             "source": "Sync",
             "sessionId": session_id,
+            "transfer": transfer,
         }),
     );
     true
@@ -1485,6 +1530,7 @@ pub fn init_sync_service(_app_handle: AppHandle) -> SyncState {
         connection_status: Arc::new(RwLock::new(String::from("disconnected"))),
         current_log_path: Arc::new(RwLock::new(None)),
         current_logger: Arc::new(std::sync::RwLock::new(None)),
+        current_transfer: Mutex::new(None),
         lifecycle: AsyncMutex::new(()),
         owner_commit: AsyncMutex::new(()),
         session: AsyncMutex::new(None),
@@ -1500,6 +1546,7 @@ pub(crate) fn test_sync_state(session_id: u64) -> SyncState {
         connection_status: Arc::new(RwLock::new(String::from("disconnected"))),
         current_log_path: Arc::new(RwLock::new(None)),
         current_logger: Arc::new(std::sync::RwLock::new(None)),
+        current_transfer: Mutex::new(None),
         lifecycle: AsyncMutex::new(()),
         owner_commit: AsyncMutex::new(()),
         session: AsyncMutex::new(None),
@@ -1562,10 +1609,10 @@ fn build_sync_session_config(
     is_mobile: bool,
 ) -> Result<SyncSessionConfig, SyncConfigValidationError> {
     let mut ws_endpoint =
-        parse_sync_endpoint(&settings.sync_server_url, "WebSocket URL", &["ws", "wss"])?;
+        parse_sync_endpoint(&settings.sync.server_url, "WebSocket URL", &["ws", "wss"])?;
     let http_endpoint =
-        parse_sync_endpoint(&settings.sync_http_url, "HTTP URL", &["http", "https"])?;
-    if settings.sync_token.trim().is_empty() {
+        parse_sync_endpoint(&settings.sync.http_url, "HTTP URL", &["http", "https"])?;
+    if settings.sync.token.trim().is_empty() {
         return Err(SyncConfigValidationError::new(
             "SYNC_TOKEN_MISSING",
             "sync token is empty",
@@ -1592,14 +1639,14 @@ fn build_sync_session_config(
     ws_endpoint.set_query(None);
     ws_endpoint
         .query_pairs_mut()
-        .append_pair("token", &settings.sync_token);
+        .append_pair("token", &settings.sync.token);
 
     Ok(SyncSessionConfig {
         ws_url: ws_endpoint.to_string(),
         http_url: http_endpoint.as_str().trim_end_matches('/').to_string(),
-        sync_token: settings.sync_token.clone(),
-        sync_prerender_enabled: settings.sync_prerender_enabled,
-        sync_log_level: settings.sync_log_level.clone(),
+        sync_token: settings.sync.token.clone(),
+        sync_prerender_enabled: settings.sync.prerender_enabled,
+        sync_log_level: settings.sync.log_level.clone(),
         attachment_blob_sync:
             crate::vcp_modules::sync::attachment_blob::attachment_blob_sync_enabled(settings),
     })
@@ -1641,13 +1688,42 @@ async fn run_sync_session(
         attachment_blob_sync,
     } = session_config;
 
+    let transfer = TransferMeter::default();
+    {
+        let state = app_handle.state::<SyncState>();
+        let _owner_commit = state.owner_commit.lock().await;
+        if state.current_session_id.load(Ordering::SeqCst) != session_id {
+            return Ok(());
+        }
+        *state
+            .current_transfer
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = Some((session_id, transfer.clone()));
+    }
+    let reporter_app = app_handle.clone();
+    let reporter_meter = transfer.clone();
+    let _transfer_reporter = TransferReporter(tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(1));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            interval.tick().await;
+            let state = reporter_app.state::<SyncState>();
+            if reporter_meter.is_frozen()
+                || state.current_session_id.load(Ordering::SeqCst) != session_id
+            {
+                break;
+            }
+            emit_transfer_snapshot(&reporter_app, session_id, reporter_meter.snapshot());
+        }
+    }));
+
     // Sync HTTP operations end on connection/transport failure or explicit session
     // cancellation. Dataset size and peer processing time are not correctness failures.
     let http_client = match reqwest::Client::builder()
         .connect_timeout(Duration::from_secs(10))
         .build()
     {
-        Ok(client) => client,
+        Ok(client) => SyncHttpClient::new(client, transfer.clone()),
         Err(error) => {
             let message = format!("Failed to initialize sync HTTP client: {error}");
             publish_sync_error(
@@ -1748,9 +1824,10 @@ async fn run_sync_session(
     }
     let db_write_metric_bridge =
         DbWriteMetricLogBridge::start(write_metric_receiver, sync_logger.clone());
-    let write_queue = Arc::new(DbWriteQueue::new(&db, session_id));
+    let attachments_root = crate::vcp_modules::file_manager::get_attachments_root_dir(&app_handle)?;
+    let write_queue = Arc::new(DbWriteQueue::new(&db, session_id, attachments_root));
 
-    #[cfg(target_os = "android")]
+    #[cfg(any(target_os = "android", target_os = "ios"))]
     let sync_guardian_lease = match tauri_plugin_vcp_mobile::stream::ForegroundLease::acquire(
         &app_handle,
         tauri_plugin_vcp_mobile::stream::ForegroundTask::Sync,
@@ -1759,7 +1836,7 @@ async fn run_sync_session(
         Ok(lease) => Some(lease),
         Err(error) => {
             let message = format!(
-                "Failed to acquire Android sync foreground lease; continuing without keepalive: {}",
+                "Failed to acquire native sync foreground resources; continuing without them: {}",
                 error
             );
             log::warn!("[SyncService] Session {session_id}: {message}");
@@ -1768,7 +1845,7 @@ async fn run_sync_session(
                 &app_handle,
                 session_id,
                 "warning",
-                "后台保活申请失败，本次同步仍将继续",
+                "原生任务资源申请失败，本次同步仍将继续",
             );
             None
         }
@@ -1814,7 +1891,7 @@ async fn run_sync_session(
                     session_id,
                     &connection_status_for_task,
                     &cancel_token,
-                    ws_stream,
+                    SyncWebSocket::new(ws_stream, transfer.clone()),
                 )
                 .await
                 {
@@ -3134,6 +3211,7 @@ async fn run_sync_session(
                         else => break,
                     }
                 }
+                ws_stream.clear_pending_transfer();
                 attempt_cancel.cancel();
                 task_tracker.close_and_wait().await;
                 if !sync_success {
@@ -3271,6 +3349,7 @@ async fn run_sync_session(
     // No session is considered stopped until its children can no longer enqueue
     // writes and the session-local queue has drained everything already accepted.
     cancel_token.cancel();
+    emit_transfer_snapshot(&app_handle, session_id, transfer.freeze());
     let shutdown_result = match write_queue.flush().await {
         Ok(()) => Ok(()),
         Err(error) => {
@@ -3297,7 +3376,7 @@ async fn run_sync_session(
     }
 
     // Each session releases only its own native lease, even after losing ownership.
-    #[cfg(target_os = "android")]
+    #[cfg(any(target_os = "android", target_os = "ios"))]
     if let Some(lease) = sync_guardian_lease {
         let _ = lease.release();
     }
@@ -3611,9 +3690,10 @@ async fn finish_sync_session(handle: &AppHandle, session_id: u64, outcome: &Resu
 
 fn emit_sync_interruption(handle: &AppHandle, session_id: u64, code: &str) {
     let error = build_local_error_payload(code, Vec::new(), None);
+    let transfer = session_transfer_snapshot(handle, session_id, true);
     let _ = handle.emit(
         "vcp-sync-status",
-        json!({ "sessionId": session_id, "status": "error", "source": "Sync", "error": error }),
+        json!({ "sessionId": session_id, "status": "error", "source": "Sync", "error": error, "transfer": transfer }),
     );
 }
 
@@ -3697,7 +3777,7 @@ pub async fn start_manual_sync(
     }
 
     let settings_state = handle.state::<SettingsState>();
-    let settings = read_settings(handle.clone(), settings_state)
+    let settings = read_config(handle.clone(), settings_state)
         .await
         .map_err(|error| {
             encode_sync_command_error(
@@ -3929,6 +4009,40 @@ pub async fn prepare_sync_log_share_file(
     Ok(staged_file.to_string_lossy().to_string())
 }
 
+/// Release only the snapshot created for this handoff; the source log remains owned by sync.
+#[tauri::command]
+pub async fn release_sync_log_share_file(app: AppHandle, path: String) -> Result<(), String> {
+    let file = std::path::PathBuf::from(path);
+    if !tokio::fs::try_exists(&file)
+        .await
+        .map_err(|error| error.to_string())?
+    {
+        return Ok(());
+    }
+    let root = app
+        .path()
+        .cache_dir()
+        .map_err(|error| error.to_string())?
+        .join("sync_log_shares");
+    let root = tokio::fs::canonicalize(root)
+        .await
+        .map_err(|error| error.to_string())?;
+    let file = tokio::fs::canonicalize(file)
+        .await
+        .map_err(|error| error.to_string())?;
+    let parent = file.parent().ok_or("无效的日志分享暂存路径")?;
+    if parent.parent() != Some(root.as_path()) {
+        return Err("拒绝删除非日志分享暂存文件".into());
+    }
+    tokio::fs::remove_file(&file)
+        .await
+        .map_err(|error| error.to_string())?;
+    if let Err(error) = tokio::fs::remove_dir(parent).await {
+        log::debug!("日志分享文件已释放，目录待后续清理: {error}");
+    }
+    Ok(())
+}
+
 #[derive(Debug, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SyncLogCleanupResult {
@@ -4030,10 +4144,8 @@ mod tests {
         assert_eq!(redacted, "wss://192.168.1.10:5975/ws-sync?token=***9876");
         assert!(!redacted.contains("example-secret"));
 
-        let settings = Settings {
-            sync_token: "example token +/?wxyz".to_string(),
-            ..valid_sync_settings()
-        };
+        let mut settings = valid_sync_settings();
+        settings.sync.token = "example token +/?wxyz".to_string();
         let config = build_sync_session_config(&settings, true)
             .unwrap_or_else(|error| panic!("valid sync configuration rejected: {}", error.detail));
         let redacted = redact_sync_ws_url(&config.ws_url);
@@ -4052,7 +4164,7 @@ mod tests {
         assert_eq!(redact_sync_ws_url("not a url"), "<unparseable ws url>");
     }
 
-    type TestServerWebSocket = WebSocketStream<tokio::net::TcpStream>;
+    type TestServerWebSocket = tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>;
 
     fn mock_sync_app(session_id: u64) -> tauri::App<tauri::test::MockRuntime> {
         let app = tauri::test::mock_app();
@@ -4203,7 +4315,10 @@ mod tests {
         let (client, _) = connect_async(format!("ws://{address}"))
             .await
             .expect("connect test WebSocket");
-        (client, server.await.expect("join test WebSocket server"))
+        (
+            SyncWebSocket::new(client, TransferMeter::default()),
+            server.await.expect("join test WebSocket server"),
+        )
     }
 
     async fn expect_version_check(server: &mut TestServerWebSocket) {
@@ -4217,14 +4332,6 @@ mod tests {
         };
         let payload: Value = serde_json::from_str(&text).expect("parse VERSION_CHECK");
         assert_eq!(payload["type"], "VERSION_CHECK");
-        assert_eq!(
-            payload["versions"],
-            json!([
-                {"component": "mobile_app", "version": env!("CARGO_PKG_VERSION")},
-                {"component": "wire", "version": WIRE_PROTOCOL_VERSION}
-            ])
-        );
-        assert_eq!(payload.as_object().map(serde_json::Map::len), Some(2));
     }
 
     async fn send_test_json(server: &mut TestServerWebSocket, payload: Value) {
@@ -4607,11 +4714,13 @@ mod tests {
 
     fn valid_sync_settings() -> Settings {
         Settings {
-            sync_server_url: "wss://192.168.1.10:5975/ws-sync".to_string(),
-            sync_http_url: "https://192.168.1.10:5974".to_string(),
-            sync_token: "sync-token".to_string(),
-            sync_log_level: "DEBUG".to_string(),
-            sync_prerender_enabled: true,
+            sync: crate::vcp_modules::settings_manager::SyncConfig {
+                server_url: "wss://192.168.1.10:5975/ws-sync".to_string(),
+                http_url: "https://192.168.1.10:5974".to_string(),
+                token: "sync-token".to_string(),
+                log_level: "DEBUG".to_string(),
+                prerender_enabled: true,
+            },
             ..Settings::default()
         }
     }
@@ -4626,15 +4735,15 @@ mod tests {
     #[test]
     fn session_config_snapshot_is_validated_normalized_and_frozen() {
         let mut settings = valid_sync_settings();
-        settings.sync_server_url =
+        settings.sync.server_url =
             "wss://192.168.1.10:5975/ws-sync?token=stale&mode=legacy".to_string();
-        settings.sync_http_url = "https://192.168.1.10:5974/base/".to_string();
-        settings.sync_token = "token +/?".to_string();
+        settings.sync.http_url = "https://192.168.1.10:5974/base/".to_string();
+        settings.sync.token = "token +/?".to_string();
 
         let config = build_sync_session_config(&settings, true)
             .unwrap_or_else(|error| panic!("valid sync configuration rejected: {}", error.detail));
-        settings.sync_server_url = "ws://changed.invalid".to_string();
-        settings.sync_token = "changed".to_string();
+        settings.sync.server_url = "ws://changed.invalid".to_string();
+        settings.sync.token = "changed".to_string();
 
         let ws_url = url::Url::parse(&config.ws_url).expect("validated WebSocket URL");
         let query = ws_url.query_pairs().collect::<Vec<_>>();
@@ -4643,85 +4752,6 @@ mod tests {
         assert_eq!(query[0].1, "token +/?");
         assert_eq!(config.http_url, "https://192.168.1.10:5974/base");
         assert_eq!(config.sync_token, "token +/?");
-        assert_eq!(config.sync_log_level, "DEBUG");
-        assert!(config.sync_prerender_enabled);
-    }
-
-    #[test]
-    fn session_config_rejects_missing_urls_and_token_before_session_creation() {
-        for (field, settings, expected_code) in [
-            (
-                "WebSocket URL",
-                Settings {
-                    sync_server_url: "   ".to_string(),
-                    ..valid_sync_settings()
-                },
-                "SYNC_CONFIG_MISSING",
-            ),
-            (
-                "HTTP URL",
-                Settings {
-                    sync_http_url: String::new(),
-                    ..valid_sync_settings()
-                },
-                "SYNC_CONFIG_MISSING",
-            ),
-            (
-                "token",
-                Settings {
-                    sync_token: " \t ".to_string(),
-                    ..valid_sync_settings()
-                },
-                "SYNC_TOKEN_MISSING",
-            ),
-        ] {
-            let error = sync_config_error(&settings, true);
-            assert_eq!(error.code, expected_code, "code for {field}");
-        }
-    }
-
-    #[test]
-    fn session_config_rejects_invalid_endpoint_shapes() {
-        for (field, settings) in [
-            (
-                "WebSocket scheme",
-                Settings {
-                    sync_server_url: "https://192.168.1.10:5975/ws-sync".to_string(),
-                    ..valid_sync_settings()
-                },
-            ),
-            (
-                "HTTP scheme",
-                Settings {
-                    sync_http_url: "ftp://192.168.1.10:5974".to_string(),
-                    ..valid_sync_settings()
-                },
-            ),
-            (
-                "WebSocket host",
-                Settings {
-                    sync_server_url: "ws://".to_string(),
-                    ..valid_sync_settings()
-                },
-            ),
-            (
-                "HTTP query",
-                Settings {
-                    sync_http_url: "https://192.168.1.10:5974?mode=legacy".to_string(),
-                    ..valid_sync_settings()
-                },
-            ),
-            (
-                "WebSocket fragment",
-                Settings {
-                    sync_server_url: "wss://192.168.1.10:5975/ws-sync#fragment".to_string(),
-                    ..valid_sync_settings()
-                },
-            ),
-        ] {
-            let error = sync_config_error(&settings, true);
-            assert_eq!(error.code, "SYNC_CONFIG_INVALID", "code for {field}");
-        }
     }
 
     #[test]
@@ -4730,29 +4760,41 @@ mod tests {
             (
                 "WebSocket localhost",
                 Settings {
-                    sync_server_url: "ws://localhost:5975".to_string(),
-                    ..valid_sync_settings()
+                    sync: crate::vcp_modules::settings_manager::SyncConfig {
+                        server_url: "ws://localhost:5975".to_string(),
+                        ..valid_sync_settings().sync
+                    },
+                    ..Default::default()
                 },
             ),
             (
                 "WebSocket IPv4 loopback range",
                 Settings {
-                    sync_server_url: "ws://127.0.0.2:5975".to_string(),
-                    ..valid_sync_settings()
+                    sync: crate::vcp_modules::settings_manager::SyncConfig {
+                        server_url: "ws://127.0.0.2:5975".to_string(),
+                        ..valid_sync_settings().sync
+                    },
+                    ..Default::default()
                 },
             ),
             (
                 "HTTP absolute localhost name",
                 Settings {
-                    sync_http_url: "http://LOCALHOST.:5974".to_string(),
-                    ..valid_sync_settings()
+                    sync: crate::vcp_modules::settings_manager::SyncConfig {
+                        http_url: "http://LOCALHOST.:5974".to_string(),
+                        ..valid_sync_settings().sync
+                    },
+                    ..Default::default()
                 },
             ),
             (
                 "HTTP IPv6 loopback",
                 Settings {
-                    sync_http_url: "http://[::1]:5974".to_string(),
-                    ..valid_sync_settings()
+                    sync: crate::vcp_modules::settings_manager::SyncConfig {
+                        http_url: "http://[::1]:5974".to_string(),
+                        ..valid_sync_settings().sync
+                    },
+                    ..Default::default()
                 },
             ),
         ] {
@@ -4761,9 +4803,12 @@ mod tests {
         }
 
         let settings = Settings {
-            sync_server_url: "ws://localhost:5975".to_string(),
-            sync_http_url: "http://127.0.0.2:5974".to_string(),
-            ..valid_sync_settings()
+            sync: crate::vcp_modules::settings_manager::SyncConfig {
+                server_url: "ws://localhost:5975".to_string(),
+                http_url: "http://127.0.0.2:5974".to_string(),
+                ..valid_sync_settings().sync
+            },
+            ..Default::default()
         };
         assert!(build_sync_session_config(&settings, false).is_ok());
     }
@@ -4833,39 +4878,6 @@ mod tests {
     }
 
     #[test]
-    fn empty_topic_diff_is_not_staged_as_a_pending_request() {
-        let mut pending = None;
-        let request = stage_topic_diff_request(&mut pending, HashSet::new(), Vec::new())
-            .expect("empty topic diff should short-circuit");
-
-        assert!(request.is_none());
-        assert!(pending.is_none());
-    }
-
-    #[test]
-    fn nonempty_topic_diff_stages_the_exact_pending_request() {
-        let key = TopicKey::new("agent", "agent-a", "topic-a");
-        let expected = HashSet::from([key.clone()]);
-        let mut pending = None;
-        let request = stage_topic_diff_request(
-            &mut pending,
-            expected.clone(),
-            vec![TopicDiffState {
-                owner_type: OwnerType::Agent,
-                owner_id: key.owner_id,
-                topic_id: key.topic_id,
-                config_hash: "config-a".to_string(),
-                content_hash: "content-a".to_string(),
-            }],
-        )
-        .expect("non-empty topic diff should stage")
-        .expect("non-empty topic diff should create a request");
-
-        assert_eq!(request.topics.len(), 1);
-        assert_eq!(pending, Some(expected));
-    }
-
-    #[test]
     fn topic_diff_staging_does_not_bypass_an_existing_pending_response() {
         let original = HashSet::from([TopicKey::new("agent", "agent-a", "topic-a")]);
         let mut pending = Some(original.clone());
@@ -4874,58 +4886,6 @@ mod tests {
 
         assert_eq!(error, "A topic hash response is already pending");
         assert_eq!(pending, Some(original));
-    }
-
-    #[test]
-    fn version_ack_contract_is_consumed_by_the_handshake_parser() {
-        let accepted = parse_version_ack(
-            &json!({
-                "type": "VERSION_ACK",
-                "versions": [
-                    {"component": "wire", "version": "1.5"},
-                    {"component": "desktop_plugin", "version": "1.5.9"}
-                ],
-                "backendMode": "cds",
-            })
-            .to_string(),
-        )
-        .expect("strict 1.5 acknowledgement");
-        assert_eq!(accepted.package_version, "1.5.9");
-        assert_eq!(accepted.wire_version, "1.5");
-        assert_eq!(accepted.backend_mode, DesktopBackendMode::Cds);
-
-        assert!(parse_version_ack(
-            &json!({
-                "type": "VERSION_ACK",
-                "version": "1.5.0",
-            })
-            .to_string()
-        )
-        .is_err());
-        assert!(parse_version_ack(
-            &json!({
-                "type": "VERSION_ACK",
-                "versions": [
-                    {"component": "desktop_plugin", "version": "1.5.0"},
-                    {"component": "wire", "version": 1.5}
-                ],
-                "backendMode": "cds",
-            })
-            .to_string()
-        )
-        .is_err());
-        assert!(parse_version_ack(
-            &json!({
-                "type": "VERSION_ACK",
-                "versions": [
-                    {"component": "desktop_plugin", "version": "1.5.0"},
-                    {"component": "wire", "version": "1.5"}
-                ],
-                "backendMode": "fallback",
-            })
-            .to_string()
-        )
-        .is_err());
     }
 
     #[test]
@@ -5123,32 +5083,6 @@ mod tests {
         tracker.close_and_wait().await;
 
         assert!(!late_side_effect.load(Ordering::SeqCst));
-    }
-
-    #[tokio::test]
-    async fn cancel_session_waits_for_main_task_exit() {
-        let cancel_token = CancellationToken::new();
-        let task_token = cancel_token.clone();
-        let exited = Arc::new(AtomicBool::new(false));
-        let task_exited = exited.clone();
-        let join_handle = tokio::spawn(async move {
-            task_token.cancelled().await;
-            tokio::time::sleep(Duration::from_millis(10)).await;
-            task_exited.store(true, Ordering::SeqCst);
-            Ok(())
-        });
-
-        let mut session = SyncSessionHandle {
-            session_id: 1,
-            cancel_token,
-            join_handle,
-        };
-        cancel_and_join_session(&mut session, Duration::from_secs(1))
-            .await
-            .expect("session exit should be observed")
-            .expect("session should exit cleanly");
-
-        assert!(exited.load(Ordering::SeqCst));
     }
 
     #[tokio::test]

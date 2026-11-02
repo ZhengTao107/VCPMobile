@@ -14,7 +14,7 @@
  * 物理上它们会渲染在 GlobalOverlayManager 提供的容器中。
  */
 import { defineAsyncComponent, ref, watch } from 'vue';
-import { useOverlayStore } from '../core/stores/overlay';
+import { useOverlayStore, type OverlayPageType } from '../core/stores/overlay';
 import { useSettingsStore } from '../core/stores/settings';
 import { isAndroid } from '../core/utils/platform';
 import ToolInteractionOverlay from '../features/distributed/ToolInteractionOverlay.vue';
@@ -38,10 +38,12 @@ const MailListView = defineAsyncComponent(() => import('../features/mail/MailLis
 const GlobalSearchView = defineAsyncComponent(() => import('../features/globalsearch/GlobalSearchView.vue'));
 const VcpCliManifestView = defineAsyncComponent(() => import('../features/cli/components/VcpCliManifestView.vue'));
 const TarvenSettingsView = defineAsyncComponent(() => import('../features/chat/components/TarvenSettings.vue'));
+const VoiceOptionsView = defineAsyncComponent(() => import('../features/chat/voice/VoiceOptionsView.vue'));
 
 
 const overlayStore = useOverlayStore();
 const settingsStore = useSettingsStore();
+const pageModalId = (type: OverlayPageType) => overlayStore.pageStack.find(page => page.type === type)?.modalId;
 
 const createFirstOpenLatch = (isOpen: () => boolean) => {
   const mounted = ref(isOpen());
@@ -55,6 +57,9 @@ const settingsMounted = createFirstOpenLatch(() => overlayStore.isSettingsOpen);
 const agentSettingsMounted = createFirstOpenLatch(() => overlayStore.isAgentSettingsOpen);
 const groupSettingsMounted = createFirstOpenLatch(() => overlayStore.isGroupSettingsOpen);
 const tarvenSettingsMounted = createFirstOpenLatch(() => overlayStore.isTarvenSettingsOpen);
+const voiceSettingsMounted = createFirstOpenLatch(() => overlayStore.isVoiceSettingsOpen);
+const voiceStyleGuidanceMounted = createFirstOpenLatch(() => overlayStore.isVoiceStyleGuidanceOpen);
+const voiceRuleDetailsMounted = createFirstOpenLatch(() => overlayStore.isVoiceRuleDetailsOpen);
 const distributedMounted = createFirstOpenLatch(() => overlayStore.isDistributedOpen);
 const ragObserverMounted = createFirstOpenLatch(() => overlayStore.isRagObserverOpen);
 const diaryMounted = createFirstOpenLatch(() => overlayStore.isDiaryCenterOpen);
@@ -70,6 +75,7 @@ const globalSearchMounted = createFirstOpenLatch(() => overlayStore.isGlobalSear
 <template>
   <div>
     <SettingsView
+      :data-vcp-modal-id="pageModalId('settings')"
       v-if="settingsMounted"
       :is-open="overlayStore.isSettingsOpen"
       :z-index="overlayStore.getPageZIndex('settings')"
@@ -77,14 +83,17 @@ const globalSearchMounted = createFirstOpenLatch(() => overlayStore.isGlobalSear
     />
 
     <AgentSettingsView
+      :data-vcp-modal-id="pageModalId('agentSettings')"
       v-if="agentSettingsMounted"
       :is-open="overlayStore.isAgentSettingsOpen"
+      :active="overlayStore.pageStackTop?.type === 'agentSettings' && overlayStore.pageStackTop?.id === overlayStore.agentSettingsId"
       :id="overlayStore.agentSettingsId"
       :z-index="overlayStore.getPageZIndex('agentSettings')"
       @close="overlayStore.closeAgentSettings()"
     />
 
     <GroupSettingsView
+      :data-vcp-modal-id="pageModalId('groupSettings')"
       v-if="groupSettingsMounted"
       :is-open="overlayStore.isGroupSettingsOpen"
       :id="overlayStore.groupSettingsId"
@@ -93,6 +102,7 @@ const globalSearchMounted = createFirstOpenLatch(() => overlayStore.isGlobalSear
     />
 
     <TarvenSettingsView
+      :data-vcp-modal-id="pageModalId('tarvenSettings')"
       v-if="tarvenSettingsMounted"
       :is-open="overlayStore.isTarvenSettingsOpen"
       :z-index="overlayStore.getPageZIndex('tarvenSettings')"
@@ -100,15 +110,45 @@ const globalSearchMounted = createFirstOpenLatch(() => overlayStore.isGlobalSear
     />
 
     <SyncSessionView
+      :data-vcp-modal-id="pageModalId('syncSession')"
       v-if="overlayStore.isSyncSessionOpen"
       :z-index="overlayStore.getPageZIndex('syncSession')"
     />
+    <VoiceOptionsView
+      v-if="voiceSettingsMounted"
+      :data-vcp-modal-id="pageModalId('voiceSettings')"
+      mode="settings"
+      :is-open="overlayStore.isVoiceSettingsOpen"
+      :active="overlayStore.pageStackTop?.type === 'voiceSettings'"
+      :z-index="overlayStore.getPageZIndex('voiceSettings')"
+      @close="overlayStore.closeVoiceSettings()"
+    />
+    <VoiceOptionsView
+      v-if="voiceStyleGuidanceMounted"
+      :data-vcp-modal-id="pageModalId('voiceStyleGuidance')"
+      mode="styleGuidance"
+      :is-open="overlayStore.isVoiceStyleGuidanceOpen"
+      :active="overlayStore.pageStackTop?.type === 'voiceStyleGuidance'"
+      :z-index="overlayStore.getPageZIndex('voiceStyleGuidance')"
+      @close="overlayStore.closeVoiceStyleGuidance()"
+    />
+    <VoiceOptionsView
+      v-if="voiceRuleDetailsMounted"
+      :data-vcp-modal-id="pageModalId('voiceRuleDetails')"
+      mode="ruleDetails"
+      :is-open="overlayStore.isVoiceRuleDetailsOpen"
+      :active="overlayStore.pageStackTop?.type === 'voiceRuleDetails'"
+      :z-index="overlayStore.getPageZIndex('voiceRuleDetails')"
+      @close="overlayStore.closeVoiceRuleDetails()"
+    />
     <RebuildSessionView
+      :data-vcp-modal-id="pageModalId('rebuildSession')"
       v-if="overlayStore.isRebuildSessionOpen"
       :z-index="overlayStore.getPageZIndex('rebuildSession')"
     />
 
     <DistributedView
+      :data-vcp-modal-id="pageModalId('distributed')"
       v-if="distributedMounted"
       :is-open="overlayStore.isDistributedOpen"
       :z-index="overlayStore.getPageZIndex('distributed')"
@@ -116,6 +156,7 @@ const globalSearchMounted = createFirstOpenLatch(() => overlayStore.isGlobalSear
     />
 
     <RagObserverView
+      :data-vcp-modal-id="pageModalId('ragObserver')"
       v-if="ragObserverMounted"
       :is-open="overlayStore.isRagObserverOpen"
       :z-index="overlayStore.getPageZIndex('ragObserver')"
@@ -123,6 +164,7 @@ const globalSearchMounted = createFirstOpenLatch(() => overlayStore.isGlobalSear
     />
 
     <VcpCliManifestView
+      :data-vcp-modal-id="pageModalId('cliManifest')"
       v-if="cliManifestMounted && isAndroid"
       :is-open="overlayStore.isCliManifestOpen"
       :z-index="overlayStore.getPageZIndex('cliManifest')"
@@ -130,6 +172,7 @@ const globalSearchMounted = createFirstOpenLatch(() => overlayStore.isGlobalSear
     />
 
     <LogCenterView
+      :data-vcp-modal-id="pageModalId('logCenter')"
       v-if="logCenterMounted"
       :is-open="overlayStore.isLogCenterOpen"
       :z-index="overlayStore.getPageZIndex('logCenter')"
@@ -137,6 +180,7 @@ const globalSearchMounted = createFirstOpenLatch(() => overlayStore.isGlobalSear
     />
 
     <TaskCenterView
+      :data-vcp-modal-id="pageModalId('taskCenter')"
       v-if="taskCenterMounted"
       :is-open="overlayStore.isTaskCenterOpen"
       :z-index="overlayStore.getPageZIndex('taskCenter')"
@@ -144,6 +188,7 @@ const globalSearchMounted = createFirstOpenLatch(() => overlayStore.isGlobalSear
     />
 
     <AgentMgrView
+      :data-vcp-modal-id="pageModalId('agentMgr')"
       v-if="agentMgrMounted"
       :is-open="overlayStore.isAgentMgrOpen"
       :z-index="overlayStore.getPageZIndex('agentMgr')"
@@ -151,6 +196,7 @@ const globalSearchMounted = createFirstOpenLatch(() => overlayStore.isGlobalSear
     />
 
     <ForumListView
+      :data-vcp-modal-id="pageModalId('forum')"
       v-if="forumMounted"
       :is-open="overlayStore.isForumOpen"
       :z-index="overlayStore.getPageZIndex('forum')"
@@ -158,6 +204,7 @@ const globalSearchMounted = createFirstOpenLatch(() => overlayStore.isGlobalSear
     />
 
     <MailListView
+      :data-vcp-modal-id="pageModalId('mail')"
       v-if="mailMounted"
       :is-open="overlayStore.isMailOpen"
       :z-index="overlayStore.getPageZIndex('mail')"
@@ -165,6 +212,7 @@ const globalSearchMounted = createFirstOpenLatch(() => overlayStore.isGlobalSear
     />
 
     <GlobalSearchView
+      :data-vcp-modal-id="pageModalId('globalSearch')"
       v-if="globalSearchMounted"
       :is-open="overlayStore.isGlobalSearchOpen"
       :z-index="overlayStore.getPageZIndex('globalSearch')"
@@ -173,6 +221,7 @@ const globalSearchMounted = createFirstOpenLatch(() => overlayStore.isGlobalSear
 
     <Suspense v-if="diaryMounted">
       <DiaryCenterView
+        :data-vcp-modal-id="pageModalId('diaryCenter')"
         :is-open="overlayStore.isDiaryCenterOpen"
         :z-index="overlayStore.getPageZIndex('diaryCenter')"
         :open-target="overlayStore.diaryOpenTarget"
@@ -182,7 +231,7 @@ const globalSearchMounted = createFirstOpenLatch(() => overlayStore.isGlobalSear
       <template #fallback>
         <div
           v-if="overlayStore.isDiaryCenterOpen"
-          class="fixed inset-0 pointer-events-auto grid place-items-center bg-[var(--primary-bg)] text-sm text-[var(--primary-text)]"
+          class="vcp-viewport-surface fixed inset-0 pointer-events-auto grid place-items-center bg-[var(--primary-bg)] text-sm text-[var(--primary-text)]"
           :style="{ zIndex: overlayStore.getPageZIndex('diaryCenter') }"
         >
           正在打开日记中心…
@@ -191,6 +240,6 @@ const globalSearchMounted = createFirstOpenLatch(() => overlayStore.isGlobalSear
     </Suspense>
 
     <!-- 设备工具交互目前仅接入 Android；用户启用节点后才挂载对应监听。 -->
-    <ToolInteractionOverlay v-if="isAndroid && settingsStore.settings?.distributedEnabled" />
+    <ToolInteractionOverlay v-if="isAndroid && settingsStore.settings?.distributed.enabled" />
   </div>
 </template>

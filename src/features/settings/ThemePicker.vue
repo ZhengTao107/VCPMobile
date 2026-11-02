@@ -1,41 +1,28 @@
 <script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue';
 import {
-  CHAT_PRESENTATION_OPTIONS,
   normalizeThemeModuleKey,
   resolveThemeWallpaperUrl,
   useThemeStore,
-  type ChatPresentationMode,
   type ThemeInfo,
 } from '../../core/stores/theme';
-import { useNotificationStore } from '../../core/stores/notification';
-import SettingsRow from '../../components/settings/SettingsRow.vue';
-import SettingsSwitch from '../../components/settings/SettingsSwitch.vue';
 import ThemeLivePreview from './ThemeLivePreview.vue';
 
-type ThemePickerSection = 'all' | 'theme' | 'rendering';
-
 const props = withDefaults(defineProps<{
-  section?: ThemePickerSection;
+  active?: boolean;
 }>(), {
-  section: 'all',
+  active: true,
 });
 
 const themeStore = useThemeStore();
-const notificationStore = useNotificationStore();
 const railRef = ref<HTMLElement | null>(null);
 const draftThemeKey = ref('');
 const isApplying = ref(false);
 const initializationError = ref('');
 const applyError = ref('');
-const presentationError = ref('');
-const smoothStreamingError = ref('');
 let scrollIdleTimer: number | null = null;
 let scrollMeasureFrame: number | null = null;
 let isActive = true;
-
-const showThemeSettings = computed(() => props.section !== 'rendering');
-const showRenderingSettings = computed(() => props.section !== 'theme');
 
 const appliedThemeKey = computed(() => {
   return normalizeThemeModuleKey(themeStore.currentTheme) || themeStore.availableThemes[0]?.fileName || '';
@@ -48,6 +35,27 @@ const draftTheme = computed(() => {
 const draftIndex = computed(() => {
   return themeStore.availableThemes.findIndex((theme) => theme.fileName === draftThemeKey.value);
 });
+
+const hasPreviousTheme = computed(() => draftIndex.value > 0);
+const hasNextTheme = computed(() => {
+  return draftIndex.value >= 0 && draftIndex.value < themeStore.availableThemes.length - 1;
+});
+
+const goToPreviousTheme = () => {
+  if (!hasPreviousTheme.value || !props.active) return;
+  const targetTheme = themeStore.availableThemes[draftIndex.value - 1];
+  if (targetTheme) {
+    selectTheme(targetTheme, true);
+  }
+};
+
+const goToNextTheme = () => {
+  if (!hasNextTheme.value || !props.active) return;
+  const targetTheme = themeStore.availableThemes[draftIndex.value + 1];
+  if (targetTheme) {
+    selectTheme(targetTheme, true);
+  }
+};
 
 const isDirty = computed(() => {
   return Boolean(draftThemeKey.value && draftThemeKey.value !== appliedThemeKey.value);
@@ -93,6 +101,7 @@ const scrollThemeIntoView = (themeKey: string, smooth = false) => {
 };
 
 const selectTheme = (theme: ThemeInfo, alignCard = true) => {
+  if (!props.active) return;
   draftThemeKey.value = theme.fileName;
   applyError.value = '';
   if (alignCard) scrollThemeIntoView(theme.fileName, true);
@@ -115,7 +124,9 @@ const selectNearestTheme = () => {
   const theme = key
     ? themeStore.availableThemes.find((candidate) => candidate.fileName === key)
     : undefined;
-  if (theme) selectTheme(theme, false);
+  if (theme && theme.fileName !== draftThemeKey.value) {
+    selectTheme(theme, false);
+  }
 };
 
 const handleRailScroll = () => {
@@ -127,11 +138,23 @@ const handleRailScroll = () => {
       scrollMeasureFrame = null;
       selectNearestTheme();
     });
-  }, 100);
+  }, 60);
+};
+
+const handleRailScrollEnd = () => {
+  if (scrollIdleTimer !== null) {
+    window.clearTimeout(scrollIdleTimer);
+    scrollIdleTimer = null;
+  }
+  if (scrollMeasureFrame !== null) {
+    cancelAnimationFrame(scrollMeasureFrame);
+    scrollMeasureFrame = null;
+  }
+  selectNearestTheme();
 };
 
 const applyDraftTheme = async () => {
-  if (!isDirty.value || !draftThemeKey.value || isApplying.value) return;
+  if (!props.active || !isDirty.value || !draftThemeKey.value || isApplying.value) return;
   isApplying.value = true;
   applyError.value = '';
   try {
@@ -147,39 +170,7 @@ const applyDraftTheme = async () => {
   }
 };
 
-const selectPresentationMode = (mode: ChatPresentationMode) => {
-  presentationError.value = '';
-  const result = themeStore.setPresentationMode(mode);
-  if (result.ok) return;
-
-  presentationError.value = result.error || '消息呈现设置保存失败';
-  notificationStore.addNotification({
-    id: 'chat-presentation-save-failed',
-    type: 'error',
-    title: '消息呈现切换失败',
-    message: presentationError.value,
-    toastOnly: true,
-  });
-};
-
-const updateSmoothStreaming = (enabled: boolean) => {
-  smoothStreamingError.value = '';
-  const result = themeStore.setSmoothStreamingEnabled(enabled);
-  if (result.ok) return;
-
-  smoothStreamingError.value = result.error || '平滑流式设置保存失败';
-  notificationStore.addNotification({
-    id: 'smooth-streaming-save-failed',
-    type: 'error',
-    title: '平滑流式设置失败',
-    message: smoothStreamingError.value,
-    toastOnly: true,
-  });
-};
-
 onMounted(async () => {
-  if (!showThemeSettings.value) return;
-
   try {
     // 设置页打开时已预热主题清单（见 SettingsView.warmSubPages）；
     // 仅在未经预热直接进入时才自行拉取，避免重复构建清单数组引发的二次渲染。
@@ -205,7 +196,7 @@ onMounted(async () => {
 watch(
   () => themeStore.currentTheme,
   async (nextTheme, previousTheme) => {
-    if (!showThemeSettings.value) return;
+    if (!props.active) return;
 
     const previousAppliedKey = normalizeThemeModuleKey(previousTheme);
     const draftWasClean = !draftThemeKey.value || draftThemeKey.value === previousAppliedKey;
@@ -226,9 +217,9 @@ onBeforeUnmount(() => {
 <template>
   <div class="theme-picker-shell h-full min-h-0">
     <div class="theme-picker-scroll h-full min-h-0 overflow-y-auto no-rubber-band">
-      <ThemeLivePreview v-if="showThemeSettings" :theme="draftTheme" :initialization-error="initializationError" />
+      <ThemeLivePreview :theme="draftTheme" :initialization-error="initializationError" />
 
-      <section v-if="showThemeSettings" class="theme-settings-section" aria-labelledby="theme-carousel-title">
+      <section class="theme-settings-section" aria-labelledby="theme-carousel-title">
         <div class="theme-section-heading is-compact">
           <div>
             <h3 id="theme-carousel-title">主题选择</h3>
@@ -240,11 +231,26 @@ onBeforeUnmount(() => {
           </span>
         </div>
 
-        <div ref="railRef" class="theme-carousel" data-testid="theme-carousel" @scroll.passive="handleRailScroll">
+        <div class="theme-carousel-wrapper">
+          <button
+            type="button"
+            class="theme-nav-btn is-prev"
+            data-testid="theme-nav-prev"
+            :disabled="!hasPreviousTheme || !active"
+            aria-label="上一个主题"
+            @click="goToPreviousTheme"
+          >
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"
+              stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <polyline points="15 18 9 12 15 6"></polyline>
+            </svg>
+          </button>
+
+          <div ref="railRef" class="theme-carousel" data-testid="theme-carousel" @scroll.passive="handleRailScroll" @scrollend.passive="handleRailScrollEnd">
           <button v-for="theme in themeStore.availableThemes" :key="theme.fileName" type="button"
             class="theme-card" :class="draftThemeKey === theme.fileName ? 'is-selected' : ''"
             :data-theme-key="theme.fileName" :aria-pressed="draftThemeKey === theme.fileName"
-            :aria-label="`预览主题：${theme.name}`" @click="selectTheme(theme)">
+            :aria-label="`预览主题：${theme.name}`" :disabled="!active" @click="selectTheme(theme)">
             <span class="theme-card-visual is-dark" :style="cardStyle(theme, 'dark')"></span>
             <span class="theme-card-visual is-light" :style="cardStyle(theme, 'light')"></span>
             <span class="theme-card-shade"></span>
@@ -257,65 +263,29 @@ onBeforeUnmount(() => {
           </button>
         </div>
 
+          <button
+            type="button"
+            class="theme-nav-btn is-next"
+            data-testid="theme-nav-next"
+            :disabled="!hasNextTheme || !active"
+            aria-label="下一个主题"
+            @click="goToNextTheme"
+          >
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"
+              stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <polyline points="9 18 15 12 9 6"></polyline>
+            </svg>
+          </button>
+        </div>
+
         <p v-if="initializationError" class="theme-error" role="alert">{{ initializationError }}</p>
         <p v-if="applyError" class="theme-error" role="alert">{{ applyError }}</p>
         <button type="button" class="theme-apply-button" data-testid="theme-apply-button"
-          :disabled="!isDirty || isApplying || !draftTheme" @click="applyDraftTheme">
+          :disabled="!active || !isDirty || isApplying || !draftTheme" @click="applyDraftTheme">
           {{ applyButtonLabel }}
         </button>
       </section>
 
-      <section v-if="showRenderingSettings" class="theme-settings-section presentation-settings" aria-labelledby="presentation-title"
-        data-testid="presentation-settings">
-        <div class="streaming-preference">
-          <SettingsRow title="平滑流式输出" description="让流式新增文字柔和显现，不改变回复内容；系统减少动态效果时自动停用。">
-            <template #action>
-              <button
-                type="button"
-                data-testid="smooth-streaming-switch"
-                class="smooth-streaming-toggle"
-                role="switch"
-                :aria-checked="themeStore.smoothStreamingEnabled"
-                aria-label="平滑流式输出"
-                @click="updateSmoothStreaming(!themeStore.smoothStreamingEnabled)"
-              >
-                <SettingsSwitch
-                  class="pointer-events-none"
-                  :model-value="themeStore.smoothStreamingEnabled"
-                />
-              </button>
-            </template>
-          </SettingsRow>
-        </div>
-        <p v-if="smoothStreamingError" class="theme-error" role="alert">{{ smoothStreamingError }}</p>
-
-        <div class="theme-section-heading">
-          <div>
-            <h3 id="presentation-title">消息呈现与内容宽度</h3>
-            <p>点选后立即生效；聊天页长按深浅按钮也可快速切换。</p>
-          </div>
-        </div>
-
-        <div class="presentation-options" role="radiogroup" aria-labelledby="presentation-title">
-          <button v-for="option in CHAT_PRESENTATION_OPTIONS" :key="option.value" type="button"
-            class="presentation-option" :class="themeStore.presentationMode === option.value ? 'is-selected' : ''"
-            role="radio" :aria-checked="themeStore.presentationMode === option.value"
-            :data-presentation-value="option.value" @click="selectPresentationMode(option.value)">
-            <span class="presentation-accent" aria-hidden="true"></span>
-            <span class="presentation-copy">
-              <strong>{{ option.title }}</strong>
-              <small>{{ option.description }}</small>
-            </span>
-            <span class="presentation-short-name font-mono">{{ option.label }}</span>
-            <svg v-if="themeStore.presentationMode === option.value" class="presentation-check" width="16" height="16"
-              viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"
-              stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-              <polyline points="20 6 9 17 4 12"></polyline>
-            </svg>
-          </button>
-        </div>
-        <p v-if="presentationError" class="theme-error" role="alert">{{ presentationError }}</p>
-      </section>
     </div>
   </div>
 </template>
@@ -379,6 +349,13 @@ onBeforeUnmount(() => {
   text-align: right;
 }
 
+.theme-carousel-wrapper {
+  position: relative;
+  display: flex;
+  align-items: center;
+  width: 100%;
+}
+
 .theme-carousel {
   display: flex;
   gap: 0.625rem;
@@ -403,11 +380,19 @@ onBeforeUnmount(() => {
   border: 2px solid transparent;
   border-radius: 0.875rem;
   scroll-snap-align: center;
+  scroll-snap-stop: always;
+  opacity: 0.68;
+  transform: scale(0.95);
+  transition: transform 0.22s cubic-bezier(0.2, 0.8, 0.4, 1), opacity 0.22s ease, border-color 0.22s ease;
+  will-change: transform, opacity;
   text-align: left;
 }
 
 .theme-card.is-selected {
+  opacity: 1;
+  transform: scale(1);
   border-color: var(--highlight-text);
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.18);
 }
 
 .theme-card-visual {
@@ -476,96 +461,52 @@ onBeforeUnmount(() => {
   opacity: 0.68;
 }
 
-.presentation-options {
-  border-top: 1px solid var(--vcp-border-subtle);
-}
-
-.presentation-option {
-  position: relative;
-  display: flex;
-  align-items: center;
-  gap: 0.75rem;
-  width: 100%;
-  min-height: 4rem;
-  padding: 0.7rem 0.5rem 0.7rem 0.75rem;
-  color: var(--primary-text);
-  background-color: transparent;
-  border: 0;
-  border-bottom: 1px solid var(--vcp-border-subtle);
-  text-align: left;
-}
-
-.presentation-option.is-selected {
-  background-color: var(--vcp-highlight-bg-10);
-}
-
-.presentation-accent {
-  position: absolute;
-  top: 0.5rem;
-  bottom: 0.5rem;
-  left: 0;
-  width: 2px;
-  background-color: transparent;
-  border-radius: 1px;
-}
-
-.presentation-option.is-selected .presentation-accent {
-  background-color: var(--highlight-text);
-}
-
-.presentation-copy {
-  display: flex;
-  flex: 1 1 auto;
-  flex-direction: column;
-  min-width: 0;
-}
-
-.presentation-copy strong {
-  font-size: 0.8125rem;
-}
-
-.presentation-copy small {
-  margin-top: 0.18rem;
-  color: var(--secondary-text);
-  font-size: 0.6875rem;
-  line-height: 1.4;
-}
-
-.presentation-short-name {
-  flex: 0 0 auto;
-  color: var(--secondary-text);
-  font-size: 0.625rem;
-  white-space: nowrap;
-}
-
-.presentation-check {
-  flex: 0 0 auto;
-  color: var(--highlight-text);
-}
-
-.streaming-preference {
-  margin-bottom: 0.75rem;
-  padding-bottom: 0.75rem;
-  border-bottom: 1px solid var(--vcp-border-subtle);
-}
-
-.smooth-streaming-toggle {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  width: 2.75rem;
-  height: 2.75rem;
-  margin: -0.75rem -0.25rem -0.75rem 0;
-  color: inherit;
-  background: transparent;
-  border: 0;
-}
-
 .theme-error {
   margin: 0.5rem 0 0;
   color: #ef4444;
   font-size: 0.6875rem;
   line-height: 1.4;
+}
+
+.theme-nav-btn {
+  position: absolute;
+  top: 50%;
+  z-index: 2;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 2.25rem;
+  height: 2.25rem;
+  padding: 0;
+  color: var(--primary-text);
+  background-color: var(--vcp-panel-bg-90);
+  border: 1px solid var(--vcp-border-subtle);
+  border-radius: 50%;
+  transform: translateY(-50%);
+  cursor: pointer;
+  touch-action: manipulation;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.15);
+  transition: opacity 0.18s ease, transform 0.18s ease, background-color 0.18s ease;
+}
+
+.theme-nav-btn.is-prev {
+  left: 0.25rem;
+}
+
+.theme-nav-btn.is-next {
+  right: 0.25rem;
+}
+
+.theme-nav-btn:active:not(:disabled) {
+  transform: translateY(-50%) scale(0.9);
+  background-color: var(--secondary-bg);
+}
+
+.theme-nav-btn:disabled {
+  opacity: 0.2;
+  cursor: not-allowed;
+  pointer-events: none;
+  box-shadow: none;
 }
 
 @media (min-width: 480px) {
@@ -592,7 +533,9 @@ onBeforeUnmount(() => {
 }
 
 @media (prefers-reduced-motion: reduce) {
-  .theme-apply-button {
+  .theme-apply-button,
+  .theme-card,
+  .theme-nav-btn {
     transition: none;
   }
 }

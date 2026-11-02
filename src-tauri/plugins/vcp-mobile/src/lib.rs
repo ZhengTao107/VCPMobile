@@ -10,6 +10,8 @@ mod ios;
 mod screen;
 pub mod stream;
 pub mod system;
+pub mod voice;
+mod webview;
 
 #[cfg(target_os = "ios")]
 tauri::ios_plugin_binding!(init_plugin_vcp_mobile);
@@ -72,6 +74,11 @@ pub fn init<R: Runtime>() -> TauriPlugin<R> {
             system::check_auto_start_permission,
             system::get_free_disk_space,
             system::pick_file,
+            system::prepare_file_operation,
+            system::cancel_file_operation,
+            system::get_webview_geometry,
+            webview::connect_webview_resume,
+            webview::complete_webview_resume,
             system::get_battery_status,
             system::get_network_status,
             system::open_file_native,
@@ -99,9 +106,11 @@ pub fn init<R: Runtime>() -> TauriPlugin<R> {
             system::open_unknown_sources_settings,
             system::acquire_ota_keepalive,
             system::release_ota_keepalive,
+            system::trigger_haptic_feedback,
         ])
         .setup(|app, _api| {
             app.manage(events::ServiceFailureNotices::default());
+            app.manage(voice::VoiceAudioState::default());
             #[cfg(target_os = "android")]
             let plugin_handle =
                 _api.register_android_plugin("com.vcp.mobile", "VcpMobilePlugin")?;

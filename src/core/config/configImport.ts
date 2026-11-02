@@ -4,12 +4,28 @@
 // 本模块只做纯计算，不读写设置；写入由调用方走 settingsStore.updateSettings。
 import {
   CONNECTION_PROFILE_FIELDS,
+  CONNECTION_PROFILE_PATHS,
   SERVER_PROFILE_NAME,
   newConnectionProfileId,
-  type AppSettings,
+  parseConnectionProfiles,
+  readConnectionField,
+  serializeConnectionProfiles,
   type ConnectionProfile,
   type ConnectionProfileField,
-} from "../stores/settings";
+} from "./connectionProfiles";
+import type { AppSettings } from "../stores/settings";
+
+/** 配置串所见的连接视图：旧扁平键名 + 档案数组（ptp4g#31 起由分域配置映射得到） */
+export type ConnectionSettingsView = Partial<Record<ConnectionProfileField, string>> & {
+  connectionProfiles?: unknown;
+};
+
+export function connectionSettingsView(settings: AppSettings): ConnectionSettingsView {
+  const view: ConnectionSettingsView = {};
+  for (const field of CONNECTION_PROFILE_FIELDS) view[field] = readConnectionField(settings, field);
+  view.connectionProfiles = parseConnectionProfiles(settings.server.connectionProfiles);
+  return view;
+}
 
 export const CONFIG_STRING_PREFIX = "vcpm1:";
 export const CONFIG_STRING_VERSION = 1;
@@ -339,7 +355,7 @@ export function parseConfigString(text: string): ParseConfigResult {
  * （顶层可能就是本机内网地址），所有内网 / localhost 地址一律不带；没有该档案时不带档案与顶层 VCP 地址。
  */
 export function buildConfigString(
-  settings: Partial<AppSettings>,
+  settings: ConnectionSettingsView,
   label?: string,
   options: BuildConfigOptions = {},
 ): string {
@@ -376,19 +392,20 @@ export function buildConfigString(
   return CONFIG_STRING_PREFIX + encodeBase64Url(JSON.stringify(payload));
 }
 
-/** 解析结果 → update_settings 的 patch（不含 label 等非设置项） */
-export function toSettingsPatch(config: ImportedConfig): Partial<AppSettings> {
-  const patch: Partial<AppSettings> = {};
+/** 解析结果 → updateFields 的字段路径值（不含 label 等非设置项） */
+export function toSettingsPatch(config: ImportedConfig): Record<string, string> {
+  const patch: Record<string, string> = {};
   for (const field of CONFIG_STRING_FIELDS) {
     const value = config[field];
-    if (value !== undefined) patch[field] = value;
+    if (value !== undefined) patch[CONNECTION_PROFILE_PATHS[field]] = value;
   }
   if (config.connectionProfiles?.length) {
-    patch.connectionProfiles = config.connectionProfiles.map((profile) => ({ ...profile }));
+    patch["server.connectionProfiles"] = serializeConnectionProfiles(
+      config.connectionProfiles.map((profile: ConnectionProfile) => ({ ...profile })),
+    );
   }
   return patch;
 }
-
 /** 密钥只露后 4 位；长度不超过 4 时全部遮蔽，避免短密钥整段外露 */
 export function maskSecret(value: string): string {
   if (value.length <= 4) return "••••";

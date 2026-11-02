@@ -14,6 +14,9 @@ export type OverlayPageType =
   | 'syncSession'
   | 'rebuildSession'
   | 'tarvenSettings'
+  | 'voiceSettings'
+  | 'voiceStyleGuidance'
+  | 'voiceRuleDetails'
   | 'distributed'
   | 'ragObserver'
   | 'diaryCenter'
@@ -44,6 +47,7 @@ export const useOverlayStore = defineStore('overlay', () => {
   const contextMenuConfig = shallowRef<ContextMenuConfig | null>(null);
   const editorConfig = ref<EditorConfig | null>(null);
   const diaryOpenTarget = ref<DiaryOpenTarget | null>(null);
+  const requestedSettingsSubPage = ref<string | null>(null);
 
   // --- Page Stack (Virtual Navigation Stack) ---
   const pageStack = ref<PageStackItem[]>([]);
@@ -56,6 +60,9 @@ export const useOverlayStore = defineStore('overlay', () => {
   const isSyncSessionOpen = computed(() => pageStack.value.some(p => p.type === 'syncSession'));
   const isRebuildSessionOpen = computed(() => pageStack.value.some(p => p.type === 'rebuildSession'));
   const isTarvenSettingsOpen = computed(() => pageStack.value.some(p => p.type === 'tarvenSettings'));
+  const isVoiceSettingsOpen = computed(() => pageStack.value.some(p => p.type === 'voiceSettings'));
+  const isVoiceStyleGuidanceOpen = computed(() => pageStack.value.some(p => p.type === 'voiceStyleGuidance'));
+  const isVoiceRuleDetailsOpen = computed(() => pageStack.value.some(p => p.type === 'voiceRuleDetails'));
   const isDistributedOpen = computed(() => pageStack.value.some(p => p.type === 'distributed'));
   const isRagObserverOpen = computed(() => pageStack.value.some(p => p.type === 'ragObserver'));
   const isDiaryCenterOpen = computed(() => pageStack.value.some(p => p.type === 'diaryCenter'));
@@ -136,7 +143,7 @@ export const useOverlayStore = defineStore('overlay', () => {
       void syncStore.close();
       popPageInternal();
       return true;
-    });
+    }, undefined, undefined, () => syncStore.canDismiss);
   };
 
   const popSyncSessionPage = () => {
@@ -199,12 +206,21 @@ export const useOverlayStore = defineStore('overlay', () => {
   };
 
   // --- Legacy API wrappers (backward compatible) ---
-  const openSettings = () => {
+  const openSettings = (subPageId?: string) => {
+    if (subPageId) requestedSettingsSubPage.value = subPageId;
+    if (isSettingsOpen.value) return;
     pushPage('settings');
   };
 
   const closeSettings = () => {
+    requestedSettingsSubPage.value = null;
     popPage();
+  };
+
+  const consumeRequestedSettingsSubPage = () => {
+    const page = requestedSettingsSubPage.value;
+    requestedSettingsSubPage.value = null;
+    return page;
   };
 
   const openAgentSettings = (id: string) => {
@@ -228,6 +244,36 @@ export const useOverlayStore = defineStore('overlay', () => {
   };
 
   const closeTarvenSettings = () => {
+    popPage();
+  };
+
+  const openVoiceSettings = () => {
+    if (isVoiceSettingsOpen.value) return;
+    pushPage('voiceSettings');
+  };
+
+  const closeVoiceSettings = () => {
+    if (pageStackTop.value?.type !== 'voiceSettings') return;
+    popPage();
+  };
+
+  const openVoiceStyleGuidance = () => {
+    if (isVoiceStyleGuidanceOpen.value) return;
+    pushPage('voiceStyleGuidance');
+  };
+
+  const closeVoiceStyleGuidance = () => {
+    if (pageStackTop.value?.type !== 'voiceStyleGuidance') return;
+    popPage();
+  };
+
+  const openVoiceRuleDetails = () => {
+    if (isVoiceRuleDetailsOpen.value) return;
+    pushPage('voiceRuleDetails');
+  };
+
+  const closeVoiceRuleDetails = () => {
+    if (pageStackTop.value?.type !== 'voiceRuleDetails') return;
     popPage();
   };
 
@@ -422,6 +468,9 @@ export const useOverlayStore = defineStore('overlay', () => {
     isSyncSessionOpen,
     isRebuildSessionOpen,
     isTarvenSettingsOpen,
+    isVoiceSettingsOpen,
+    isVoiceStyleGuidanceOpen,
+    isVoiceRuleDetailsOpen,
     isDistributedOpen,
     isRagObserverOpen,
     isDiaryCenterOpen,
@@ -435,6 +484,8 @@ export const useOverlayStore = defineStore('overlay', () => {
     diaryOpenTarget,
     // Legacy open/close (now backed by page stack)
     openSettings,
+    requestedSettingsSubPage,
+    consumeRequestedSettingsSubPage,
     closeSettings,
     openAgentSettings,
     closeAgentSettings,
@@ -447,6 +498,12 @@ export const useOverlayStore = defineStore('overlay', () => {
     closeRebuildSession,
     openTarvenSettings,
     closeTarvenSettings,
+    openVoiceSettings,
+    closeVoiceSettings,
+    openVoiceStyleGuidance,
+    closeVoiceStyleGuidance,
+    openVoiceRuleDetails,
+    closeVoiceRuleDetails,
     openDistributed,
     closeDistributed,
     openRagObserver,

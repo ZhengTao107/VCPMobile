@@ -1,6 +1,7 @@
 <script setup lang="ts">
-import { computed } from 'vue';
+import { computed, ref, watch, onUnmounted } from 'vue';
 import type { OverlayActionItem } from '../../core/types/overlay';
+import { useModalHistory } from '../../core/composables/useModalHistory';
 
 const props = defineProps<{
   isOpen: boolean;
@@ -12,6 +13,13 @@ const props = defineProps<{
 const isSelectionMenu = computed(() => props.actions.some((action) => action.selected !== undefined));
 
 const emit = defineEmits(['close', 'action-click', 'header-action-click']);
+const surfaceRef = ref<HTMLElement | null>(null);
+const { registerModal, unregisterModal } = useModalHistory();
+watch(() => props.isOpen, (open) => {
+  if (open) registerModal('ContextMenu', () => emit('close'), () => surfaceRef.value);
+  else unregisterModal('ContextMenu');
+}, { immediate: true });
+onUnmounted(() => unregisterModal('ContextMenu'));
 
 const handleBackdropClick = () => {
   emit('close');
@@ -34,17 +42,20 @@ const handleHeaderAction = () => {
 <template>
   <Teleport to="body">
     <Transition name="fade">
-      <div v-if="isOpen" class="fixed inset-0 bg-black/20 pointer-events-auto z-dialog"
+      <div v-if="isOpen" class="vcp-viewport-surface fixed inset-0 bg-black/20 pointer-events-auto z-dialog"
         @click="handleBackdropClick">
-        <div
+        <div ref="surfaceRef"
           v-guide="'context-menu-sheet'"
-          class="absolute left-1/2 -translate-x-1/2 w-[calc(100%-24px)] max-w-sm rounded-3xl border border-black/5 dark:border-white/10 bg-white/92 dark:bg-[#111827]/92 shadow-2xl overflow-hidden"
-          :style="{ bottom: 'calc(var(--vcp-safe-bottom, 48px) + 24px)' }"
+          class="absolute left-1/2 -translate-x-1/2 w-[calc(100%-24px)] max-w-sm rounded-3xl border border-black/5 dark:border-white/10 bg-white/92 dark:bg-[#111827]/92 shadow-2xl overflow-hidden flex flex-col"
+          :style="{
+            bottom: 'calc(var(--vcp-safe-bottom, 48px) + 24px)',
+            maxHeight: 'min(20rem, 55%, calc(100% - var(--vcp-safe-top, 24px) - var(--vcp-safe-bottom, 48px) - 48px))',
+          }"
           role="dialog"
           aria-modal="true"
           :aria-label="title || '操作菜单'"
           @click.stop>
-          <div v-if="title" class="min-h-14 px-5 py-3 border-b border-black/5 dark:border-white/10 flex items-center justify-between gap-3">
+          <div v-if="title" class="min-h-14 shrink-0 px-5 py-3 border-b border-black/5 dark:border-white/10 flex items-center justify-between gap-3">
             <h3 class="text-sm font-black tracking-wide">{{ title }}</h3>
             <button
               v-if="headerAction"
@@ -64,8 +75,8 @@ const handleHeaderAction = () => {
               <span>{{ headerAction.label }}</span>
             </button>
           </div>
-          <div class="p-2" :role="isSelectionMenu ? 'radiogroup' : undefined" :aria-label="isSelectionMenu ? title : undefined">
-            <button v-for="action in actions" :key="action.label" @click="handleAction(action)"
+          <div class="context-menu-scroll vcp-scrollable p-2 min-h-0 overflow-y-auto overscroll-contain" :role="isSelectionMenu ? 'radiogroup' : undefined" :aria-label="isSelectionMenu ? title : undefined">
+            <button v-for="action in actions" :key="action.id ?? action.label" @click="handleAction(action)"
               :disabled="action.disabled"
               :role="isSelectionMenu ? 'radio' : undefined"
               :aria-checked="isSelectionMenu ? action.selected === true : undefined"
@@ -91,6 +102,14 @@ const handleHeaderAction = () => {
 </template>
 
 <style scoped>
+.context-menu-scroll {
+  scrollbar-color: rgba(128, 128, 128, 0.65) transparent;
+}
+
+.context-menu-scroll::-webkit-scrollbar-thumb {
+  background: rgba(128, 128, 128, 0.65);
+}
+
 .fade-enter-active,
 .fade-leave-active {
   transition: opacity 0.25s ease;

@@ -14,6 +14,11 @@ commands.allow = [
     "check_notification_listener_permission",
     "request_notification_listener_permission",
     "pick_file",
+    "prepare_file_operation",
+    "cancel_file_operation",
+    "get_webview_geometry",
+    "connect_webview_resume",
+    "complete_webview_resume",
     "get_battery_status",
     "get_network_status",
     "open_file_native",
@@ -47,4 +52,5 @@ commands.allow = [
     "open_unknown_sources_settings",
     "acquire_ota_keepalive",
     "release_ota_keepalive",
+    "trigger_haptic_feedback",
 ]

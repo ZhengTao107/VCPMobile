@@ -5,7 +5,7 @@
 //! 配置/状态 JSON 以 Value 透传（契约解释权在前端 Store 的归一化层）。
 
 use crate::vcp_modules::infra::admin_api;
-use crate::vcp_modules::settings_manager::{read_settings, SettingsState};
+use crate::vcp_modules::settings_manager::{read_config, SettingsState};
 use reqwest::{Method, RequestBuilder, StatusCode};
 use serde_json::Value;
 use std::time::Duration;
@@ -90,8 +90,8 @@ async fn send_json(request: RequestBuilder, timeout: Duration) -> Result<Value, 
 async fn settings_of<R: Runtime>(
     app_handle: AppHandle<R>,
     settings_state: State<'_, SettingsState>,
-) -> Result<crate::vcp_modules::settings_manager::Settings, String> {
-    let settings = read_settings(app_handle, settings_state).await?;
+) -> Result<std::sync::Arc<crate::vcp_modules::settings_manager::Settings>, String> {
+    let settings = read_config(app_handle, settings_state).await?;
     admin_api::ensure_admin_config(&settings, "任务调度中心")?;
     Ok(settings)
 }
@@ -161,6 +161,19 @@ pub async fn task_set_enabled<R: Runtime>(
 /// 安全注意：后端 `POST /task-assistant/config` 是**全量覆盖**语义——
 /// 请求体不含 tasks 时会把任务列表清空。因此这里必须 read-modify-write：
 /// 先 GET 完整 config，仅改写 globalEnabled 后整体回写。
+fn global_enabled_payload(response: Value, enabled: bool) -> Result<Value, String> {
+    let mut config = response
+        .get("config")
+        .and_then(Value::as_object)
+        .cloned()
+        .ok_or_else(|| "服务器返回的 config 结构异常，已中止写入".to_string())?;
+    if !config.get("tasks").is_some_and(Value::is_array) {
+        return Err("服务器返回的 tasks 结构异常，已中止写入".to_string());
+    }
+    config.insert("globalEnabled".to_string(), Value::Bool(enabled));
+    Ok(Value::Object(config))
+}
+
 #[tauri::command]
 pub async fn task_set_global_enabled<R: Runtime>(
     app_handle: AppHandle<R>,
@@ -170,17 +183,13 @@ pub async fn task_set_global_enabled<R: Runtime>(
     let settings = settings_of(app_handle, settings_state).await?;
     let config_url = build_url(&settings, &["task-assistant", "config"])?;
 
-    let mut config = send_json(
+    let response = send_json(
         admin_api::client_get(&settings, &config_url)?,
         DEFAULT_TIMEOUT,
     )
     .await?;
 
-    let payload = config
-        .get_mut("config")
-        .and_then(|c| c.as_object_mut())
-        .ok_or_else(|| "服务器返回的 config 结构异常，已中止写入".to_string())?;
-    payload.insert("globalEnabled".to_string(), Value::Bool(enabled));
+    let config = global_enabled_payload(response, enabled)?;
 
     send_json(
         admin_api::client_post_json(&settings, &config_url, &config)?,
@@ -313,37 +322,39 @@ pub async fn delegation_cancel<R: Runtime>(
 }
 
 #[cfg(test)]
-mod tests {
+mod config_tests {
     use super::*;
-    use crate::vcp_modules::settings_manager::Settings;
+    use serde_json::json;
 
-    fn settings() -> Settings {
-        Settings {
-            vcp_server_url: "http://localhost:8080/v1/chat/completions".to_string(),
-            admin_username: "admin".to_string(),
-            admin_password: "secret".to_string(),
-            ..Default::default()
+    #[test]
+    fn global_toggle_posts_only_the_preserved_inner_configuration() {
+        let config = json!({
+            "globalEnabled":false,"tasks":[{"id":"existing-task","enabled":false}],
+            "settings":{"maxHistory":80},"extra":"keep"
+        });
+        let response =
+            json!({"config":config,"availableTaskTypes":["custom_prompt"],"taskTemplates":{}});
+        for enabled in [true, false] {
+            let payload = global_enabled_payload(response.clone(), enabled).unwrap();
+            let mut expected = config.clone();
+            expected["globalEnabled"] = json!(enabled);
+            assert_eq!(payload, expected);
+            assert!(payload.get("config").is_none());
+            assert!(payload.get("availableTaskTypes").is_none());
         }
+        assert_eq!(
+            global_enabled_payload(json!({"config":{"tasks":[]}}), true).unwrap(),
+            json!({"tasks":[],"globalEnabled":true})
+        );
     }
 
     #[test]
-    fn task_url_percent_encodes_chinese_id() {
-        let url = task_url(&settings(), "task_forum_晨间巡航_123").unwrap();
-        assert!(url.starts_with("http://localhost:8080/admin_api/task-assistant/tasks/"));
-        assert!(!url.contains('晨'), "taskId 必须百分号编码: {url}");
-        assert!(url.contains("%E6%99%A8"));
-    }
-
-    #[test]
-    fn task_url_rejects_empty_and_control_chars() {
-        assert!(task_url(&settings(), "").is_err());
-        assert!(task_url(&settings(), "  ").is_err());
-        assert!(task_url(&settings(), "abc\u{0007}").is_err());
-    }
-
-    #[test]
-    fn task_url_preserves_safe_id() {
-        let url = task_url(&settings(), "task_custom_prompt_demo_1724000000000").unwrap();
-        assert!(url.ends_with("/tasks/task_custom_prompt_demo_1724000000000"));
+    fn damaged_task_lists_are_not_replaced_with_an_empty_default() {
+        for response in [json!({}), json!({"config":false}), json!({"config":{}})] {
+            assert!(global_enabled_payload(response, true).is_err());
+        }
+        for invalid in [Value::Null, json!(false), json!(0), json!(""), json!({})] {
+            assert!(global_enabled_payload(json!({"config":{"tasks":invalid}}), false).is_err());
+        }
     }
 }

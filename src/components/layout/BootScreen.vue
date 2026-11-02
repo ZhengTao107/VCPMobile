@@ -27,7 +27,7 @@ const restartApp = async () => {
   <!-- 0. 全局初始化加载层 (通用) -->
   <Transition name="fade">
     <div v-if="lifecycleStore.state !== 'READY' && lifecycleStore.state !== 'ERROR' && lifecycleStore.state !== 'OPTIMIZING'"
-      class="vcp-boot-surface vcp-safe-inline fixed inset-0 z-boot bg-white/96 dark:bg-gray-950/96 flex flex-col items-center justify-center gap-6 px-8 text-center">
+      class="vcp-viewport-surface vcp-boot-surface vcp-safe-inline fixed inset-0 z-boot bg-white/96 dark:bg-gray-950/96 flex flex-col items-center justify-center gap-6 px-8 text-center">
       <div class="w-18 h-18 relative">
         <div class="absolute inset-0 rounded-full border-4 border-blue-500/15"></div>
         <div
@@ -43,10 +43,10 @@ const restartApp = async () => {
     </div>
   </Transition>
 
-  <!-- 0.3 数据库存储优化进度展示层 -->
+  <!-- 数据库核查或存储维护期间，显示核心返回的当前阶段。 -->
   <Transition name="fade">
     <div v-if="lifecycleStore.state === 'OPTIMIZING'"
-      class="vcp-boot-surface vcp-safe-inline fixed inset-0 z-boot bg-white/96 dark:bg-gray-950/96 flex flex-col items-center justify-center gap-6 px-8 text-center">
+      class="vcp-viewport-surface vcp-boot-surface vcp-safe-inline fixed inset-0 z-boot bg-white/96 dark:bg-gray-950/96 flex flex-col items-center justify-center gap-6 px-8 text-center">
       <div class="w-18 h-18 relative">
         <div class="absolute inset-0 rounded-full border-4 border-blue-500/15"></div>
         <div
@@ -54,9 +54,9 @@ const restartApp = async () => {
         </div>
       </div>
       <div class="flex flex-col items-center gap-2 max-w-xs">
-        <p class="text-[11px] font-black tracking-[0.45em] text-blue-500/80 pl-[0.45em]">DATABASE OPTIMIZATION</p>
-        <h2 class="text-2xl font-black tracking-tight text-primary-text">正在优化数据库...</h2>
-        <p class="text-sm opacity-70 leading-6">{{ lifecycleStore.currentPhaseLabel }}</p>
+        <p class="text-[11px] font-black tracking-[0.45em] text-blue-500/80 pl-[0.45em]">DATABASE MAINTENANCE</p>
+        <h2 class="text-2xl font-black tracking-tight text-primary-text">正在维护数据库</h2>
+        <p class="text-sm opacity-70 leading-6">{{ lifecycleStore.coreStatus.message }}</p>
         <p class="text-[10px] opacity-45 font-mono uppercase tracking-[0.3em]">{{ lifecycleStore.state }}</p>
       </div>
     </div>
@@ -65,7 +65,7 @@ const restartApp = async () => {
   <!-- 0.5 全局错误看板 -->
   <Transition name="fade">
     <div v-if="lifecycleStore.state === 'ERROR'"
-      class="vcp-boot-surface vcp-safe-inline fixed inset-0 z-boot bg-white/98 dark:bg-gray-950/98 flex flex-col items-center justify-center p-8 text-center">
+      class="vcp-viewport-surface vcp-boot-surface vcp-safe-inline fixed inset-0 z-boot bg-white/98 dark:bg-gray-950/98 flex flex-col items-center justify-center p-8 text-center">
       <div
         class="w-full max-w-md rounded-3xl border border-red-500/20 bg-white/80 dark:bg-white/5 shadow-2xl shadow-red-500/10 px-6 py-8 flex flex-col items-center">
         <div class="w-16 h-16 bg-red-500/10 text-red-500 rounded-2xl flex items-center justify-center mb-6">

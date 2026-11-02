@@ -23,7 +23,7 @@ macro_rules! app_command_handler {
         use crate::distributed;
         use crate::vcp_modules::agent_chat_application_service::handle_agent_chat_message;
         use crate::vcp_modules::agent_service::{
-            create_agent, delete_agent, get_agents, get_assistants_snapshot, read_agent_config,
+            create_agent, delete_agent, export_agent_preferences, get_agents, get_assistants_snapshot, read_agent_config,
             save_agent_config, update_agent_config,
         };
         use crate::vcp_modules::agentmgr::{
@@ -33,9 +33,24 @@ macro_rules! app_command_handler {
             batch_get_avatars, get_avatar, save_avatar_data, store_dominant_color,
         };
         use crate::vcp_modules::aurora_pipeline::rebuild_aurora_snapshot;
+        use crate::vcp_modules::chat::chat_navigation::{
+            connect_chat_view, register_chat_navigation_intent, request_chat_navigation, restore_chat_view,
+        };
+        use crate::vcp_modules::chat::chat_window::{
+            read_chat_window, reconcile_chat_window, resolve_chat_placeholders,
+        };
         use crate::vcp_modules::chat_manager::{
-            append_single_message, delete_messages, load_chat_history, load_chat_history_around,
+            append_single_message, delete_messages, edit_resend_message, load_chat_history, load_chat_history_around,
             load_chat_history_streamed, patch_single_message, truncate_history_after_message,
+        };
+        use crate::vcp_modules::chat::voice_service::{
+            begin_voice_conversation, end_voice_conversation, get_voice_conversation_snapshot,
+            start_voice_microphone, close_voice_microphone, voice_call_list_inputs, voice_call_select_input,
+            allocate_voice_document, connect_voice_document, connect_tts_document,
+            start_tts_session, stop_tts, submit_tts_text,
+            preview_tts, preview_voice_clone_sample,
+            import_voice_clone_sample, get_voice_clone_sample,
+            list_voice_clone_samples, delete_voice_clone_sample,
         };
         use crate::vcp_modules::cli::{
             close_vcp_mobile_cli_terminal, commit_vcp_mobile_cli_skill_import,
@@ -61,21 +76,23 @@ macro_rules! app_command_handler {
             fix_emoticon_url, get_emoticon_library, regenerate_emoticon_library,
         };
         use crate::vcp_modules::file_manager::{
-            check_attachment_support, get_attachment_real_path, open_file, register_local_file,
-            store_file,
+            begin_file_operation, cancel_attachment_import, check_attachment_support,
+            export_attachment_file, finish_file_operation, get_attachment_image,
+            get_attachment_real_path, open_file, prepare_rendered_image, read_attachment_text_preview,
+            register_local_file, release_attachment_image, release_rendered_image,
+            release_temporary_export, store_file, store_temporary_export,
         };
         use crate::vcp_modules::forum::{
             forum_create_post, forum_delete, forum_get_post, forum_list_posts, forum_reply,
         };
         use crate::vcp_modules::group_chat_application_service::{
-            handle_group_chat_message, invite_group_member_to_speak,
+            control_group_session, handle_group_chat_message, invite_group_member_to_speak,
         };
         use crate::vcp_modules::group_service::{
             create_group, delete_group, get_groups, read_group_config, save_group_config,
             update_group_config,
         };
         use crate::vcp_modules::boot_trace::{get_boot_trace, save_boot_trace};
-        use crate::vcp_modules::high_speed_channel::prepare_vcp_upload;
         use crate::vcp_modules::lifecycle_manager::{
             get_core_status, get_last_error, get_system_snapshot, reconcile_distributed_node_cmd,
             restart_or_exit_app,
@@ -98,11 +115,17 @@ macro_rules! app_command_handler {
             toggle_favorite_model,
         };
         use crate::vcp_modules::settings_manager::{
-            get_settings_recovery_status, read_settings, set_theme, update_settings,
+            export_config_domains, export_group_preferences, import_settings_backup,
+            parse_config_backup, read_settings,
+            update_settings,
+        };
+        use crate::vcp_modules::infra::share_inbox::{
+            bind_current_share, commit_share_message, discard_current_share,
+            prepare_current_share, read_current_share, receive_android_share, update_share_draft,
         };
         use crate::vcp_modules::sync_service::{
             clear_old_sync_logs, list_sync_log_files, prepare_sync_log_share_file,
-            read_sync_log_file, start_manual_sync, stop_sync,
+            read_sync_log_file, release_sync_log_share_file, start_manual_sync, stop_sync,
         };
         use crate::vcp_modules::sync::sync_hint::{sync_hint_cancel, sync_hint_wait};
         use crate::vcp_modules::taskcenter::{
@@ -120,16 +143,14 @@ macro_rules! app_command_handler {
             start_update_download,
         };
         use crate::vcp_modules::vcp_client::{
-            get_active_generations, interruptGroupTurn, interruptRequest, preview_chat_endpoint,
-            recover_active_generation, sendToVCP, test_vcp_connection,
+            reconnect_chat_streams, interruptGroupTurn, interruptRequest, preview_chat_endpoint,
+            test_vcp_connection,
         };
         use crate::vcp_modules::vcp_info_service::{
             clear_vcp_info, get_vcp_info_connection_status, get_vcp_info_metadata_list,
             get_vcp_info_payload, init_vcp_info_connection,
         };
-        use crate::vcp_modules::vcp_log_service::{
-            init_vcp_log_connection, send_vcp_log_message, set_vcp_log_heartbeat,
-        };
+        use crate::vcp_modules::vcp_log_service::{init_vcp_log_connection, send_vcp_log_message};
 
         // ──────────────────────────────────────────────────────────────
         // IPC 防爆栈总闸（治理 1.1.4 Release「输入附件必闪退」的同类隐患）
@@ -170,9 +191,17 @@ macro_rules! app_command_handler {
                 chat_strip_thought_chains,
                 delete_message_attachment,
                 delete_messages,
+                edit_resend_message,
                 fetch_raw_message_content,
                 crate::vcp_modules::chat::context_metrics::get_topic_context_metrics,
                 handle_agent_chat_message,
+                connect_chat_view,
+                register_chat_navigation_intent,
+                request_chat_navigation,
+                restore_chat_view,
+                read_chat_window,
+                reconcile_chat_window,
+                resolve_chat_placeholders,
                 load_chat_history,
                 load_chat_history_around,
                 load_chat_history_streamed,
@@ -183,13 +212,31 @@ macro_rules! app_command_handler {
                 rebuild_aurora_snapshot,
                 search_messages_fts,
                 truncate_history_after_message,
+                // ── 实时语音交互（仅当前语音拥有的识别、朗读与请求）──
+                begin_voice_conversation,
+                end_voice_conversation,
+                get_voice_conversation_snapshot,
+                close_voice_microphone,
+                start_voice_microphone,
+                voice_call_list_inputs,
+                voice_call_select_input,
+                allocate_voice_document,
+                connect_voice_document,
+                connect_tts_document,
+                start_tts_session,
+                stop_tts,
+                submit_tts_text,
+                preview_tts,
+                preview_voice_clone_sample,
+                import_voice_clone_sample,
+                get_voice_clone_sample,
+                list_voice_clone_samples,
+                delete_voice_clone_sample,
                 // ── VCP 连接与生成控制（vcp_client）──
-                get_active_generations,
+                reconnect_chat_streams,
                 interruptGroupTurn,
                 interruptRequest,
                 preview_chat_endpoint,
-                recover_active_generation,
-                sendToVCP,
                 test_vcp_connection,
                 // ── 话题（topic_service）──
                 create_topic,
@@ -207,6 +254,7 @@ macro_rules! app_command_handler {
                 batch_get_avatars,
                 create_agent,
                 delete_agent,
+                export_agent_preferences,
                 get_agents,
                 get_assistants_snapshot,
                 get_avatar,
@@ -219,6 +267,7 @@ macro_rules! app_command_handler {
                 create_group,
                 delete_group,
                 get_groups,
+                control_group_session,
                 handle_group_chat_message,
                 invite_group_member_to_speak,
                 read_group_config,
@@ -232,9 +281,11 @@ macro_rules! app_command_handler {
                 save_tarven_rule,
                 toggle_rule_enabled,
                 // ── 设置（settings_manager）──
-                get_settings_recovery_status,
+                export_config_domains,
+                export_group_preferences,
+                import_settings_backup,
+                parse_config_backup,
                 read_settings,
-                set_theme,
                 update_settings,
                 // ── 日记（diary）──
                 diary_cancel_search,
@@ -300,13 +351,31 @@ macro_rules! app_command_handler {
                 // ── 日志中心（logcenter）──
                 logcenter_clear_server,
                 logcenter_fetch,
-                // ── 附件与文件（file_manager / high_speed_channel）──
+                // ── 附件与文件（file_manager）──
+                begin_file_operation,
+                cancel_attachment_import,
                 check_attachment_support,
+                export_attachment_file,
+                finish_file_operation,
+                get_attachment_image,
                 get_attachment_real_path,
                 open_file,
-                prepare_vcp_upload,
+                prepare_rendered_image,
+                read_attachment_text_preview,
                 register_local_file,
+                release_attachment_image,
+                release_rendered_image,
+                release_temporary_export,
                 store_file,
+                store_temporary_export,
+                // ── 当前一次分享（share_inbox）──
+                receive_android_share,
+                bind_current_share,
+                commit_share_message,
+                discard_current_share,
+                prepare_current_share,
+                read_current_share,
+                update_share_draft,
                 // ── 系统维护（maintenance_manager）──
                 clear_webview_cache,
                 reconstruct_system_cache,
@@ -328,7 +397,6 @@ macro_rules! app_command_handler {
                 init_vcp_info_connection,
                 init_vcp_log_connection,
                 send_vcp_log_message,
-                set_vcp_log_heartbeat,
                 // ── 生命周期与系统状态（lifecycle_manager / boot_trace）──
                 get_boot_trace,
                 get_core_status,
@@ -341,6 +409,7 @@ macro_rules! app_command_handler {
                 list_sync_log_files,
                 prepare_sync_log_share_file,
                 read_sync_log_file,
+                release_sync_log_share_file,
                 start_manual_sync,
                 stop_sync,
                 sync_hint_cancel,

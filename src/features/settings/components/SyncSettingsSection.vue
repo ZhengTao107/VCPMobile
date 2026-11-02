@@ -1,7 +1,8 @@
 <script setup lang="ts">
-import { computed, ref } from "vue";
+import { onUnmounted, ref, watch } from "vue";
 import { invoke } from "@tauri-apps/api/core";
-import type { AppSettings } from "../../../core/stores/settings";
+import type { ConnectionFields } from "../editing/fieldSets";
+import type { SettingsSaveResult } from "../editing/useSettingsEditSession";
 import { useOverlayStore } from "../../../core/stores/overlay";
 import SettingsTextField from "../../../components/settings/SettingsTextField.vue";
 import SettingsActionButton from "../../../components/settings/SettingsActionButton.vue";
@@ -10,22 +11,23 @@ import SettingsRow from "../../../components/settings/SettingsRow.vue";
 import SettingsSwitch from "../../../components/settings/SettingsSwitch.vue";
 
 const props = defineProps<{
-  settings: AppSettings;
+  settings: Readonly<ConnectionFields>;
+  active: boolean;
+  disabled?: boolean;
+  commit: () => Promise<SettingsSaveResult>;
 }>();
 
-// 与 autoSyncTrigger.isAutoSyncReady 同口径：缺省视为开启，只有显式 false 关闭。
-// 只读渲染不写字段，避免打开设置页就产生保存补丁。
-const autoSyncEnabled = computed<boolean>({
-  get: () => props.settings.autoSync !== false,
-  set: (value) => {
-    props.settings.autoSync = value;
-  },
-});
+// fork ptp4g#4：自动同步开关，缺省开启；切换即提交。
+const setAutoSync = (value: boolean) => {
+  emit("edit", { "sync.autoSync": value });
+  emit("blur");
+};
 
 const overlayStore = useOverlayStore();
 
 const emit = defineEmits<{
-  (e: "save-request"): void;
+  (e: "edit", patch: Partial<ConnectionFields>): void;
+  (e: "blur"): void;
 }>();
 
 const emoticonStatus = ref<{
@@ -33,23 +35,53 @@ const emoticonStatus = ref<{
   message: string;
 }>({ type: null, message: "" });
 
-const startManualSync = () => {
-  overlayStore.openSyncSession();
+const openingSync = ref(false);
+const startManualSync = async () => {
+  if (disposed || !props.active || props.disabled || openingSync.value) return;
+  const request = generation;
+  openingSync.value = true;
+  try {
+    // A blur save may still be pending when this click arrives.
+    const saved = await props.commit();
+    if (disposed || !props.active || request !== generation || !saved.ok) return;
+    overlayStore.openSyncSession();
+  } finally {
+    openingSync.value = false;
+  }
 };
 
+let disposed = false;
+let generation = 0;
+let clearTimer: ReturnType<typeof setTimeout> | null = null;
+const deactivate = () => {
+  generation += 1;
+  if (clearTimer) clearTimeout(clearTimer);
+  clearTimer = null;
+};
+watch(() => props.active, (active) => { if (!active) deactivate(); }, { flush: 'sync' });
+onUnmounted(() => { disposed = true; deactivate(); });
+
 const rebuildEmoticonLibrary = async () => {
-  emit("save-request");
+  if (disposed || !props.active || props.disabled || emoticonStatus.value.type === 'loading') return;
+  const request = ++generation;
+  if (clearTimer) clearTimeout(clearTimer);
   emoticonStatus.value = { type: "loading", message: "正在从远程服务器获取..." };
   try {
+    const saved = await props.commit();
+    if (disposed || !props.active || request !== generation) return;
+    if (!saved.ok) throw new Error(saved.error);
     const count = await invoke<number>("regenerate_emoticon_library");
+    if (disposed || !props.active || request !== generation) return;
     emoticonStatus.value = {
       type: "success",
       message: `同步成功：共计 ${count} 个表情`,
     };
-    setTimeout(() => {
-      emoticonStatus.value = { type: null, message: "" };
+    clearTimer = setTimeout(() => {
+      if (!disposed && props.active && request === generation) emoticonStatus.value = { type: null, message: "" };
+      clearTimer = null;
     }, 3000);
   } catch (e: any) {
+    if (disposed || !props.active || request !== generation) return;
     emoticonStatus.value = { type: "error", message: `同步失败: ${e}` };
   }
 };
@@ -58,19 +90,28 @@ const rebuildEmoticonLibrary = async () => {
 <template>
   <div class="space-y-5 px-1">
     <SettingsTextField
-      v-model="settings.syncHttpUrl"
+      :model-value="settings['sync.httpUrl']"
+      :disabled="disabled"
+      @update:model-value="emit('edit', { 'sync.httpUrl': $event })"
+      @blur="emit('blur')"
       label="HTTP 服务 URL"
       placeholder="http://192.168.x.x:5974"
       mono
     />
     <SettingsTextField
-      v-model="settings.syncServerUrl"
+      :model-value="settings['sync.serverUrl']"
+      :disabled="disabled"
+      @update:model-value="emit('edit', { 'sync.serverUrl': $event })"
+      @blur="emit('blur')"
       label="WebSocket 服务 URL"
       placeholder="ws://192.168.x.x:5975"
       mono
     />
     <SettingsTextField
-      v-model="settings.syncToken"
+      :model-value="settings['sync.token']"
+      :disabled="disabled"
+      @update:model-value="emit('edit', { 'sync.token': $event })"
+      @blur="emit('blur')"
       is-secure
       label="Mobile Sync Token"
       placeholder="输入桌面端 config.env 中的 Token"
@@ -83,12 +124,15 @@ const rebuildEmoticonLibrary = async () => {
       data-setting="autoSync"
     >
       <template #action>
-        <SettingsSwitch v-model="autoSyncEnabled" />
+        <SettingsSwitch :model-value="settings['sync.autoSync']" :disabled="disabled" @update:model-value="setAutoSync" />
       </template>
     </SettingsRow>
     <div class="border-t border-black/5 dark:border-white/5 pt-2 space-y-4">
       <SettingsTextField
-        v-model="settings.fileKey"
+        :model-value="settings['server.fileKey']"
+        :disabled="disabled"
+        @update:model-value="emit('edit', { 'server.fileKey': $event })"
+        @blur="emit('blur')"
         is-secure
         label="表情包图床密钥 (fileKey)"
         placeholder="用于构造表情包 URL 的密码"
@@ -102,6 +146,7 @@ const rebuildEmoticonLibrary = async () => {
         button-size="sm"
         button-label="REFRESH"
         :button-loading="emoticonStatus.type === 'loading'"
+        :button-disabled="disabled"
         :status-type="emoticonStatus.type"
         :status-message="emoticonStatus.message"
         @action-click="rebuildEmoticonLibrary"
@@ -115,6 +160,8 @@ const rebuildEmoticonLibrary = async () => {
           <SettingsActionButton
             variant="secondary"
             size="sm"
+            :disabled="disabled"
+            :loading="openingSync"
             @click="startManualSync"
           >
             OPEN PANEL

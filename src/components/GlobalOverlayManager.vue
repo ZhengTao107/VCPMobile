@@ -33,19 +33,19 @@ const handleEditorSave = async (newContent: string) => {
 </script>
 
 <template>
-  <div class="fixed inset-0 pointer-events-none z-toast">
+  <div class="vcp-viewport-surface fixed inset-0 pointer-events-none z-toast">
     <!-- 1. 全局基础 UI (Prompt/Toast) -->
     <VcpPrompt v-if="overlayStore.promptConfig" :is-open="!!overlayStore.promptConfig"
       :title="overlayStore.promptConfig.title" :initial-value="overlayStore.promptConfig.initialValue"
+      :input-mode="overlayStore.promptConfig.inputMode" :validate="overlayStore.promptConfig.validate"
       :placeholder="overlayStore.promptConfig.placeholder" @confirm="handlePromptConfirm"
       @cancel="overlayStore.closePrompt()" @update:isOpen="!$event && overlayStore.closePrompt()" />
 
     <!-- 全局 Confirm -->
-    <VcpConfirm v-if="overlayStore.confirmConfig" :is-open="!!overlayStore.confirmConfig"
+    <VcpConfirm v-if="overlayStore.confirmConfig" modal-id="Confirm" :is-open="!!overlayStore.confirmConfig"
       :title="overlayStore.confirmConfig.title" :message="overlayStore.confirmConfig.message"
       :is-danger="overlayStore.confirmConfig.isDanger" :only-confirm="overlayStore.confirmConfig.onlyConfirm"
-      @confirm="overlayStore.confirmConfig.onConfirm()" @cancel="overlayStore.confirmConfig.onCancel()"
-      @update:isOpen="!$event && overlayStore.confirmConfig.onCancel()" />
+      @confirm="overlayStore.confirmConfig?.onConfirm()" @cancel="overlayStore.confirmConfig?.onCancel()" />
 
     <!-- 全局 Context Menu -->
     <ContextMenuSheet v-if="overlayStore.contextMenuConfig" :is-open="!!overlayStore.contextMenuConfig"
@@ -64,10 +64,10 @@ const handleEditorSave = async (newContent: string) => {
     <ToastManager class="pointer-events-auto" />
     <RenderedImageViewer />
 
-    <!-- 2. 业务 Feature 投射目标 -->
-    <!-- 各 Feature 组件通过 <Teleport to="#vcp-feature-overlays"> 投射到此处 -->
-    <div id="vcp-feature-overlays" class="absolute inset-0 pointer-events-none"></div>
   </div>
+  <!-- Keep feature surfaces outside the toast stacking context so sheet,
+       dialog and viewer layers retain their global ordering. -->
+  <div id="vcp-feature-overlays" class="pointer-events-none"></div>
 </template>
 
 <style scoped></style>

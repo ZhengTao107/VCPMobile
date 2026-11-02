@@ -30,16 +30,11 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 const BLOB_ROUTE: &str = "/api/mobile-sync-blob";
 const PROBE_CHUNK: usize = 500;
 const MAX_PROBE_RESPONSE_BYTES: usize = 1024 * 1024;
-const SETTINGS_KEY: &str = "attachmentBlobSync";
 const LOG_PHASE: &str = "attachments";
 
-/// `Settings.extra.attachmentBlobSync`，缺省或非布尔值视为开启。
+/// `sync.attachmentBlobSync`（fork p8lk4#15），缺省开启。
 pub fn attachment_blob_sync_enabled(settings: &Settings) -> bool {
-    settings
-        .extra
-        .get(SETTINGS_KEY)
-        .and_then(serde_json::Value::as_bool)
-        .unwrap_or(true)
+    settings.sync.attachment_blob_sync
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -893,7 +888,7 @@ impl AttachmentBlobSync {
 
         // rename 进 CAS 后立即注册，中间不插入其他 await 点之外的工作。
         let dest = root.join(cas_file_name(&blob.hash, &blob.name));
-        if let Err(error) = crate::vcp_modules::high_speed_channel::install_verified_upload(
+        if let Err(error) = install_verified_upload(
             fetched.temp.path(),
             &dest,
             size,
@@ -1001,6 +996,83 @@ impl AttachmentBlobSync {
             )));
         }
         Ok(Fetched { temp, mime })
+    }
+}
+
+/// 把已校验的临时文件落进 CAS。目标已存在（同哈希并发写入或历史文件）时只按尺寸复用。
+/// 落位写法与上游 `file_manager` CAS 一致：同目录 `rename`，失败后仅接受已存在且尺寸正确的胜者。
+async fn install_verified_upload(
+    temp_path: &Path,
+    dest_path: &Path,
+    expected_size: u64,
+) -> Result<(), String> {
+    if !dest_path.exists() {
+        if let Err(error) = tokio::fs::rename(temp_path, dest_path).await {
+            if !dest_path.exists() {
+                return Err(format!("附件移动失败: {error}"));
+            }
+        }
+    }
+
+    crate::vcp_modules::file_manager::check_existing_cas_size_async(dest_path, expected_size)
+        .await?;
+
+    if temp_path.exists() {
+        tokio::fs::remove_file(temp_path)
+            .await
+            .map_err(|error| format!("清理已验证的重复附件临时文件失败: {error}"))?;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod install_tests {
+    use super::install_verified_upload;
+
+    #[tokio::test]
+    async fn existing_cas_is_reused_by_size_gate_and_temp_is_discarded() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let source = temp.path().join("upload.tmp");
+        let destination = temp.path().join("cas.bin");
+        let expected = b"expected";
+
+        // 尺寸不符（截断/半文件）的已有 CAS：拒绝复用，暂存文件保留以便重试。
+        std::fs::write(&source, expected).expect("source");
+        std::fs::write(&destination, b"bad").expect("truncated destination");
+        assert!(
+            install_verified_upload(&source, &destination, expected.len() as u64)
+                .await
+                .is_err()
+        );
+        assert!(
+            source.exists(),
+            "unverified upload temp must remain retryable"
+        );
+
+        // 尺寸匹配的已有 CAS：文件名即内容哈希 + 原子发布，直接复用并清理暂存。
+        std::fs::write(&destination, expected).expect("valid destination");
+        install_verified_upload(&source, &destination, expected.len() as u64)
+            .await
+            .expect("matching CAS should be reusable");
+        assert!(
+            !source.exists(),
+            "verified duplicate temp should be removed"
+        );
+    }
+
+    #[tokio::test]
+    async fn newly_installed_upload_is_verified_after_atomic_move() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let source = temp.path().join("upload.tmp");
+        let destination = temp.path().join("cas.bin");
+        let expected = b"new-cas";
+        std::fs::write(&source, expected).expect("source");
+
+        install_verified_upload(&source, &destination, expected.len() as u64)
+            .await
+            .expect("new CAS should install");
+        assert!(!source.exists());
+        assert_eq!(std::fs::read(destination).expect("destination"), expected);
     }
 }
 
@@ -1276,15 +1348,13 @@ mod tests {
 
     #[test]
     fn settings_flag_defaults_on_and_respects_explicit_false() {
-        let mut settings = crate::vcp_modules::settings_manager::create_default_settings();
-        settings.extra = serde_json::Value::Null;
+        let mut settings = Settings::default();
         assert!(attachment_blob_sync_enabled(&settings));
-        settings.extra = serde_json::json!({});
-        assert!(attachment_blob_sync_enabled(&settings));
-        settings.extra = serde_json::json!({ "attachmentBlobSync": false });
+        settings.sync.attachment_blob_sync = false;
         assert!(!attachment_blob_sync_enabled(&settings));
-        settings.extra = serde_json::json!({ "attachmentBlobSync": true });
-        assert!(attachment_blob_sync_enabled(&settings));
+        let legacy: Settings = serde_json::from_value(serde_json::json!({ "sync": {} }))
+            .expect("missing field uses default");
+        assert!(attachment_blob_sync_enabled(&legacy));
     }
 
     #[tokio::test]

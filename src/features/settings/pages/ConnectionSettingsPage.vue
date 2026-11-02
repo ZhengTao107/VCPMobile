@@ -1,0 +1,114 @@
+<script setup lang="ts">
+import { computed, ref, watch } from 'vue';
+import SettingsSection from '../../../components/settings/SettingsSection.vue';
+import VcpCoreSettingsSection from '../components/VcpCoreSettingsSection.vue';
+import SyncSettingsSection from '../components/SyncSettingsSection.vue';
+import ConfigBackupSection from '../components/ConfigBackupSection.vue';
+import { CONNECTION_FIELDS, type ConnectionFields } from '../editing/fieldSets';
+import { useSettingsPageSession } from '../editing/useSettingsPageSession';
+import type { SettingsSaveResult } from '../editing/useSettingsEditSession';
+import { applyImport as importConfigBackup, type BackupImportResult, type ParsedConfigBackup } from '../useConfigBackup';
+
+const props = defineProps<{ active: boolean }>();
+const { session, loading, error, reload } = useSettingsPageSession(CONNECTION_FIELDS, () => props.active);
+const { draft, leaving } = session;
+const actionBusy = ref(false);
+const disabled = computed(() => !props.active || leaving.value);
+const errorSummary = ref<HTMLElement | null>(null);
+let focusSaveError = true;
+let focusingError = false;
+
+watch([error, disabled, actionBusy], ([message, isDisabled, busy]) => {
+  // Wait for the save/leave lock to lift before focusing an element in this page.
+  if (!message || isDisabled || busy || !focusSaveError) return;
+  focusingError = true;
+  try {
+    errorSummary.value?.focus({ preventScroll: true });
+    errorSummary.value?.scrollIntoView({ block: 'nearest' });
+  } finally {
+    focusingError = false;
+  }
+}, { flush: 'post' });
+
+const edit = (patch: Partial<ConnectionFields>) => {
+  if (disabled.value || actionBusy.value) return;
+  for (const key of CONNECTION_FIELDS) {
+    const value = patch[key];
+    if (value !== undefined) session.edit(key, value);
+  }
+};
+
+const saveOnBlur = () => {
+  if (disabled.value || actionBusy.value || focusingError) return;
+  // Keep the next field/click usable while the edit session serializes this save.
+  // A rejected background save stays visible without taking focus from the next input.
+  focusSaveError = false;
+  void session.save();
+};
+
+// Freeze only until the confirmed snapshot has been captured, not throughout file/network IO.
+const commitForAction = async (): Promise<SettingsSaveResult> => {
+  if (disabled.value || actionBusy.value) return { ok: false, error: '设置页面当前不可操作' };
+  focusSaveError = true;
+  actionBusy.value = true;
+  try {
+    const result = await session.save();
+    if (!props.active) return { ok: false, error: '设置页面已关闭' };
+    return result;
+  } finally {
+    actionBusy.value = false;
+  }
+};
+
+const applyImport = async (backup: ParsedConfigBackup): Promise<BackupImportResult> => {
+  if (disabled.value || actionBusy.value) throw new Error('设置页面当前不可操作');
+  focusSaveError = true;
+  actionBusy.value = true;
+  try {
+    const settled = await session.settlePending();
+    if (!settled.ok) throw new Error(settled.error);
+    if (!props.active) throw new Error('设置页面已关闭');
+    return await importConfigBackup(backup, (changes) => {
+      if (props.active) {
+        session.acceptImport(CONNECTION_FIELDS.filter((key) => Object.prototype.hasOwnProperty.call(changes, key)));
+      }
+    });
+  } finally {
+    actionBusy.value = false;
+  }
+};
+
+defineExpose({
+  beforeLeave: () => {
+    if (actionBusy.value) return Promise.resolve(false);
+    focusSaveError = true;
+    return session.prepareLeave();
+  },
+});
+</script>
+
+<template>
+  <div class="flex flex-col gap-6" :class="{ 'settings-page--leaving': leaving }" :inert="disabled || actionBusy">
+    <p v-if="error" ref="errorSummary" role="alert" tabindex="-1" class="text-sm text-red-500 break-words">
+      {{ error }}
+      <button v-if="!draft" type="button" class="ml-2 underline" :disabled="loading" @click="reload">重试</button>
+    </p>
+    <template v-if="draft">
+      <SettingsSection title="核心连接">
+        <VcpCoreSettingsSection :settings="draft" :active="active" :disabled="disabled" :commit="commitForAction" @edit="edit" @blur="saveOnBlur" />
+      </SettingsSection>
+      <SettingsSection title="数据同步">
+        <SyncSettingsSection :settings="draft" :active="active" :disabled="disabled" :commit="commitForAction" @edit="edit" @blur="saveOnBlur" />
+      </SettingsSection>
+      <SettingsSection title="配置备份">
+        <ConfigBackupSection :active="active" :disabled="disabled" :commit="commitForAction" :apply-import="applyImport" />
+      </SettingsSection>
+    </template>
+    <p v-else-if="loading" class="text-sm opacity-60">正在加载设置...</p>
+  </div>
+</template>
+
+<style scoped>
+.settings-page--leaving :deep(.settings-field-input:disabled),
+.settings-page--leaving :deep(.settings-button:disabled:not(.opacity-60):not(:has(.animate-spin))) { opacity: 1; }
+</style>

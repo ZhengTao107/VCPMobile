@@ -6,7 +6,7 @@
   <sub>VCPChat 的移动端进化形态 —— 对话、同步、渲染与设备能力，全部下沉至原生边界之内</sub></p>
 
   <p>
-    <a href="https://github.com/MRiecy/VCPMobile/releases"><img src="https://img.shields.io/badge/version-1.1.6-8b5cf6" alt="version"></a>
+    <a href="https://github.com/MRiecy/VCPMobile/releases"><img src="https://img.shields.io/badge/version-1.1.7-8b5cf6" alt="version"></a>
     <a href="https://github.com/MRiecy/VCPMobile/actions/workflows/ci.yml"><img src="https://github.com/MRiecy/VCPMobile/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
     <img src="https://img.shields.io/badge/platform-Android%20arm64--v8a-2dd4bf?logo=android&logoColor=white" alt="platform">
     <img src="https://img.shields.io/badge/license-CC%20BY--NC--SA%204.0-475569" alt="license">
@@ -14,7 +14,7 @@
   <p>
     <img src="https://img.shields.io/badge/Tauri%202.11%20%7C%20Vue%203.5-6366f1?logo=tauri&logoColor=white" alt="framework">
     <img src="https://img.shields.io/badge/Rust%20%7C%20Tokio-1f2937?logo=rust" alt="backend">
-    <img src="https://img.shields.io/badge/UnoCSS%20%7C%20Pinia%203-8b5cf6" alt="ui">
+    <img src="https://img.shields.io/badge/UnoCSS%20%7C%20Pinia%204-8b5cf6" alt="ui">
     <img src="https://img.shields.io/badge/docs-93%20files-d946ef" alt="docs">
     <img src="https://img.shields.io/badge/device%20tools-14-2dd4bf" alt="device tools">
   </p>
@@ -46,7 +46,7 @@
 - **零依赖增量同步** — WebSocket + HTTP 双通道直连桌面端，SHA-256 哈希差异比对，不经过任何第三方云
 - **Cyber-Physical 节点** — 14 项原生设备能力工具，让手机成为 AI 可直接调用的分布式计算节点
 
-> **支持范围**：当前生产平台为 Android `arm64-v8a` 触控手机、平板与按窗口宽度响应的折叠屏（minSdk 26）。iPhone/iPad 兼容已进入 [Phase 0–6 分期实施](plan/vcpmobile-ios-compatibility-research/08-分期实施路线图与验收门禁.md)，目标为复用 Vue/Rust 核心的实验性用户自签产物，尚未交付 iOS 构建。不支持桌面端、Android TV 或其他 Android ABI；桌面用户请使用 VCPChat。Vite 预览、host Rust 编译与现有非 Android fallback 不构成 iOS 实现或桌面产品入口。完整规范见 [`docs/MOBILE_UI_COMPATIBILITY.md`](docs/MOBILE_UI_COMPATIBILITY.md)。当前 Web 构建仍为 `chrome87`，WebKit 构建与交互适配按阶段推进。
+> **支持范围**：当前生产平台为 Android `arm64-v8a` 触控手机、平板与按窗口宽度响应的折叠屏（minSdk 26），要求设备当前使用的 Android WebView 为 Chromium 117 或更新版本。系统版本不等于 WebView 版本；应用启动后的“指引帮助”提供兼容说明。iPhone/iPad 实验客户端复用 Vue/Rust 核心，最低支持 iOS/iPadOS 26.0，发布包由用户自行签名安装。不支持桌面端、Android TV 或其他 Android ABI；桌面用户请使用 VCPChat。Vite 预览、host Rust 编译与现有非 Android fallback 不构成 iOS 实现或桌面产品入口。共享前端构建目标为 `chrome117` / `safari26.0`，WebKit 交互适配按阶段推进。详见 [iOS 构建说明](docs/IOS_BUILD.md) 和 [移动端 UI 兼容性规范](docs/MOBILE_UI_COMPATIBILITY.md)。
 
 <div align="center">
   <img src=".github/assets/aurora-line.svg" width="100%" height="6" alt="" />
@@ -88,7 +88,7 @@ Aurora 之外，v1.1.6 的另一面是沉默的稳定性：同步协议归一化
 
 ```
 ┌────────────────────────────────────────────────────────────────┐
-│  Rendering Layer —— Vue 3.5 · Pinia 3 · UnoCSS                 │
+│  Rendering Layer —— Vue 3.5 · Pinia 4 · UnoCSS                 │
 │  src/ —— 18 个领域模块 · 20 Stores · 15 Composables            │
 ├────────────────────────────────────────────────────────────────┤
 │  IPC Bridge Layer —— Tauri v2 · invoke / listen / Channel      │
@@ -178,23 +178,27 @@ sequenceDiagram
 
 ### 用户安装
 
-1. 前往 [Releases](https://github.com/MRiecy/VCPMobile/releases) 下载最新 `VCPMobile_v1.1.6_arm64-v8a.apk`
-2. 安装至 Android 设备（minSdk 26，推荐 Android 10+），完成权限引导
-3. 配置 VCP 服务器地址与 API Key —— 开始对话
+在对应版本的 **Assets** 选择设备所需的包，并使用同名 `.sha256` 核对下载文件。[GitHub Releases](https://github.com/MRiecy/VCPMobile/releases)
+
+- **Android** 下载已签名的 `VCPMobile_vX.Y.Z_arm64-v8a.apk`，安装后完成权限引导。
+- **iPhone / iPad** 下载 `VCPMobile_vX.Y.Z_ios-arm64.unsigned.ipa`。签名工具要求 `.app` 时改选 `VCPMobile_vX.Y.Z_ios-arm64.app.zip`。将主应用和分享扩展一起自签后安装。[iOS 自签说明](docs/IOS_BUILD.md#分享扩展与自签)
+
+打开应用，配置 VCP 服务器地址与 API Key 即可开始对话。
 
 ### 开发者环境
 
-**Prerequisites**：Rust (stable, edition 2021) · Node.js 22+ · pnpm 10 · Java 17 (temurin) · Android SDK + NDK `29.0.14206865`
+开发工具版本见 `rust-toolchain.toml` 和 `.github/toolchain.env`。运行发布前检查需要配置 `JAVA_HOME`、`ANDROID_HOME` 和 `NDK_HOME`，并安装锁定版本的 SDK、Build Tools 和 NDK。
 
 ```bash
 git clone https://github.com/MRiecy/VCPMobile.git && cd VCPMobile
-pnpm install
+pnpm install --frozen-lockfile
 pnpm tauri android init              # 仅首次
 
 pnpm android:debug:doctor -- --json  # 工具链 / ADB / USB 体检
 pnpm android:debug:dev               # 低噪声 USB + HMR 真机调试
 
-pnpm check                           # 全量静态检查（vue-tsc + cargo check --locked）
+pnpm check                           # 日常检查：配置契约、ESLint、TypeScript 和 Rust 编译
+pnpm check:release                   # 本地和 CI 共用的发布前检查
 pnpm tauri android build --apk --target aarch64   # Release APK（需签名环境变量）
 ```
 
@@ -225,7 +229,7 @@ cargo bench --locked --profile perf   # Aurora 渲染双轨基准
 
 **CI**（push / PR）：前端类型检查与 Vitest → Rust fmt / test / clippy → Android 生成树漂移检查 → 插件 JVM 测试 → 依赖审计。工具链版本单一事实源：`rust-toolchain.toml` + `.github/toolchain.env`。
 
-**Release**（GitHub Release published）：四版本源与 versionCode 一致性校验 → 签名 `aarch64` APK 构建 → 单一签名者与调试证书拒绝 → 上传 APK 及 SHA-256。Release 配置：`opt-level 3 · lto · codegen-units 1 · panic=abort · strip`。
+**Release** 在维护者点击 **Publish release** 后，从同一版本标签构建签名 Android APK 和供用户自签的 iOS IPA、应用 ZIP，并上传各自的 SHA-256 校验文件。手动运行 **iOS Device Archive** 时，可从该次 Actions 运行下载 release 或 debug 产物。[iOS 构建与下载](docs/IOS_BUILD.md)
 
 <div align="center">
   <img src=".github/assets/aurora-line.svg" width="100%" height="6" alt="" />

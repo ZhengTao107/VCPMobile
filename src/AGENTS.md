@@ -4,11 +4,9 @@
 
 ---
 
-## 1. 子系统定位
+## 1. 定位与数据流
 
-`src/` 是 Project Avatar 的 Vue 渲染层。它把 Tauri 返回值、事件与流式消息归约为前端状态，按当前移动端窗口宽度呈现同一套业务组件，并把触控、返回、表单和消息操作转换为现有 Store、Composable 或 IPC 调用。Android 为当前生产平台；iPhone/iPad 按根规范分期接入，平台原生差异在边界归一化，不能复制业务状态。
-
-### 1.1 正常数据流
+`src/` 是 Project Avatar 的 Vue 渲染层。它负责将 Tauri IPC 返回值、异步事件与流式消息归约为响应式状态，在统一组件树中呈现移动端界面，并将用户交互转换为 Store 变更或 IPC 调用。
 
 ```text
 Tauri Result / Event ──> App / Store / Composable ──> Feature / Component ──> UI
@@ -18,96 +16,53 @@ Tauri Result / Event ──> App / Store / Composable ──> Feature / Componen
 Rust AST / TailFrame ──> MessageRenderer ──> AstExecutor / DOM Engine ──> Rich Blocks
 ```
 
-前端只归约和呈现当前调用链实际送达的数据，不从页面可见性、按钮状态或本地动画反推 Rust 业务结果。一次操作的传输完成、前端状态变化和后端业务完成属于不同阶段，按实际生产代码逐层确认。
+---
+
+## 2. 代码地图
+
+| 路径 | 唯一职责 |
+| ---- | -------- |
+| `main.ts` | 主应用装配：Vue 实例、Pinia 状态池、Router 路由、全局指令与错误捕获 |
+| `App.vue` | 根级挂载面：进程级窗口生命周期、安全区域 (Insets)、系统事件与主工作区 |
+| `core/stores/` | 跨 Feature 全局状态（智能体、设置快照、覆盖层栈、分享与会话） |
+| `core/composables/` | 浏览器能力、Tauri 事件监听与移动端交互生命周期桥接 |
+| `core/dom-engine/` | 流式富文本与 AST 消息片段的局部高性能 DOM 渲染执行器 |
+| `core/constants/` | 全局常量定义与语义化层级系统 (`layers.ts`) |
+| `features/` | 领域业务模块（chat、agent、topic、settings、sync、rag 等），包含领域专属 Store 与交互 |
+| `components/` | 应用基础外壳、设置原子控件（SettingsCanvas）与通用 UI 原语 |
+| `assets/` | 主题定义 (`themes.css`)、全局重置与富文本消息样式 |
 
 ---
 
-## 2. 代码结构
+## 3. 核心不变量
 
-```
-src/
-├── main.ts                    # 主 WebView：Vue、Pinia、Router、全局指令与错误入口
-├── floating-main.ts           # 浮动助手 WebView 的独立 Vue 入口
-├── App.vue                    # 生命周期、原生事件、Insets、外层工作区与全局挂载面
-├── appStyles.ts               # reset、UnoCSS、主题样式的加载顺序
-├── core/
-│   ├── stores/                # 跨 Feature 状态与生命周期 owner
-│   ├── composables/           # 浏览器、Tauri 事件和交互生命周期桥接
-│   ├── dom-engine/            # 流式消息的局部 DOM 执行器
-│   ├── constants/             # 前端共享常量与语义层级
-│   ├── types/                 # 前端共享 DTO 与状态类型
-│   └── utils/                 # 渲染、转换与无状态工具
-├── features/                  # 领域视图、领域 Store 与共置交互
-├── components/                # 应用外壳、设置原语与共享 UI
-└── assets/                    # 主题和全局消息样式
-```
-
-目录表示代码归属，不替代调用链。新增状态、组件或工具前先定位当前消费者与 owner；只有多个 Feature 共同消费且生命周期一致的能力才进入 `core/` 或共享 `components/`。
+| # | 不变量 / 约束 | 锚点 | 破坏后果 |
+| - | ------------- | ---- | -------- |
+| F1 | 跨 Feature 共享状态归 `core/stores/`，领域专属状态封闭在 `features/<domain>/` 内，禁止跨领域私自持有状态镜像 | `core/stores/` | 状态生命周期分叉，引发更新丢失或双重渲染 |
+| F2 | 虚拟多页与抽屉导航必须由 `overlayStore` 的页面栈统一调度，禁止在 Feature 内部复制独立的全局全屏路由栈 | `core/stores/overlayStore.ts` | 移动端物理返回键拦截失序，导致回退死循环或意外退出应用 |
+| F3 | 全局弹层（Prompt、Confirm、Toast、Viewer）必须经由 `GlobalOverlayManager` 呈现并消费语义层级，严禁手写硬编码 Z-Index | `core/constants/layers.ts` | 弹窗互相遮挡、模态被底层内容穿透或点击事件穿透 |
+| F4 | 消息流式渲染必须基于 AST 快照与 TailFrame 增量驱动，稳定块与尾部渲染分离，禁止以全量重渲染替代局部计算 | `features/chat/composables/useMessageTailRenderer.ts` | 导致超长对话流式打字卡顿、打字机跳动或滚动丢失 |
+| F5 | 消息上下文菜单由根级 `v-longpress.message` 代理，内部需保留原生选区或点击的控件须显式标记 `data-longpress-native` | `core/directives/` | 长按消息复制与局部富文本选中、表单操作相互冲突 |
+| F6 | 设置页编辑必须通过 `useSettingsPageSession` 维持生命周期，修改提交携基准版本原子比对，离开页面必须释放会话 | `features/settings/` | 迟到配置覆盖最新修改，或未保存草稿泄漏至后续页面 |
+| F7 | 通话与朗读权威状态归 Rust，前端 Store 仅提交意图并消费快照，后台切换与组件销毁不自动篡改业务终态 | `core/stores/` | 产生幽灵语音任务、音频播放失控或前台错位重连 |
+| F8 | 严禁在滚动容器、列表卡片或气泡内容中使用 `backdrop-filter: blur()`，仅允许在 fixed/sticky 导航条极小面积评估保留 | `assets/themes.css` | 移动端 GPU 合成层爆炸，导致低端 Android 设备列表滑动掉帧卡顿 |
+| F9 | 手机、平板与折叠屏必须共享同一套组件树与业务 Store，仅通过当前窗口宽度做响应式断点适配，禁止分支维护 | `src/App.vue` | 状态逻辑多处分叉，多端表现无法对齐且增加维护成本 |
 
 ---
 
-## 3. 应用装配与状态所有权
+## 4. 覆盖层与导航规范
 
-### 3.1 根应用
-
-`main.ts` 装配主应用；`App.vue` 持有进程级前端启动、原生窗口事件、分享与通知入口、Insets 桥、返回链和主工作区。全局监听必须在对应生命周期建立，并在卸载路径释放；不得由普通 Feature 重复注册第二套根监听。
-
-`floating-main.ts` 是浮动助手，现已退役，仅存档。
-
-前端从 [core/utils/platform.ts](core/utils/platform.ts) 同步取得 OS 插件提供的平台身份，普通差异由共享 Vue 中的运行时分支处理。`appLifecycle.bootstrap` 继续拥有启动编排；实际权限、生命周期和任务状态由各自操作取得，平台识别不再等待能力查询。具体约定见 [跨平台开发规范](../docs/CROSS_PLATFORM_DEVELOPMENT.md)。
-
-`useAppLifecycle` 将 iOS 原生 network online 与既有浏览器 online 汇入同一个流恢复 owner；iOS 在首次真实 active snapshot 前不发起恢复。卸载释放两条原生监听，迟到安装立即释放；网络路径可用只表示可以尝试对账，不表示服务端已可达。
-
-`useNotificationProcessor` 将实时事件和系统快照中的原生事件注册失败归为同一固定 ID 告知；`notification` Store 私有的 `oncePerWebview` 接受记忆先于原 30 秒去重，关闭 Toast、清除或淘汰历史不会重置。新 WebView 的新 Pinia 可再次接受 Rust 保留的真实注册失败；guardian/helper 继续原有通知语义。
-
-### 3.2 Store、Composable 与组件
-
-- `core/stores/` 持有跨 Feature 或跨挂载周期状态；`features/<domain>/` 内的 Store 持有领域状态。
-- Composable 连接 Vue 生命周期、浏览器能力或 Tauri 事件；组件消费状态并保留只属于自身挂载期的瞬时交互。
-- 现有调用链允许 Store、Composable 或明确的根/边界组件直接 invoke。不得为了形式统一新增无所有权价值的转发层。
-- 修改并发请求、取消、恢复或异步回调时，沿代码检查当前 identity、generation、owner 与卸载边界，不从界面最终看起来正确推断竞态已经闭合。
-
-### 3.3 导航与覆盖层
-
-主 Router 只承载实际路由；页面式业务入口由 `overlayStore` 的 page stack、`FeatureOverlays` 和 `SlidePage` 形成虚拟导航。`layoutStore` 持有左右抽屉意图，`useModalHistory` 连接返回顺序；不得在 Feature 内复制另一套全局页面栈或返回栈。
-
-`GlobalOverlayManager` 负责 Prompt、Confirm、ContextMenu、Editor、Toast 与共享 Viewer，并提供 Feature Teleport 目标。新增全局覆盖面前先找到现有 owner、挂载点与关闭路径；局部弹层留在局部组件，不因层级问题直接抬成全局状态。
+- **虚拟导航**: 主应用基于单页架构，次级业务视窗通过 `SlidePage` 压栈管理，返回顺序与 Z-Index 由 `overlayStore.getPageZIndex` 动态关联。
+- **全局覆盖**: 全局弹窗与抽屉使用统一遮罩管理，同一时刻只激活最高优先级交互面，避免多模态并发阻断用户输入。
 
 ---
 
-## 4. 消息渲染与交互完整性
+## 5. 修改与验证
 
-`MessageRenderer.vue` 消费当前消息、AST snapshot 与 TailFrame；`core/utils/astExecutor.ts`、`core/dom-engine/` 和各 Rich Block 承接局部更新及交互。修改任一环节时沿实际数据形态追踪生成者、缓存身份、DOM owner、恢复路径和卸载清理，不能用全量重渲染掩盖增量链错误。
+| 修改范围 | 验证命令 |
+| -------- | -------- |
+| 前端代码、组件与 Store 逻辑 | 在仓库根目录运行 `pnpm lint` 与 `pnpm vue-tsc --noEmit` |
+| 跨端 IPC 调用与配置类型一致性 | 在仓库根目录运行 `pnpm check` |
+| 前端单元与状态集成测试 | 在仓库根目录运行 `pnpm test:run` |
 
-Markdown、代码、KaTeX、Mermaid、SVG/MathML、受控 raw HTML、Tool、Thought、Diary、附件和流式收敛共同构成现有消息能力。兼容或安全修改必须保留结构、样式、媒体与交互；隔离能够触达宿主或外部状态的主动执行面，不采用整块转义、纯文本降级或禁用全部脚本来替代边界设计。
-
-消息内部按钮、链接、图片与引用由现有事件桥和对应 Store 处理。新增交互必须复用真实消费入口，区分 DOM 局部反馈与业务结果，不在渲染器内另建业务状态所有者。
-
----
-
-## 5. UI 与样式约定
-
-### 5.1 移动端产品表达
-
-- 高密度线性布局优先，列表重于卡片；避免大面积圆角和厚重投影。
-- ID、UUID、状态码使用 Monospace；灰度承载主体，彩色只表达清晰状态。
-- 交互反馈保持内敛，使用侧边强调、边框或透明度变化，不做大幅缩放与弹跳。
-- 内容区域不使用 backdrop blur；fixed/sticky 单例若保留轻度 blur，必须对应真实移动端性能证据。
-
-手机、平板、分屏和折叠状态共享同一组件树与业务状态，只按当前 WebView 可用宽度改变呈现。不得按品牌、机型、方向或“桌面模式”复制页面和 Store。
-
-### 5.2 样式与层级
-
-Vue 组件使用 `<script setup>`；状态 Store 延续 Composition API。样式优先复用 UnoCSS、主题变量和现有共享类，复杂的消息块或交互动画可留在对应生产样式文件。
-
-`appStyles.ts` 中 reset、UnoCSS 与主题样式的顺序具有实际级联含义。全局覆盖层使用 `core/constants/layers.ts` 定义的语义层级；局部 stacking context 可以使用局部数值。遇到遮挡先检查 Teleport、父级 stacking context 与实际挂载位置，不用更大的魔法数字覆盖问题。
-
----
-
-## 6. 修改与完成边界
-
-实现需求时，从当前视图或事件入口追踪到 Store、Composable、IPC 与渲染消费者，复用现有 owner 完成最小闭环。跨 Rust/Tauri 边界时同时读取对应目录的 `AGENTS.md`，并以两端生产代码核对字段和生命周期。
-
-前端或跨层变化从仓库根运行 `pnpm check`。Android 窗口、Insets、返回、触控或性能结论分别以实际取得的构建与设备证据说明；iOS 按根规范采用源码审计及 G1/G2 阶段性 Actions 验收，不建设实机测试体系。测试只能作为额外执行结果，不能定义生产行为。
-
-**完成**：目标行为由现有状态 owner 驱动，组件、覆盖层、IPC、渲染与清理路径保持一致，并明确说明已验证的生产代码路径、构建结果及尚未取得的设备证据。
+**完成判定**：交互闭环由对应 Store 或 Composable 接管，语义层级无冲突，组件销毁时事件监听与定时器完全释放，静态检查零报错。

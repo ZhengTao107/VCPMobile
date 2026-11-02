@@ -1,6 +1,8 @@
+import process from "node:process";
 import { computed, nextTick, ref } from "vue";
 import { describe, expect, it, vi } from "vitest";
 import { useChatScroll } from "@/core/composables/useChatScroll";
+import { scrollToMessageById } from "@/core/utils/scrollToMessage";
 
 const flushFrames = async () => {
   await new Promise((resolve) => setTimeout(resolve, 5));
@@ -14,13 +16,11 @@ const settleInitialRendering = async () => {
 
 function installControllableResizeObserver() {
   const original = window.ResizeObserver;
-  let callback: ResizeObserverCallback | null = null;
-  let observer: ResizeObserver | null = null;
+  let notify: (() => void) | null = null;
 
   class TestResizeObserver implements ResizeObserver {
     constructor(nextCallback: ResizeObserverCallback) {
-      callback = nextCallback;
-      observer = this;
+      notify = () => nextCallback([], this);
     }
 
     observe() {}
@@ -32,10 +32,10 @@ function installControllableResizeObserver() {
 
   return {
     trigger: () => {
-      if (!callback || !observer) {
+      if (!notify) {
         throw new Error("ResizeObserver has not been initialized");
       }
-      callback([], observer);
+      notify();
     },
     restore: () => {
       window.ResizeObserver = original;
@@ -62,6 +62,70 @@ function scrollTopArgument(
 }
 
 describe("useChatScroll pagination completion", () => {
+  it("preserves a stale pagination rejection without finishing a newer request", async () => {
+    const list = document.createElement("div");
+    Object.defineProperties(list, {
+      scrollHeight: { configurable: true, value: 1000 },
+      clientHeight: { configurable: true, value: 100 },
+      scrollTop: { configurable: true, writable: true, value: 0 },
+    });
+    list.scrollTo = vi.fn();
+    const messageListRef = ref<HTMLElement | null>(null);
+    let rejectOld!: (reason: unknown) => void;
+    let finishCurrent!: (value: { addedCount: number }) => void;
+    const oldPage = new Promise<{ addedCount: number }>((_resolve, reject) => {
+      rejectOld = reject;
+    });
+    const currentPage = new Promise<{ addedCount: number }>((resolve) => {
+      finishCurrent = resolve;
+    });
+    const onLoadMore = vi.fn()
+      .mockReturnValueOnce(oldPage)
+      .mockReturnValueOnce(currentPage);
+    const scroll = useChatScroll({
+      messageListRef,
+      messageCount: computed(() => 0),
+      hasMoreHistory: ref(true),
+      isLoadingHistory: ref(false),
+      onLoadMore,
+    });
+    const failure = new Error("unexpected history callback failure");
+    const propagated: unknown[] = [];
+    // Pagination is launched by a DOM event without a returned promise. Observe
+    // the same unhandled-rejection boundary used by the app's error reporter.
+    const recordRejection = (reason: unknown) => { propagated.push(reason); };
+    process.on("unhandledRejection", recordRejection);
+    try {
+      messageListRef.value = list;
+      await nextTick();
+      list.dispatchEvent(new WheelEvent("wheel", { deltaY: -1 }));
+      expect(onLoadMore).toHaveBeenCalledTimes(1);
+
+      scroll.reset();
+      list.dispatchEvent(new WheelEvent("wheel", { deltaY: -1 }));
+      expect(onLoadMore).toHaveBeenCalledTimes(2);
+      vi.mocked(list.scrollTo).mockClear();
+
+      rejectOld(failure);
+      await flushFrames();
+      expect(propagated).toEqual([failure]);
+      expect(list.scrollTo).not.toHaveBeenCalled();
+      list.dispatchEvent(new WheelEvent("wheel", { deltaY: -1 }));
+      expect(onLoadMore).toHaveBeenCalledTimes(2);
+
+      finishCurrent({ addedCount: 0 });
+      await flushFrames();
+      expect(list.scrollTo).toHaveBeenCalledTimes(1);
+      expect(propagated).toEqual([failure]);
+    } finally {
+      // Keep rejected fixtures observed and release pending work even on failure.
+      void oldPage.catch(() => {});
+      finishCurrent({ addedCount: 0 });
+      scroll.dispose();
+      process.off("unhandledRejection", recordRejection);
+    }
+  });
+
   it("leaves loading-top after a zero-result page and permits retry", async () => {
     const list = document.createElement("div");
     Object.defineProperties(list, {
@@ -114,6 +178,74 @@ function createLayoutScroll(list: HTMLElement) {
 }
 
 describe("useChatScroll streaming follow intent", () => {
+  it("keeps an anchored message at the same offset when media above it grows near the tail", async () => {
+    const resize = installControllableResizeObserver();
+    const list = document.createElement("div");
+    const row = document.createElement("article");
+    row.dataset.messageId = "last";
+    list.append(row);
+    let height = 1000;
+    let rowOffset = 640;
+    Object.defineProperties(list, {
+      scrollTop: { writable: true, value: 650 },
+      scrollHeight: { get: () => height },
+      clientHeight: { value: 300 },
+    });
+    list.scrollTo = vi.fn();
+    list.getBoundingClientRect = () => new DOMRect(0, 0, 300, 300);
+    row.getBoundingClientRect = () => new DOMRect(0, rowOffset - list.scrollTop, 300, 200);
+    const element = ref<HTMLElement | null>(null);
+    const scroll = useChatScroll({ messageListRef: element, messageCount: computed(() => 1),
+      hasMoreHistory: ref(false), isLoadingHistory: ref(false), anchored: ref(true),
+      onLoadMore: vi.fn(async () => ({ addedCount: 0 })) });
+    try {
+      element.value = list;
+      await nextTick();
+      row.dispatchEvent(new Event("vcp-message-anchor", { bubbles: true }));
+      list.dispatchEvent(new Event("scroll"));
+      await flushFrames();
+      rowOffset += 80;
+      height += 80;
+      resize.trigger();
+      await flushFrames();
+      expect(list.scrollTop).toBe(730);
+      expect(scroll.followingLatest.value).toBe(false);
+      expect(list.scrollTo).not.toHaveBeenCalled();
+    } finally {
+      scroll.dispose();
+      resize.restore();
+    }
+  });
+  it("keeps an explicitly opened reply in view as the first history layout settles", async () => {
+    const resizeObserver = installControllableResizeObserver();
+    const list = document.createElement("div");
+    const message = document.createElement("div");
+    message.dataset.messageId = "old-reply";
+    list.appendChild(message);
+    document.body.appendChild(list);
+    list.scrollTo = vi.fn();
+    message.scrollIntoView = vi.fn(() => { list.scrollTop = 300; });
+    Object.defineProperties(list, {
+      scrollHeight: { configurable: true, value: 1200 },
+      clientHeight: { configurable: true, value: 400 },
+    });
+    const scroll = createLayoutScroll(list);
+    try {
+      await nextTick();
+      expect(scrollToMessageById("old-reply", { flash: false, behavior: "instant" })).toBe(true);
+      list.dispatchEvent(new Event("scroll"));
+      await flushFrames();
+      resizeObserver.trigger();
+      expect(list.scrollTop).toBe(300);
+      expect(list.scrollTo).not.toHaveBeenCalled();
+      expect(scroll.showScrollToBottom.value).toBe(true);
+    } finally {
+      scroll.dispose();
+      resizeObserver.restore();
+      list.remove();
+    }
+  });
+
   it("keeps following when a delayed programmatic scroll event sees another large content batch", async () => {
     const resizeObserver = installControllableResizeObserver();
     const list = document.createElement("div");

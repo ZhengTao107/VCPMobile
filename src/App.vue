@@ -3,7 +3,6 @@ import { onMounted, onUnmounted, computed, nextTick, ref, watch, type WatchStopH
 import { useRouter } from "vue-router";
 import { listen } from "@tauri-apps/api/event";
 import { invoke } from "@tauri-apps/api/core";
-import type { PickedFile } from "tauri-plugin-vcp-mobile";
 import { getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow";
 import { useSidebarSwipe } from "./core/composables/useSidebarSwipe";
 import { useThemeStore } from "./core/stores/theme";
@@ -16,17 +15,17 @@ import { useNotificationStore } from "./core/stores/notification";
 import { useNotificationProcessor } from "./core/composables/useNotificationProcessor";
 import { useEmoticonFixer } from "./core/composables/useEmoticonFixer";
 import { useAutoUpdate } from "./core/composables/useAutoUpdate";
-import { useChatSessionStore } from "./core/stores/chatSessionStore";
-import { useAssistantStore } from "./core/stores/assistant";
+import { useChatSessionStore, type ConversationKey } from "./core/stores/chatSessionStore";
+import { useVoiceCallStore } from "./features/chat/voice/voiceCallStore";
 import { useAppLifecycle } from "./core/composables/useAppLifecycle";
 import { retainNativeInsetsBridge } from "./core/composables/useKeyboardInsets";
-import { LatestIntentOwner } from "./core/utils/latestIntentOwner";
+import { useWebViewResume } from "./core/composables/useWebViewResume";
+import { useShareStore } from "./core/stores/shareStore";
 import {
   useVcpCliStore,
   type VcpCliNotificationTarget,
 } from "./features/cli/vcpCliStore";
-import type { AttachmentData } from "./core/types/chat";
-import type { AgentListItemDto, TopicDto } from "./core/types/assistant";
+import type { AgentListItemDto } from "./core/types/assistant";
 
 // 初始化应用生命周期监听
 useAppLifecycle();
@@ -45,28 +44,13 @@ import UpdatePrompt from "./components/ui/UpdatePrompt.vue";
 import ShareAgentSelector from "./features/chat/components/ShareAgentSelector.vue";
 
 
-interface SharedFileEntry {
-  cachePath: string;
-  mimeType: string;
-  fileName: string;
-  size: number;
-  stagingTicket: string;
-}
-
-interface SharedContentData {
-  intentId: string;
-  operationId: string;
-  text: string;
-  files: SharedFileEntry[];
-}
-
 const themeStore = useThemeStore();
 const lifecycleStore = useAppLifecycleStore();
 const notificationStore = useNotificationStore();
 const layoutStore = useLayoutStore();
 const overlayStore = useOverlayStore();
 const sessionStore = useChatSessionStore();
-const assistantStore = useAssistantStore();
+const voiceCallStore = useVoiceCallStore();
 const { processPayload } = useNotificationProcessor();
 const leftSidebarPersistent = window.matchMedia("(min-width: 1024px)");
 const rightSidebarPersistent = window.matchMedia("(min-width: 1280px)");
@@ -83,172 +67,24 @@ const router = useRouter();
 
 const { initRootHistory } = useModalHistory();
 
-// --- Share Intent State ---
-const sharedContent = ref<SharedContentData>({ intentId: "", operationId: "", text: "", files: [] });
-const showShareSelector = ref(false);
-const pendingSharedFiles = ref<PickedFile[]>([]);
-const shareIntentOwner = new LatestIntentOwner();
-let stopShareReadyWatch: WatchStopHandle | null = null;
-
-const handleShareIntent = (e: Event) => {
-  processSharedIntent((e as CustomEvent<unknown>).detail);
+// One recoverable share; native acquisition and message commits are owned by Rust.
+const shareStore = useShareStore();
+const handleShareIntent = () => {
+  if (lifecycleStore.state === "READY") void shareStore.pollAndroid().catch(shareStore.notify);
 };
-
-const isSharedFileEntry = (value: unknown): value is SharedFileEntry => {
-  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
-  const file = value as Record<string, unknown>;
-  return typeof file.cachePath === "string" &&
-    typeof file.mimeType === "string" &&
-    typeof file.fileName === "string" &&
-    typeof file.size === "number" &&
-    Number.isSafeInteger(file.size) &&
-    file.size >= 0 &&
-    typeof file.stagingTicket === "string";
+const refreshShare = () => {
+  if (lifecycleStore.state !== "READY" || (!isAndroid && !isIOS)) return;
+  // Renew presentation at this entry, before a slow Android file handoff. Its
+  // eventual completion must not erase a close made while processing the share.
+  const pending = isAndroid ? Promise.all([shareStore.refresh(), shareStore.pollAndroid()]) : shareStore.refresh();
+  void pending.catch(shareStore.notify);
 };
-
-const processSharedIntent = async (detail: unknown) => {
-  const operationId = shareIntentOwner.begin();
-  const source = detail && typeof detail === "object" && !Array.isArray(detail)
-    ? detail as Record<string, unknown>
-    : {};
-  const intentId = typeof source.intentId === "string" ? source.intentId : "";
-  const text = typeof source.text === "string" ? source.text : "";
-  const files = Array.isArray(source.files)
-    ? source.files.filter(isSharedFileEntry)
-    : [];
-  console.log("[App] Share intent received", {
-    intentId,
-    textLength: text.length,
-    fileCount: files.length,
-  });
-  const snapshot: SharedContentData = { intentId, operationId, text, files };
-
-  stopShareReadyWatch?.();
-  stopShareReadyWatch = null;
-  sharedContent.value = snapshot;
-  pendingSharedFiles.value = [];
-  showShareSelector.value = false;
-
-  // Wait for core to be ready, then process files
-  if (lifecycleStore.state !== "READY") {
-    console.log("[App] Core not ready yet, deferring share intent processing...");
-    stopShareReadyWatch = watch(
-      () => lifecycleStore.state,
-      async (state) => {
-        if (state === "READY" && shareIntentOwner.isCurrent(operationId)) {
-          stopShareReadyWatch?.();
-          stopShareReadyWatch = null;
-          await prepareShareFiles(snapshot, operationId);
-        }
-      },
-    );
-    return;
-  }
-
-  await prepareShareFiles(snapshot, operationId);
-};
-
-const prepareShareFiles = async (content: SharedContentData, operationId: string) => {
-  const files = content.files;
-  if (files.length > 0) {
-    try {
-      console.log(`[App] Registering ${files.length} shared file(s)...`);
-      for (const file of files) {
-        await invoke("check_attachment_support", { originalName: file.fileName });
-      }
-      const stagedResults = await invoke<PickedFile[]>("plugin:vcp-mobile|register_shared_files", {
-        ownerId: content.intentId,
-        files: files.map((f) => ({
-          cachePath: f.cachePath,
-          mimeType: f.mimeType,
-          fileName: f.fileName,
-          stagingTicket: f.stagingTicket,
-        })),
-      });
-      if (!shareIntentOwner.isCurrent(operationId)) return;
-
-      const results: PickedFile[] = [];
-      for (const staged of stagedResults) {
-        if (!shareIntentOwner.isCurrent(operationId)) return;
-        const registered = await invoke<AttachmentData>("register_local_file", {
-          localPath: staged.path,
-          originalName: staged.name,
-          mimeType: staged.mime || "application/octet-stream",
-          thumbnailPath: staged.thumbnailPath || null,
-          stableId: `share_${operationId}_${results.length}`,
-          expectedHash: staged.hash,
-        });
-        results.push({
-          path: registered.internalPath,
-          name: registered.name,
-          mime: registered.type,
-          size: registered.size,
-          hash: registered.hash,
-          thumbnailPath: registered.thumbnailPath ?? undefined,
-        });
-      }
-      if (!shareIntentOwner.isCurrent(operationId)) return;
-      pendingSharedFiles.value = results;
-      console.log(`[App] Shared files registered: ${results.length}`);
-    } catch (error) {
-      if (!shareIntentOwner.isCurrent(operationId)) return;
-      console.error("[App] Failed to register shared files", error);
-      pendingSharedFiles.value = [];
-      notificationStore.addNotification({
-        type: "error",
-        title: "分享附件处理失败",
-        message: error instanceof Error ? error.message : String(error),
-        toastOnly: false,
-      });
-    }
-  } else {
-    pendingSharedFiles.value = [];
-  }
-
-  // Ensure agents are loaded
-  if (assistantStore.agents.length === 0) {
-    try {
-      await assistantStore.fetchAgentsAndGroups();
-    } catch (e) {
-      console.error("[App] Failed to fetch agents for share selector:", e);
-    }
-  }
-
-  if (shareIntentOwner.isCurrent(operationId)) {
-    showShareSelector.value = true;
-  }
-};
-
-const handleShareAgentSelected = async (agent: AgentListItemDto) => {
-  const operationId = sharedContent.value.operationId;
-  showShareSelector.value = false;
-
-  try {
-    await sessionStore.startShareSession(
-      agent.id,
-      sharedContent.value.text,
-      pendingSharedFiles.value,
-    );
-  } catch (err) {
-    console.error("[App] Failed to start share session:", err);
-    notificationStore.addNotification({
-      type: "error",
-      title: "打开分享会话失败",
-      message: err instanceof Error ? err.message : String(err),
-      toastOnly: false,
-    });
-  }
-
-  // Clear share state
-  if (shareIntentOwner.isCurrent(operationId)) {
-    shareIntentOwner.clear(operationId);
-    sharedContent.value = { intentId: "", operationId: "", text: "", files: [] };
-    pendingSharedFiles.value = [];
-  }
-};
-
-const handleShareSelectorClose = () => {
-  showShareSelector.value = false;
+watch(() => lifecycleStore.state, state => { if (state === "READY") refreshShare(); });
+watch(() => lifecycleStore.lifecycleSnapshot?.phase, (phase, previous) => {
+  if (phase === "active" && previous !== "active") refreshShare();
+});
+const handleShareAgentSelected = (agent: AgentListItemDto, allowPartial = false) => {
+  void shareStore.openDraft(agent.id, allowPartial);
 };
 
 // --- Notification Click Routing State & Logic ---
@@ -266,7 +102,7 @@ type NotificationClickTarget =
       ownerId: string;
       ownerType: "agent" | "group";
       topicId: string;
-      requestId: string;
+      messageId?: string;
     };
 
 const parseNotificationClickTarget = (value: unknown): NotificationClickTarget | null => {
@@ -301,7 +137,8 @@ const parseNotificationClickTarget = (value: unknown): NotificationClickTarget |
     source.ownerId.length === 0 ||
     (source.ownerType !== "agent" && source.ownerType !== "group") ||
     typeof source.topicId !== "string" ||
-    source.topicId.length === 0
+    source.topicId.length === 0 ||
+    (isIOS && (source.kind !== "chat" || typeof source.messageId !== "string" || !source.messageId))
   ) {
     return null;
   }
@@ -310,15 +147,14 @@ const parseNotificationClickTarget = (value: unknown): NotificationClickTarget |
     ownerId: source.ownerId,
     ownerType: source.ownerType,
     topicId: source.topicId,
-    requestId: typeof source.requestId === "string" ? source.requestId : "",
+    messageId: typeof source.messageId === "string" ? source.messageId : undefined,
   };
 };
 
 let notificationNavigationGeneration = 0;
+let notificationChatIntent: number | null = null;
 let stopNotificationReadyWatch: WatchStopHandle | null = null;
 let appUnmounted = false;
-let lastIOSNotificationSequence = 0;
-let lastIOSNotificationClickId = "";
 const isCurrentNotificationNavigation = (generation: number) =>
   !appUnmounted && generation === notificationNavigationGeneration;
 
@@ -326,18 +162,14 @@ const routeNotificationClick = (rawDetail: unknown) => {
   if (appUnmounted) return;
   const detail = parseNotificationClickTarget(rawDetail);
   if (!detail) return;
-  if (isIOS) {
-    const response = rawDetail as Record<string, unknown>;
-    if (typeof response.clickId !== 'string' || !response.clickId || response.clickId.length > 256
-      || typeof response.sequence !== 'number' || !Number.isSafeInteger(response.sequence)
-      || response.sequence <= lastIOSNotificationSequence
-      || response.clickId === lastIOSNotificationClickId) return;
-    // Native assigns order at the actual click. A late cold-start read cannot
-    // supersede a newer live click, and both deliveries of one click are consumed once.
-    lastIOSNotificationSequence = response.sequence;
-    lastIOSNotificationClickId = response.clickId;
-  }
   const generation = ++notificationNavigationGeneration;
+  if (detail.kind === 'chat') {
+    notificationChatIntent = sessionStore.beginNavigation();
+  } else if (notificationChatIntent !== null && sessionStore.isNavigationCurrent(notificationChatIntent)) {
+    // An app-only or CLI click can supersede a still-validating chat notification.
+    sessionStore.beginNavigation();
+    notificationChatIntent = null;
+  }
   stopNotificationReadyWatch?.();
   stopNotificationReadyWatch = null;
   // A plain notification opens the app without inventing a chat destination.
@@ -446,33 +278,25 @@ const processNotificationClick = async (
     return;
   }
 
-  // 聊天通知先只读验证目标；过期通知不得关闭当前界面或清空当前 Topic。
+  const intent = notificationChatIntent;
+  if (intent === null || !sessionStore.isNavigationCurrent(intent) || !useModalHistory().canCloseAllModals()) return;
   try {
-    const topics = await invoke<TopicDto[]>("get_topics", {
-      ownerId: detail.ownerId,
-      ownerType: detail.ownerType,
-    });
-    if (!isCurrentNotificationNavigation(generation)) return;
-    const targetExists = topics.some((topic) => topic.id === detail.topicId);
-    if (!targetExists) {
-      notificationStore.addNotification({
-        type: "warning",
-        title: "通知已过期",
-        message: "目标话题已不存在，当前会话未受影响",
-        toastOnly: true,
-      });
-      return;
-    }
-
-    if (!closeNavigationSurfaces()) return;
-    if (!isCurrentNotificationNavigation(generation)) return;
-    await sessionStore.selectTopicById(
-      detail.ownerId,
-      detail.ownerType,
-      detail.topicId,
+    const status = await sessionStore.selectTopicById(
+      detail.ownerId, detail.ownerType, detail.topicId, intent, detail.messageId,
     );
+    if (!isCurrentNotificationNavigation(generation) || !sessionStore.isNavigationCurrent(intent)) return;
+    if (status === "accepted") {
+      if (useModalHistory().canCloseAllModals()) closeNavigationSurfaces();
+    } else if (status === "missing") {
+      notificationStore.addNotification({
+        type: "warning", title: "通知已过期",
+        message: detail.messageId ? "目标消息已不存在。" : "目标话题已不存在。", toastOnly: true,
+      });
+    } else {
+      sessionStore.notifyNavigationResult(status);
+    }
   } catch (error) {
-    if (!isCurrentNotificationNavigation(generation)) return;
+    if (!isCurrentNotificationNavigation(generation) || !sessionStore.isNavigationCurrent(intent)) return;
     console.error("[App] Failed to open notification target:", error);
     notificationStore.addNotification({
       type: "error",
@@ -480,12 +304,23 @@ const processNotificationClick = async (
       message: error instanceof Error ? error.message : String(error),
       toastOnly: true,
     });
+  } finally {
+    if (notificationChatIntent === intent) notificationChatIntent = null;
   }
 };
 
 // --- Global Swipe Logic for Sidebar ---
 const appRootRef = ref<HTMLElement | null>(null);
 useSidebarSwipe(appRootRef, { type: "global" });
+const renderedConversationEpoch = ref<number | null>(null);
+const handleContentSettled = (key: ConversationKey | null) => {
+  if (key && sessionStore.isConversationCurrent(key)) renderedConversationEpoch.value = key.epoch;
+};
+const handleContentPending = (key: ConversationKey | null) => {
+  if (key ? sessionStore.isConversationCurrent(key) : !sessionStore.currentConversationKey) {
+    renderedConversationEpoch.value = null;
+  }
+};
 
 const bootstrapApp = async () => {
   try {
@@ -497,11 +332,11 @@ const bootstrapApp = async () => {
 
 
 
-const backgroundStyle = computed(() => {
+const wallpaperUrl = computed(() => {
   const themeInfo = themeStore.currentThemeInfo || themeStore.availableThemes.find(
     (t) => t.fileName === themeStore.currentTheme,
   );
-  if (!themeInfo) return {};
+  if (!themeInfo) return null;
 
   const isLight = !themeStore.isDarkResolved;
   let rawValue = isLight
@@ -515,18 +350,30 @@ const backgroundStyle = computed(() => {
       : themeInfo.variables.light?.["--chat-wallpaper-light"];
   }
 
-  if (!rawValue || rawValue === "none") return {};
+  if (!rawValue || rawValue === "none") return null;
 
   // Extract filename and clean it robustly
   const match = rawValue.match(/url\(['"]?(.*?)['"]?\)/);
   let filename = match ? match[1] : rawValue;
 
   // 1. Strip path
-  filename = filename.replace(/^.*[\\\/]/, "").replace(/['"]/g, "");
+  filename = filename.replace(/^.*[\\/]/, "").replace(/['"]/g, "");
   // 2. Strip ANY existing extension and force .webp (matching optimized public/wallpaper)
   filename = filename.split(".")[0] + ".webp";
 
-  return { backgroundImage: `url("/wallpaper/${filename}")` };
+  return `/wallpaper/${filename}`;
+});
+const backgroundStyle = computed(() => wallpaperUrl.value
+  ? { backgroundImage: `url("${wallpaperUrl.value}")` }
+  : {});
+
+useWebViewResume({
+  root: appRootRef,
+  ready: () => lifecycleStore.state === 'PERMISSIONS' || lifecycleStore.state === 'ERROR'
+    || lifecycleStore.state === 'READY' && (!sessionStore.currentConversationKey
+      || renderedConversationEpoch.value === sessionStore.currentConversationKey.epoch),
+  appearance: () => `${themeStore.currentTheme}:${themeStore.isDarkResolved}`,
+  wallpaperUrl: () => wallpaperUrl.value,
 });
 
 // 用于取消监听的清理函数
@@ -553,7 +400,11 @@ const handleExitRequest = async () => {
   // 2. 第二级：若当前在 Agent 聊天中（且已就绪），按返回键退回到初始零数据引导欢迎页
   if (lifecycleStore.state === 'READY' && sessionStore.currentSelectedItem !== null) {
     console.log('[ExitRequest] Resetting active session to welcome boot screen.');
-    sessionStore.clearConversation();
+    try {
+      sessionStore.notifyNavigationResult(await sessionStore.clearConversation());
+    } catch (error) {
+      notificationStore.addNotification({ type: 'error', title: '退出会话失败', message: String(error), toastOnly: true });
+    }
     return;
   }
 
@@ -591,50 +442,32 @@ const handleExitRequest = async () => {
   }
 };
 
-let pendingNotificationRead: Promise<void> | null = null;
-let pendingNotificationRefreshQueued = false;
+let readingPendingNotification = false;
+let notificationReadQueued = false;
 let androidPendingNotificationRead = false;
-let unlistenNativeNotification: (() => void) | null = null;
-let notificationSubscription: Promise<void> | null = null;
-let notificationSubscriptionSettled = isAndroid;
 
-const readPendingNotification = (): Promise<void> => {
-  if (appUnmounted || lifecycleStore.state !== 'READY' || !notificationSubscriptionSettled
-    || (!isAndroid && !isIOS) || (isAndroid && androidPendingNotificationRead)) return Promise.resolve();
-  if (pendingNotificationRead) {
-    if (isIOS) pendingNotificationRefreshQueued = true;
-    return pendingNotificationRead;
+const readPendingNotification = async () => {
+  if (appUnmounted || lifecycleStore.state !== 'READY' || (!isAndroid && !isIOS) || androidPendingNotificationRead) return;
+  if (readingPendingNotification) {
+    // A new iOS tap may arrive after Swift took the previous one but before IPC returns.
+    notificationReadQueued = true;
+    return;
   }
   if (isAndroid) androidPendingNotificationRead = true;
-  pendingNotificationRead = invoke<unknown>('plugin:vcp-mobile|get_pending_notification')
-    .then(pending => { if (!appUnmounted) routeNotificationClick(pending); })
-    .catch(error => console.warn('[App] Failed to fetch pending notification click:', error))
-    .finally(() => {
-      pendingNotificationRead = null;
-      if (!appUnmounted && pendingNotificationRefreshQueued) {
-        pendingNotificationRefreshQueued = false;
-        void readPendingNotification();
-      }
-    });
-  return pendingNotificationRead;
-};
-
-const subscribeNativeNotifications = (): Promise<void> => {
-  if (appUnmounted || !isIOS) return Promise.resolve();
-  if (notificationSubscription) return notificationSubscription;
-  if (unlistenNativeNotification) return readPendingNotification();
-  notificationSubscription = listen<unknown>('vcp-notification-click', event => {
-    routeNotificationClick(event.payload);
-  }).then(unlisten => {
-    if (appUnmounted) unlisten();
-    else unlistenNativeNotification = unlisten;
-  }).catch(error => {
-    console.warn('[App] Failed to subscribe to native notification clicks:', error);
-  }).then(async () => {
-    notificationSubscriptionSettled = true;
-    await readPendingNotification();
-  }).finally(() => { notificationSubscription = null; });
-  return notificationSubscription;
+  readingPendingNotification = true;
+  const sequence = sessionStore.navigationSequence;
+  try {
+    const detail = await invoke<unknown>('plugin:vcp-mobile|get_pending_notification');
+    if (sessionStore.isNavigationCurrent(sequence)) routeNotificationClick(detail);
+  } catch (error) {
+    console.warn('[App] Failed to fetch pending notification click:', error);
+  } finally {
+    readingPendingNotification = false;
+    if (notificationReadQueued) {
+      notificationReadQueued = false;
+      void readPendingNotification();
+    }
+  }
 };
 
 watch(
@@ -644,7 +477,7 @@ watch(
   },
 );
 watch(() => lifecycleStore.lifecycleSnapshot?.phase, (phase, previous) => {
-  if (isIOS && phase === 'active' && previous !== 'active') void subscribeNativeNotifications();
+  if (isIOS && phase === 'active' && previous !== 'active') void readPendingNotification();
 });
 
 onMounted(async () => {
@@ -655,7 +488,12 @@ onMounted(async () => {
     window.addEventListener("vcp-share-intent", handleShareIntent);
     window.addEventListener("vcp-notification-click", handleNotificationClick);
   }
-  if (isIOS) void subscribeNativeNotifications();
+  if (isIOS) {
+    window.addEventListener("vcp-notification-pending", readPendingNotification);
+    window.addEventListener("vcp-share-inbox-changed", refreshShare);
+    void readPendingNotification();
+  }
+  refreshShare();
   leftSidebarPersistent.addEventListener("change", reconcileDrawerPresentation);
   rightSidebarPersistent.addEventListener("change", reconcileDrawerPresentation);
   reconcileDrawerPresentation();
@@ -698,18 +536,20 @@ onMounted(async () => {
 
 onUnmounted(() => {
   appUnmounted = true;
+  if (notificationChatIntent !== null && sessionStore.isNavigationCurrent(notificationChatIntent)) {
+    sessionStore.beginNavigation();
+  }
   notificationNavigationGeneration++;
-  stopShareReadyWatch?.();
-  stopShareReadyWatch = null;
   stopNotificationReadyWatch?.();
   stopNotificationReadyWatch = null;
   if (unlistenLog) unlistenLog();
   stopRouterHistory?.();
-  unlistenNativeNotification?.();
   window.removeEventListener("vcp-exit-requested", handleExitRequest);
   window.removeEventListener("vcp-hardware-back", handleExitRequest);
   window.removeEventListener("vcp-share-intent", handleShareIntent);
+  window.removeEventListener("vcp-share-inbox-changed", refreshShare);
   window.removeEventListener("vcp-notification-click", handleNotificationClick);
+  window.removeEventListener("vcp-notification-pending", readPendingNotification);
   leftSidebarPersistent.removeEventListener("change", reconcileDrawerPresentation);
   rightSidebarPersistent.removeEventListener("change", reconcileDrawerPresentation);
   releaseNativeInsetsBridge();
@@ -719,7 +559,7 @@ onUnmounted(() => {
 </script>
 
 <template>
-  <div ref="appRootRef" class="vcp-app-root h-full w-full overflow-hidden flex flex-col select-none relative">
+  <div ref="appRootRef" class="vcp-app-root vcp-viewport-surface h-full w-full overflow-hidden flex flex-col select-none relative">
     <!-- 0. 权限门禁（仅在 PERMISSIONS 状态显示；保活核心权限缺失时阻断进入） -->
     <PermissionGate v-if="lifecycleStore.state === 'PERMISSIONS'" />
 
@@ -730,39 +570,39 @@ onUnmounted(() => {
     <Transition name="bg-fade">
       <div :key="backgroundStyle.backgroundImage" class="vcp-background-layer" :style="backgroundStyle"></div>
     </Transition>
-    <div class="vcp-background-overlay absolute inset-0 pointer-events-none transition-colors" style="transition-duration: 350ms;"
-      :class="themeStore.isDarkResolved ? 'bg-black/12' : 'bg-transparent'"></div>
+    <div class="vcp-background-overlay absolute inset-0 pointer-events-none"
+      :class="themeStore.isDarkResolved ? 'opacity-100' : 'opacity-0'"></div>
 
     <!-- 2. 单一横向工作区：CSS 按可用宽度决定抽屉、单栏或双栏呈现 -->
     <div
       v-if="lifecycleStore.state === 'READY'"
       class="vcp-workspace-row flex-1 min-w-0 min-h-0 relative overflow-hidden"
+      :class="{ 'is-voice-call': voiceCallStore.active }"
     >
       <!-- 对应侧栏仍为 drawer 时显示遮罩；DOM 置于侧栏前，确保侧栏稳定位于其上 -->
-      <Transition name="fade">
-        <div
-          v-if="layoutStore.leftDrawerOpen || layoutStore.rightDrawerOpen"
-          class="vcp-drawer-overlay absolute inset-0 z-drawer bg-black/12"
-          :class="{
-            'is-left-open': layoutStore.leftDrawerOpen,
-            'is-right-open': layoutStore.rightDrawerOpen,
-          }"
-          @click.self="
-            layoutStore.setLeftDrawer(false);
-            layoutStore.setRightDrawer(false);
-          "
-        ></div>
-      </Transition>
+      <div
+        class="vcp-drawer-overlay absolute inset-0 z-drawer bg-black/12"
+        :class="{
+          'is-left-open': layoutStore.leftDrawerOpen,
+          'is-right-open': layoutStore.rightDrawerOpen,
+        }"
+        @click.self="
+          layoutStore.setLeftDrawer(false);
+          layoutStore.setRightDrawer(false);
+        "
+      ></div>
 
-      <AgentSidebar class="vcp-workspace-left" />
+      <AgentSidebar v-show="!voiceCallStore.active" class="vcp-workspace-left" />
 
       <main class="vcp-workspace-main flex-1 min-w-0 min-h-0 relative overflow-hidden">
         <router-view v-slot="{ Component }">
-          <component v-if="Component" :is="Component" />
+          <component v-if="Component" :is="Component" @content-settled="handleContentSettled"
+            @content-pending="handleContentPending" />
         </router-view>
       </main>
 
       <RightSidebar
+        v-show="!voiceCallStore.active"
         class="vcp-workspace-right"
         :is-open="layoutStore.rightDrawerOpen"
         @close="layoutStore.setRightDrawer(false)"
@@ -780,10 +620,16 @@ onUnmounted(() => {
 
     <!-- 7. 分享意图 Agent 选择器 -->
     <ShareAgentSelector v-if="lifecycleStore.state === 'READY'"
-      :is-open="showShareSelector"
-      :shared-text="sharedContent.text"
-      :shared-file-count="sharedContent.files.length"
-      @close="handleShareSelectorClose"
+      :is-open="shareStore.selectorOpen"
+      :shared-text="shareStore.current?.text || ''"
+      :shared-file-count="shareStore.current?.attachments.length || 0"
+      :failures="shareStore.failures"
+      :busy="shareStore.busy"
+      :error="shareStore.current?.error"
+      :is-draft="shareStore.current?.state === 'draft'"
+      @close="shareStore.closeSelector"
+      @discard="shareStore.discard"
+      @retry="shareStore.prepare().catch(shareStore.notify)"
       @selected="handleShareAgentSelected"
     />
 
@@ -833,13 +679,38 @@ body,
   padding-right: var(--vcp-workspace-safe-right);
 }
 
+.vcp-drawer-overlay {
+  opacity: 0;
+  visibility: hidden;
+  /* 退场期间继续拦截点击，visibility 完成隐藏后再释放命中区域。 */
+  pointer-events: auto;
+  will-change: opacity;
+  transition:
+    opacity var(--vcp-drawer-close-duration) var(--vcp-drawer-close-easing),
+    visibility 0s linear var(--vcp-drawer-close-duration);
+}
+
+@media (width < 1024px) {
+  .vcp-drawer-overlay:is(.is-left-open, .is-right-open) {
+    opacity: 1;
+    visibility: visible;
+    transition:
+      opacity var(--vcp-drawer-open-duration) var(--vcp-drawer-open-easing),
+      visibility 0s;
+  }
+}
+
 @media (min-width: 1024px) {
   .vcp-workspace-main {
     padding-left: 0;
   }
 
-  .vcp-drawer-overlay:not(.is-right-open) {
-    display: none;
+  .vcp-drawer-overlay.is-right-open {
+    opacity: 1;
+    visibility: visible;
+    transition:
+      opacity var(--vcp-drawer-open-duration) var(--vcp-drawer-open-easing),
+      visibility 0s;
   }
 }
 
@@ -850,7 +721,18 @@ body,
 
   .vcp-drawer-overlay {
     display: none;
+    will-change: auto;
   }
+}
+
+.vcp-drawer-overlay.is-dragging {
+  transition: none;
+}
+
+/* 沉浸通话收起常驻侧栏后，由聊天区重新承接两侧安全区。 */
+.vcp-workspace-row.is-voice-call > .vcp-workspace-main {
+  padding-left: var(--vcp-workspace-safe-left);
+  padding-right: var(--vcp-workspace-safe-right);
 }
 
 .vcp-background-layer {
@@ -860,6 +742,11 @@ body,
   background-position: center;
   background-repeat: no-repeat;
   transition: none;
+}
+
+.vcp-background-overlay {
+  background-color: rgba(0, 0, 0, 0.12);
+  transition: opacity 350ms ease-in-out;
 }
 
 /* Transitions */
@@ -875,7 +762,7 @@ body,
 
 .bg-fade-enter-active,
 .bg-fade-leave-active {
-  transition: opacity 0.35s ease-in-out;
+  transition: opacity 350ms ease-in-out;
 }
 
 .bg-fade-enter-from,

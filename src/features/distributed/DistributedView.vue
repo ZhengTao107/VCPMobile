@@ -3,6 +3,8 @@ import { computed, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import { invoke } from "@tauri-apps/api/core";
 import type { PermissionStatusDto } from "../../core/types/native";
 import { useSettingsStore } from "../../core/stores/settings";
+import type { ConfigSnapshot } from '../../core/config/generated/config';
+import { buildSettingsUpdate, cloneConfig } from '../../core/config/fields';
 import { useNotificationStore } from "../../core/stores/notification";
 import { isAndroid, isIOS } from "../../core/utils/platform";
 import { useDistributed } from "./composables/useDistributed";
@@ -44,16 +46,24 @@ const connectionSettingsLoading = ref(false);
 const connectionSettingsReady = ref(false);
 const connectionSettingsError = ref("");
 const connectionSaving = ref(false);
+let connectionBaseline: ConfigSnapshot | null = null;
+const connectionSettingsRefreshing = computed(() =>
+  connectionSettingsLoading.value && connectionBaseline !== null,
+);
 const connectionFieldsDisabled = computed(() =>
   !connectionSettingsReady.value || connectionSettingsLoading.value ||
   connectionSaving.value || status.value.state !== "disconnected",
 );
 // 分布式地址 / Key 留空时沿用 VCPLog 那组（同一台 VCP 的 WS 入口）；输入框不回显，只在连接时取值。
-const effectiveWsUrl = computed(() => wsUrl.value.trim() || (settingsStore.settings?.vcpLogUrl ?? "").trim());
-const effectiveVcpKey = computed(() => vcpKey.value.trim() || (settingsStore.settings?.vcpLogKey ?? "").trim());
+const effectiveWsUrl = computed(() => wsUrl.value.trim() || (settingsStore.settings?.log.url ?? "").trim());
+const effectiveVcpKey = computed(() => vcpKey.value.trim() || (settingsStore.settings?.log.key ?? "").trim());
 const canSaveConnection = computed(() =>
   props.isOpen && !connectionFieldsDisabled.value &&
   Boolean(effectiveWsUrl.value && effectiveVcpKey.value),
+);
+const connectionButtonDimmed = computed(() =>
+  connectionSaving.value || !wsUrl.value.trim() || !vcpKey.value.trim() ||
+  (!connectionSettingsReady.value && !connectionSettingsRefreshing.value),
 );
 
 // Interface types
@@ -122,16 +132,22 @@ const authorizationMutationPending = computed(
 const authorizationConfigReady = computed(
   () =>
     toolConfigStatus.value !== null &&
-    !toolConfigStatusLoading.value &&
     toolConfigStatus.value.state !== "uninitialized" &&
     !toolConfigStatusError.value,
 );
 const authorizationSwitchesDisabled = computed(
   () =>
     catalogLoading.value ||
+    toolConfigStatusLoading.value ||
     Boolean(catalogError.value) ||
     authorizationMutationPending.value ||
     !authorizationConfigReady.value,
+);
+const authorizationSwitchesDimmed = computed(
+  () => Boolean(catalogError.value) || authorizationMutationPending.value || !authorizationConfigReady.value,
+);
+const showToolConfigLoading = computed(
+  () => toolConfigStatusLoading.value && toolConfigStatus.value === null,
 );
 
 const isCurrentView = (generation: number) =>
@@ -275,7 +291,6 @@ const loadPluginsMetadata = async (view = viewGeneration) => {
   if (!isCurrentView(view)) return;
   catalogLoading.value = true;
   catalogError.value = "";
-  toolConfigStatus.value = null;
   toolConfigStatusLoading.value = true;
   toolConfigStatusError.value = "";
 
@@ -471,9 +486,10 @@ const loadSettings = async (view = viewGeneration) => {
     if (!isCurrentView(view)) return;
     const settings = settingsStore.settings;
     if (!settings) throw new Error("连接配置为空");
-    wsUrl.value = settings.distributedWsUrl || "";
-    vcpKey.value = settings.distributedVcpKey || "";
-    deviceName.value = settings.distributedDeviceName ?? "VCPMobile";
+    connectionBaseline = cloneConfig(settingsStore.snapshot!);
+    wsUrl.value = settings.log.url || "";
+    vcpKey.value = settings.log.key || "";
+    deviceName.value = "VCPMobile";
     connectionSettingsReady.value = true;
   } catch (e) {
     console.error("[DistributedView] Failed to load settings:", e);
@@ -492,20 +508,32 @@ const handleConnect = async () => {
   if (!canSaveConnection.value) return;
   const view = viewGeneration;
   connectionSaving.value = true;
+  let configurationSaved = false;
   try {
-    await settingsStore.updateSettings({
-      distributedWsUrl: effectiveWsUrl.value,
-      distributedVcpKey: effectiveVcpKey.value,
-      distributedDeviceName: deviceName.value,
-      distributedEnabled: true,
-    });
+    if (!connectionBaseline) throw new Error('连接配置尚未加载');
+    // fork ptp4g#24：分布式地址/Key 留空时回落 VCPLog 连接对。
+    const result = await settingsStore.updateSettings(buildSettingsUpdate(connectionBaseline, {
+      'distributed.wsUrl': effectiveWsUrl.value,
+      'distributed.vcpKey': effectiveVcpKey.value,
+      'distributed.deviceName': deviceName.value,
+      'distributed.enabled': true,
+    }));
+    if (result.status === 'conflict') {
+      connectionBaseline = cloneConfig(result.snapshot);
+      throw new Error('连接配置已被其他操作修改。草稿已保留，请检查后再次连接。');
+    }
+    if (result.status === 'rejected') throw new Error(result.issues.map(issue => issue.message).join('；'));
+    connectionBaseline = cloneConfig(result.snapshot);
+    configurationSaved = true;
+    // Explicit Connect is also a retry when an unchanged, enabled node is offline.
+    await invoke('reconcile_distributed_node_cmd');
   } catch (e: any) {
     console.error("[DistributedView] Connection start failed:", e);
     if (isCurrentView(view)) {
       notificationStore.addNotification({
         type: "error",
-        title: "连接设置保存失败",
-        message: String(e),
+        title: configurationSaved ? '设置已保存，连接未能启动' : '连接设置保存失败',
+        message: configurationSaved ? '请检查网络与服务器状态后重试连接。' : String(e),
         toastOnly: true,
       });
     }
@@ -516,10 +544,16 @@ const handleConnect = async () => {
 
 const handleDisconnect = async () => {
   if (connectionSaving.value) return;
+  const view = viewGeneration;
   connectionSaving.value = true;
   try {
     if (settingsStore.settings) {
-      await settingsStore.updateSettings({ distributedEnabled: false });
+      const result = await settingsStore.updateFields({ 'distributed.enabled': false });
+      if (result.status === 'saved' && isCurrentView(view) && connectionBaseline) {
+        // Accept our own disconnect, retaining the original revision and field
+        // bases so concurrent edits to the connection details still conflict.
+        connectionBaseline.data.distributed.enabled = result.snapshot.data.distributed.enabled;
+      }
     }
   } catch (e: any) {
     console.error("[DistributedView] Connection stop failed:", e);
@@ -841,7 +875,8 @@ onBeforeUnmount(() => {
                 v-else
                 @click="handleConnect"
                 :disabled="!canSaveConnection"
-                class="px-4 py-1.5 text-white text-xs font-bold rounded-xl active:scale-95 transition-all disabled:opacity-50"
+                class="px-4 py-1.5 text-white text-xs font-bold rounded-xl active:scale-95 transition-all"
+                :class="{ 'opacity-50': connectionButtonDimmed }"
                 style="background-color: var(--highlight-text)"
               >
                 {{ connectionSaving ? '保存中...' : '连接' }}
@@ -920,7 +955,7 @@ onBeforeUnmount(() => {
           <!-- Configuration Fields -->
           <SettingsCard>
             <div class="space-y-4 py-1">
-              <p v-if="connectionSettingsLoading" class="text-xs opacity-60" role="status">
+              <p v-if="connectionSettingsLoading && !connectionSettingsRefreshing" class="text-xs opacity-60" role="status">
                 正在读取连接配置...
               </p>
               <div v-else-if="connectionSettingsError" class="flex items-center justify-between gap-3 text-xs">
@@ -937,22 +972,22 @@ onBeforeUnmount(() => {
               <SettingsTextField
                 v-model="deviceName"
                 label="节点名称 / Device Name"
-                placeholder="例如 VCPMobile"
-                :disabled="connectionFieldsDisabled"
+                placeholder="固定为 VCPMobile"
+                :disabled="true"
               />
               <SettingsTextField
                 v-model="wsUrl"
                 label="WS 服务地址 / WebSocket URL"
-                placeholder="ws://192.168.x.x:port"
+                placeholder="读取自服务器连接"
                 mono
-                :disabled="connectionFieldsDisabled"
+                :disabled="true"
               />
               <SettingsTextField
                 v-model="vcpKey"
                 label="VCP 鉴权密钥 / VCP API Key"
-                placeholder="授权校验密钥"
+                placeholder="读取自服务器连接"
                 is-secure
-                :disabled="connectionFieldsDisabled"
+                :disabled="true"
               />
             </div>
           </SettingsCard>
@@ -1046,12 +1081,12 @@ onBeforeUnmount(() => {
             {{ catalogError }}
           </div>
           <div
-            v-if="toolConfigStatusLoading || toolConfigStatusError || toolConfigStatus?.state === 'uninitialized' || toolConfigStatus?.state === 'recovered_disabled' || toolConfigStatus?.state === 'persistence_error'"
+            v-if="showToolConfigLoading || toolConfigStatusError || toolConfigStatus?.state === 'uninitialized' || toolConfigStatus?.state === 'recovered_disabled' || toolConfigStatus?.state === 'persistence_error'"
             data-tool-config-status
-            :role="toolConfigStatusLoading ? 'status' : 'alert'"
+            :role="showToolConfigLoading ? 'status' : 'alert'"
             class="mx-4 mt-2 border-l-2 border-amber-500 pl-2 text-[9px] leading-relaxed opacity-75"
           >
-            {{ toolConfigStatusLoading ? '正在读取授权策略；目录可独立浏览。' : toolConfigStatusError || (toolConfigStatus?.state === 'uninitialized'
+            {{ showToolConfigLoading ? '正在读取授权策略；目录可独立浏览。' : toolConfigStatusError || (toolConfigStatus?.state === 'uninitialized'
               ? '授权策略仍在加载；当前仅可浏览目录。'
               : '授权策略已安全恢复为全关，请逐项重新确认。') }}
           </div>
@@ -1166,8 +1201,8 @@ onBeforeUnmount(() => {
                     :aria-checked="plugin.enabled"
                     :aria-busy="authorizationMutationOwner?.toolId === plugin.id"
                     :disabled="authorizationSwitchesDisabled"
-                    class="w-9 h-5 rounded-full p-0.5 transition-colors duration-200 flex items-center shrink-0 disabled:cursor-not-allowed disabled:opacity-35"
-                    :class="plugin.enabled ? 'bg-blue-500/55 border border-blue-500/30' : 'bg-black/15 dark:bg-white/15 border border-black/5 dark:border-white/5'"
+                    class="w-9 h-5 rounded-full p-0.5 transition-colors duration-200 flex items-center shrink-0 disabled:cursor-not-allowed"
+                    :class="[plugin.enabled ? 'bg-blue-500/55 border border-blue-500/30' : 'bg-black/15 dark:bg-white/15 border border-black/5 dark:border-white/5', { 'opacity-35': authorizationSwitchesDimmed }]"
                     @click.stop="toggleToolEnabled(plugin)"
                   >
                     <span

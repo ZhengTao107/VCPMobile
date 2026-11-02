@@ -361,6 +361,18 @@
           "markdownDescription": "Denies the cancel_download_notification command without any pre-configured scope."
         },
         {
+          "description": "Enables the cancel_file_operation command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-cancel-file-operation",
+          "markdownDescription": "Enables the cancel_file_operation command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the cancel_file_operation command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-cancel-file-operation",
+          "markdownDescription": "Denies the cancel_file_operation command without any pre-configured scope."
+        },
+        {
           "description": "Enables the capture_window_snapshot command without any pre-configured scope.",
           "type": "string",
           "const": "allow-capture-window-snapshot",
@@ -431,6 +443,30 @@
           "type": "string",
           "const": "deny-clear-keep-screen-on",
           "markdownDescription": "Denies the clear_keep_screen_on command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the complete_webview_resume command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-complete-webview-resume",
+          "markdownDescription": "Enables the complete_webview_resume command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the complete_webview_resume command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-complete-webview-resume",
+          "markdownDescription": "Denies the complete_webview_resume command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the connect_webview_resume command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-connect-webview-resume",
+          "markdownDescription": "Enables the connect_webview_resume command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the connect_webview_resume command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-connect-webview-resume",
+          "markdownDescription": "Denies the connect_webview_resume command without any pre-configured scope."
         },
         {
           "description": "Enables the delete_temp_file command without any pre-configured scope.",
@@ -529,6 +565,18 @@
           "markdownDescription": "Denies the get_pending_notification command without any pre-configured scope."
         },
         {
+          "description": "Enables the get_webview_geometry command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-get-webview-geometry",
+          "markdownDescription": "Enables the get_webview_geometry command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the get_webview_geometry command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-get-webview-geometry",
+          "markdownDescription": "Denies the get_webview_geometry command without any pre-configured scope."
+        },
+        {
           "description": "Enables the launch_root_manager command without any pre-configured scope.",
           "type": "string",
           "const": "allow-launch-root-manager",
@@ -599,6 +647,18 @@
           "type": "string",
           "const": "deny-pick-file",
           "markdownDescription": "Denies the pick_file command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the prepare_file_operation command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-prepare-file-operation",
+          "markdownDescription": "Enables the prepare_file_operation command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the prepare_file_operation command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-prepare-file-operation",
+          "markdownDescription": "Denies the prepare_file_operation command without any pre-configured scope."
         },
         {
           "description": "Enables the register_shared_files command without any pre-configured scope.",
@@ -803,6 +863,18 @@
           "type": "string",
           "const": "deny-start-network-monitoring",
           "markdownDescription": "Denies the start_network_monitoring command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the trigger_haptic_feedback command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-trigger-haptic-feedback",
+          "markdownDescription": "Enables the trigger_haptic_feedback command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the trigger_haptic_feedback command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-trigger-haptic-feedback",
+          "markdownDescription": "Denies the trigger_haptic_feedback command without any pre-configured scope."
         },
         {
           "description": "Enables the update_download_notification command without any pre-configured scope.",

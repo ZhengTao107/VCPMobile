@@ -1,14 +1,28 @@
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { createPinia, setActivePinia } from 'pinia';
 import {
-  normalizeChatPresentationMode,
-  normalizeThemeModuleKey,
   resolveThemeWallpaperUrl,
+  normalizeThemePreferencePatch,
+  THEME_PREFERENCE_DEFAULTS,
   useThemeStore,
 } from '@/core/stores/theme';
+import { useChatPreferencesStore } from '@/features/chat/preferences/store';
+import { CHAT_PREFERENCE_DEFAULTS, normalizeChatPreferencePatch } from '@/features/chat/preferences/model';
 
 describe('theme and chat presentation store contracts', () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+    vi.unstubAllGlobals();
+  });
+
   beforeEach(() => {
+    // Happy DOM binds Storage methods through a Proxy. A plain facade keeps
+    // failure spies reversible while retaining its actual backing storage.
+    const storage = window.localStorage;
+    vi.stubGlobal('localStorage', {
+      getItem: storage.getItem.bind(storage), setItem: storage.setItem.bind(storage),
+      removeItem: storage.removeItem.bind(storage), clear: storage.clear.bind(storage),
+    });
     localStorage.clear();
     document.documentElement.style.cssText = '';
     document.documentElement.className = '';
@@ -16,56 +30,20 @@ describe('theme and chat presentation store contracts', () => {
     setActivePinia(createPinia());
   });
 
-  it.each(['bubble', 'panel', 'immersive'] as const)(
-    'restores the legal presentation value %s',
-    (mode) => {
-      localStorage.setItem('vcp-chat-presentation-mode', mode);
-      const store = useThemeStore();
-      expect(store.presentationMode).toBe(mode);
-      store.$dispose();
-    },
-  );
 
   it('falls back to bubble and repairs an invalid persisted presentation value', () => {
     localStorage.setItem('vcp-chat-presentation-mode', 'magazine');
-    const store = useThemeStore();
+    const store = useChatPreferencesStore();
 
     expect(store.presentationMode).toBe('bubble');
     expect(localStorage.getItem('vcp-chat-presentation-mode')).toBe('bubble');
-    expect(normalizeChatPresentationMode(null)).toBe('bubble');
     store.$dispose();
   });
 
-  it('does not write or reflow when setting the current presentation value', () => {
-    const store = useThemeStore();
-    const setItem = vi.spyOn(localStorage, 'setItem');
 
-    const result = store.setPresentationMode('bubble');
-
-    expect(result).toEqual({ ok: true, changed: false, mode: 'bubble' });
-    expect(setItem).not.toHaveBeenCalledWith('vcp-chat-presentation-mode', expect.anything());
-    store.$dispose();
-  });
-
-  it('keeps smooth streaming opt-in and restores the local rendering preference', () => {
-    const initialStore = useThemeStore();
-    expect(initialStore.smoothStreamingEnabled).toBe(false);
-    expect(initialStore.setSmoothStreamingEnabled(true)).toEqual({
-      ok: true,
-      changed: true,
-      enabled: true,
-    });
-    expect(localStorage.getItem('vcp-smooth-streaming-enabled')).toBe('true');
-    initialStore.$dispose();
-
-    setActivePinia(createPinia());
-    const restoredStore = useThemeStore();
-    expect(restoredStore.smoothStreamingEnabled).toBe(true);
-    restoredStore.$dispose();
-  });
 
   it('keeps the previous smooth streaming preference when persistence fails', () => {
-    const store = useThemeStore();
+    const store = useChatPreferencesStore();
     const originalSetItem = localStorage.setItem.bind(localStorage);
     vi.spyOn(localStorage, 'setItem').mockImplementation((key, value) => {
       if (key === 'vcp-smooth-streaming-enabled') throw new Error('quota exceeded');
@@ -82,7 +60,7 @@ describe('theme and chat presentation store contracts', () => {
   });
 
   it('keeps the previous presentation mode when local persistence fails', () => {
-    const store = useThemeStore();
+    const store = useChatPreferencesStore();
     expect(store.setPresentationMode('panel').ok).toBe(true);
 
     const originalSetItem = localStorage.setItem.bind(localStorage);
@@ -100,14 +78,60 @@ describe('theme and chat presentation store contracts', () => {
     store.$dispose();
   });
 
-  it('normalizes legacy CSS theme identities to the compiled TS module key', () => {
-    expect(normalizeThemeModuleKey('themes-bear-holiday.css')).toBe('themes-bear-holiday.ts');
-    expect(normalizeThemeModuleKey('themes熊熊假日.css')).toBe('themes-bear-holiday.ts');
-    expect(normalizeThemeModuleKey('themes-bear-holiday.ts')).toBe('themes-bear-holiday.ts');
-    expect(normalizeThemeModuleKey('../themes-bear-holiday.ts')).toBeNull();
-    expect(normalizeThemeModuleKey('https://example.com/theme.ts')).toBeNull();
-    expect(normalizeThemeModuleKey('missing.ts')).toBeNull();
+
+  it.each([
+    ['vcp-message-haptics-enabled', 'messageHapticsEnabled', 'setMessageHapticsEnabled', false, true],
+    ['vcp-collapse-tools-while-streaming', 'collapseToolsWhileStreaming', 'setCollapseToolsWhileStreaming', true, false],
+  ] as const)('does not publish %s when storage rejects a change', (key, field, setter, next, previous) => {
+    const store = useChatPreferencesStore();
+    const originalSetItem = localStorage.setItem.bind(localStorage);
+    vi.spyOn(localStorage, 'setItem').mockImplementation((storageKey, value) => {
+      if (storageKey === key) throw new Error('quota exceeded');
+      return originalSetItem(storageKey, value);
+    });
+    expect(store[setter](next)).toMatchObject({ ok: false, changed: false, enabled: previous });
+    expect(store[field]).toBe(previous);
+    expect(localStorage.getItem(key)).toBeNull();
+    store.$dispose();
   });
+
+
+  it('uses safe defaults without trying to repair values that could not be read', () => {
+    vi.spyOn(localStorage, 'getItem').mockImplementation(() => { throw new Error('access denied'); });
+    const write = vi.spyOn(localStorage, 'setItem');
+    const store = useChatPreferencesStore();
+    expect(store.presentationMode).toBe('bubble');
+    expect(store.smoothStreamingEnabled).toBe(false);
+    expect(store.messageHapticsEnabled).toBe(true);
+    expect(store.collapseToolsWhileStreaming).toBe(false);
+    expect(write).not.toHaveBeenCalled();
+    store.$dispose();
+  });
+
+  it('initializes the default theme visually without rewriting unreadable preferences', async () => {
+    vi.spyOn(localStorage, 'getItem').mockImplementation(() => { throw new Error('access denied'); });
+    const write = vi.spyOn(localStorage, 'setItem');
+    const store = useThemeStore();
+    await store.initTheme();
+    expect(store.mode).toBe(THEME_PREFERENCE_DEFAULTS.mode);
+    expect(store.currentThemeInfo?.fileName).toBe(THEME_PREFERENCE_DEFAULTS.themeKey);
+    expect(write).not.toHaveBeenCalled();
+    store.$dispose();
+  });
+
+  it('keeps a valid theme visible when repair of an invalid mode cannot be persisted', async () => {
+    localStorage.setItem('vcp-theme-name', 'themes-simple-bw.ts');
+    localStorage.setItem('vcp-theme-mode', 'invalid-mode');
+    vi.spyOn(localStorage, 'setItem').mockImplementation(() => { throw new Error('quota exceeded'); });
+    const store = useThemeStore();
+    await store.initTheme();
+    expect(store.mode).toBe(THEME_PREFERENCE_DEFAULTS.mode);
+    expect(store.currentThemeInfo?.fileName).toBe('themes-simple-bw.ts');
+    expect(localStorage.getItem('vcp-theme-mode')).toBe('invalid-mode');
+    expect(localStorage.getItem('vcp-theme-name')).toBe('themes-simple-bw.ts');
+    store.$dispose();
+  });
+
 
   it('accepts only bundled wallpaper basenames and maps them to WebP', () => {
     expect(resolveThemeWallpaperUrl("'forest_night.webp'")).toBe('/wallpaper/forest_night.webp');
@@ -118,7 +142,7 @@ describe('theme and chat presentation store contracts', () => {
     expect(resolveThemeWallpaperUrl('../secret.webp')).toBeNull();
     expect(resolveThemeWallpaperUrl('https://example.com/remote.webp')).toBeNull();
     expect(resolveThemeWallpaperUrl('javascript:alert.webp')).toBeNull();
-    expect(resolveThemeWallpaperUrl('theme\").webp')).toBeNull();
+    expect(resolveThemeWallpaperUrl('theme").webp')).toBeNull();
   });
 
   it('validates before applying and persists only a canonical TS theme key', async () => {
@@ -131,13 +155,33 @@ describe('theme and chat presentation store contracts', () => {
     expect(store.currentTheme).toBe(initialTheme);
     expect(document.documentElement.style.cssText).toBe(initialCss);
 
-    const result = await store.applyThemeFile('themes-simple-bw.css');
+    const result = await store.applyThemeFile('themes-simple-bw.ts');
     expect(result).toEqual({ ok: true, themeKey: 'themes-simple-bw.ts' });
     expect(store.currentTheme).toBe('themes-simple-bw.ts');
     expect(store.currentThemeInfo?.fileName).toBe('themes-simple-bw.ts');
     expect(localStorage.getItem('vcp-theme-name')).toBe('themes-simple-bw.ts');
     // 默认模式为 light（星渊雪境亮色默认主题）：注入的是 simple-bw 的亮色变量
     expect(document.documentElement.style.getPropertyValue('--primary-bg')).toBe('#f4f6f8');
+    store.$dispose();
+  });
+
+  it('uses owner defaults for invalid imported leaves while preserving present siblings and absent fields', async () => {
+    expect(normalizeThemePreferencePatch({ themeKey: 'themes黑白简约.css', mode: 'dark', ignored: true }))
+      .toEqual({ themeKey: THEME_PREFERENCE_DEFAULTS.themeKey, mode: 'dark' });
+    expect(normalizeThemePreferencePatch({ mode: 'sepia' }))
+      .toEqual({ mode: THEME_PREFERENCE_DEFAULTS.mode });
+    expect(normalizeChatPreferencePatch({ presentationMode: 'magazine', messageHapticsEnabled: false, smoothStreamingEnabled: 'true' }))
+      .toEqual({ presentationMode: 'bubble', messageHapticsEnabled: false, smoothStreamingEnabled: false });
+    expect(normalizeChatPreferencePatch({ ignored: true })).toEqual({});
+    expect(normalizeChatPreferencePatch(null)).toEqual(CHAT_PREFERENCE_DEFAULTS);
+
+    const store = useThemeStore();
+    await store.restorePreferences({ themeKey: 'themes-simple-bw.ts', mode: 'dark' });
+    await store.restorePreferences({ mode: 'invalid' });
+    expect(store.currentTheme).toBe('themes-simple-bw.ts');
+    expect(store.mode).toBe(THEME_PREFERENCE_DEFAULTS.mode);
+    await store.restorePreferences({ themeKey: 'themes-simple-bw.css' });
+    expect(store.currentTheme).toBe(THEME_PREFERENCE_DEFAULTS.themeKey);
     store.$dispose();
   });
 
@@ -162,12 +206,44 @@ describe('theme and chat presentation store contracts', () => {
     store.$dispose();
   });
 
-  it('enumerates only TS theme modules for the picker', async () => {
-    const store = useThemeStore();
-    await store.fetchThemes();
 
-    expect(store.availableThemes).toHaveLength(13);
-    expect(store.availableThemes.every((theme) => theme.fileName.endsWith('.ts'))).toBe(true);
+  it('restores theme and mode together without the interactive mode debounce', async () => {
+    const store = useThemeStore();
+    store.setMode('dark');
+    const result = await store.restorePreferences({ themeKey: 'themes-simple-bw.ts', mode: 'system' });
+    expect(result.ok).toBe(true);
+    expect(store.mode).toBe('system');
+    expect(store.isDarkResolved).toBe(false);
+    expect(localStorage.getItem('vcp-theme-mode')).toBe('system');
+    expect(localStorage.getItem('vcp-theme-name')).toBe('themes-simple-bw.ts');
+    store.$dispose();
+
+    setActivePinia(createPinia());
+    const reopened = useThemeStore();
+    expect(reopened.mode).toBe('system');
+    expect(reopened.currentTheme).toBe('themes-simple-bw.ts');
+    reopened.$dispose();
+  });
+
+  it('restores the previous theme, mode, DOM and storage when the second preference write fails', async () => {
+    const store = useThemeStore();
+    await store.restorePreferences({ themeKey: 'themes-simple-bw.ts', mode: 'dark' });
+    const style = document.documentElement.style;
+    const before = Object.fromEntries(Array.from(style).map(key => [key, style.getPropertyValue(key)]));
+    const originalWrite = localStorage.setItem.bind(localStorage);
+    vi.spyOn(localStorage, 'setItem').mockImplementation((key, value) => {
+      if (key === 'vcp-theme-mode' && value === 'system') throw new Error('mode storage full');
+      originalWrite(key, value);
+    });
+    const result = await store.restorePreferences({ themeKey: 'themes-bear-holiday.ts', mode: 'system' });
+    expect(result).toMatchObject({ ok: false, error: expect.stringContaining('mode storage full') });
+    expect(store.currentTheme).toBe('themes-simple-bw.ts');
+    expect(store.mode).toBe('dark');
+    expect(store.isDarkResolved).toBe(true);
+    expect(document.documentElement.classList.contains('dark')).toBe(true);
+    expect(Object.fromEntries(Array.from(style).map(key => [key, style.getPropertyValue(key)]))).toEqual(before);
+    expect(localStorage.getItem('vcp-theme-name')).toBe('themes-simple-bw.ts');
+    expect(localStorage.getItem('vcp-theme-mode')).toBe('dark');
     store.$dispose();
   });
 });

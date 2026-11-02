@@ -1,51 +1,12 @@
 import { defineStore, acceptHMRUpdate } from 'pinia';
-import { onScopeDispose, ref, watch } from 'vue';
+import { nextTick, onScopeDispose, ref, watch } from 'vue';
+import { readLocalPreference, writeLocalPreference } from '../preferences/localPreference';
 
 export type ThemeMode = 'light' | 'dark' | 'system';
 
-export const CHAT_PRESENTATION_MODES = ['bubble', 'panel', 'immersive'] as const;
-export type ChatPresentationMode = (typeof CHAT_PRESENTATION_MODES)[number];
-
-export interface ChatPresentationOption {
-  value: ChatPresentationMode;
-  label: string;
-  title: string;
-  description: string;
-}
-
-export const CHAT_PRESENTATION_OPTIONS: readonly ChatPresentationOption[] = [
-  {
-    value: 'bubble',
-    label: '气泡',
-    title: '气泡模式',
-    description: '保留左右气泡、头像与紧凑内容宽度。',
-  },
-  {
-    value: 'panel',
-    label: '统一',
-    title: '统一模式',
-    description: '消息共用连续全宽表面，以细分隔线区分。',
-  },
-  {
-    value: 'immersive',
-    label: '刊物',
-    title: '刊物模式',
-    description: '隐藏头像，使用居中的长文阅读宽度。',
-  },
-] as const;
-
-export interface PresentationChangeResult {
-  ok: boolean;
-  changed: boolean;
-  mode: ChatPresentationMode;
-  error?: string;
-}
-
-export interface SmoothStreamingChangeResult {
-  ok: boolean;
-  changed: boolean;
-  enabled: boolean;
-  error?: string;
+export interface ThemePreferences {
+  themeKey: string;
+  mode: ThemeMode;
 }
 
 export interface ThemeApplyResult {
@@ -65,23 +26,10 @@ export interface ThemeInfo {
 
 const DEFAULT_THEME = 'themes-star-abyss.ts';
 const THEME_NAME_STORAGE_KEY = 'vcp-theme-name';
-const PRESENTATION_STORAGE_KEY = 'vcp-chat-presentation-mode';
-const SMOOTH_STREAMING_STORAGE_KEY = 'vcp-smooth-streaming-enabled';
 
-const LEGACY_THEME_MAP: Record<string, string> = {
-  'themes冰火魔歌.css': 'themes-ice-fire.css',
-  'themes瓷与锦.css': 'themes-porcelain-brocade.css',
-  'themes绯红天穹.css': 'themes-crimson-sky.css',
-  'themes黑白简约.css': 'themes-simple-bw.css',
-  'themes静谧森岭.css': 'themes-quiet-forest.css',
-  'themes卡提西亚.css': 'themes-cartethyia.css',
-  'themes霓虹咖啡.css': 'themes-neon-coffee.css',
-  'themes童趣梦境.css': 'themes-childhood-dream.css',
-  'themes星咏与狼嗥.css': 'themes-star-wolf.css',
-  'themes星渊雪境.css': 'themes-star-abyss.css',
-  'themes熊熊假日.css': 'themes-bear-holiday.css',
-  'themes雪境晨昏.css': 'themes-snow-morning.css',
-  'themes夜樱猫语.css': 'themes-night-sakura-cat.css'
+export const THEME_PREFERENCE_DEFAULTS: Readonly<ThemePreferences> = {
+  themeKey: DEFAULT_THEME,
+  mode: 'light',
 };
 
 interface ThemeModule {
@@ -99,26 +47,29 @@ for (const [path, mod] of Object.entries(themeModules)) {
   if (key) themeModulesByKey.set(key, mod);
 }
 
-export const normalizeChatPresentationMode = (value: unknown): ChatPresentationMode => {
-  return CHAT_PRESENTATION_MODES.includes(value as ChatPresentationMode)
-    ? (value as ChatPresentationMode)
-    : 'bubble';
+export const normalizeThemeModuleKey = (value: unknown): string | null => {
+  return typeof value === 'string' && themeModulesByKey.has(value) ? value : null;
 };
 
-export const normalizeThemeModuleKey = (value: unknown): string | null => {
-  if (typeof value !== 'string') return null;
-  const input = value.trim();
-  if (!input || input.includes('/') || input.includes('\\') || input.includes('\0')) {
-    return null;
+export const normalizeThemeMode = (value: unknown): ThemeMode =>
+  value === 'light' || value === 'dark' || value === 'system'
+    ? value
+    : THEME_PREFERENCE_DEFAULTS.mode;
+
+/** 已提供的坏值回退；缺失字段不进入补丁，避免覆盖当前偏好。 */
+export const normalizeThemePreferencePatch = (value: unknown): Partial<ThemePreferences> => {
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) {
+    return { ...THEME_PREFERENCE_DEFAULTS };
   }
-
-  const legacyMapped = LEGACY_THEME_MAP[input] || input;
-  const key = legacyMapped.endsWith('.css')
-    ? `${legacyMapped.slice(0, -4)}.ts`
-    : legacyMapped;
-
-  if (!key.endsWith('.ts') || !themeModulesByKey.has(key)) return null;
-  return key;
+  const source = value as Record<string, unknown>;
+  const patch: Partial<ThemePreferences> = {};
+  if (Object.prototype.hasOwnProperty.call(source, 'themeKey')) {
+    patch.themeKey = normalizeThemeModuleKey(source.themeKey) ?? THEME_PREFERENCE_DEFAULTS.themeKey;
+  }
+  if (Object.prototype.hasOwnProperty.call(source, 'mode')) {
+    patch.mode = normalizeThemeMode(source.mode);
+  }
+  return patch;
 };
 
 export const resolveThemeWallpaperUrl = (value: unknown): string | null => {
@@ -144,6 +95,8 @@ export const resolveThemeWallpaperUrl = (value: unknown): string | null => {
     candidate.includes(':') ||
     candidate.includes('?') ||
     candidate.includes('#') ||
+    // Bundled wallpaper names cannot contain ASCII control characters.
+    // eslint-disable-next-line no-control-regex
     /[\u0000-\u001f\u007f]/.test(candidate)
   ) {
     return null;
@@ -177,42 +130,16 @@ export const useThemeStore = defineStore('theme', () => {
     }
   };
 
-  const storedMode = readStoredValue('vcp-theme-mode');
-  // 默认主题「星渊雪境」以亮色示人：无本地偏好时默认 light；
-  // 已存储 dark / system 偏好的老用户完全不受影响。
-  const initialMode: ThemeMode = storedMode === 'dark' || storedMode === 'system'
-    ? storedMode
-    : 'light';
+  const storedMode = readLocalPreference('vcp-theme-mode');
+  if (!storedMode.ok) console.warn('[themeStore] Failed to read mode:', storedMode.error);
+  // 缺失或异常模式使用主题所属领域的默认值。
+  const initialMode = normalizeThemeMode(storedMode.ok ? storedMode.raw : null);
   const mode = ref<ThemeMode>(initialMode);
   // 初值与默认模式（light）保持一致；store 创建时 mode 的 immediate watch
   // 会同步执行 applyTheme 将其纠正为真实值。
   const isDarkResolved = ref(false);
   const lastModeSwitchAt = ref(0);
-  const MODE_SWITCH_DEBOUNCE_MS = 420;
-
-  const storedPresentationMode = readStoredValue(PRESENTATION_STORAGE_KEY);
-  const initialPresentationMode = normalizeChatPresentationMode(storedPresentationMode);
-  if (storedPresentationMode !== null && storedPresentationMode !== initialPresentationMode) {
-    try {
-      localStorage.setItem(PRESENTATION_STORAGE_KEY, initialPresentationMode);
-    } catch (error) {
-      console.warn('[themeStore] Failed to repair presentation preference:', error);
-    }
-  }
-  const presentationMode = ref<ChatPresentationMode>(initialPresentationMode);
-  const storedSmoothStreaming = readStoredValue(SMOOTH_STREAMING_STORAGE_KEY);
-  const smoothStreamingEnabled = ref(storedSmoothStreaming === 'true');
-  if (
-    storedSmoothStreaming !== null
-    && storedSmoothStreaming !== 'true'
-    && storedSmoothStreaming !== 'false'
-  ) {
-    try {
-      localStorage.setItem(SMOOTH_STREAMING_STORAGE_KEY, 'false');
-    } catch (error) {
-      console.warn('[themeStore] Failed to repair smooth streaming preference:', error);
-    }
-  }
+  const MODE_SWITCH_DEBOUNCE_MS = 260;
 
   const initialTheme = normalizeThemeModuleKey(readStoredValue(THEME_NAME_STORAGE_KEY)) || DEFAULT_THEME;
   const currentTheme = ref(initialTheme);
@@ -223,13 +150,154 @@ export const useThemeStore = defineStore('theme', () => {
   const lastAppliedVarKeys = ref<string[]>([]);
   let currentThemeModule: ThemeModule | null = null;
   let isInitializing = true;
+  let restoringMode = false;
 
-  const triggerThemeSwitchTransition = () => {
-    if (isInitializing) return;
-    document.documentElement.classList.add('theme-switching');
-    setTimeout(() => {
-      document.documentElement.classList.remove('theme-switching');
-    }, 400);
+  interface ViewTransitionLike {
+    ready: Promise<void>;
+    updateCallbackDone: Promise<void>;
+    finished: Promise<void>;
+    skipTransition: () => void;
+  }
+  type DocumentWithViewTransition = Document & {
+    startViewTransition?: (updateCallback: () => Promise<void> | void) => ViewTransitionLike;
+  };
+
+  let themeSwitchOwner: symbol | null = null;
+  let pendingTransitionCommit: (() => void) | null = null;
+  let activeViewTransition: ViewTransitionLike | null = null;
+
+  const beginThemeSwitch = (): symbol => {
+    const owner = Symbol('theme-switch');
+    themeSwitchOwner = owner;
+    if (!isInitializing) document.documentElement.classList.add('theme-switching');
+    return owner;
+  };
+
+  const finishThemeSwitch = (owner: symbol | null) => {
+    if (owner === null || themeSwitchOwner !== owner) return;
+    themeSwitchOwner = null;
+    document.documentElement.classList.remove('theme-switching');
+  };
+
+  const settleThemeWithoutSnapshot = async (owner: symbol | null) => {
+    try {
+      await nextTick();
+      if (owner !== null && themeSwitchOwner === owner) {
+        // 先让禁用局部过渡的最终样式落地，再撤掉标记；隐藏页面也不依赖 rAF。
+        document.documentElement.getBoundingClientRect();
+      }
+    } finally {
+      finishThemeSwitch(owner);
+    }
+  };
+
+  const canUseViewTransition = (): boolean => {
+    if (isInitializing || typeof document === 'undefined' || typeof window === 'undefined') {
+      return false;
+    }
+    const doc = document as DocumentWithViewTransition;
+    if (typeof doc.startViewTransition !== 'function') {
+      return false;
+    }
+    if (document.visibilityState === 'hidden') {
+      return false;
+    }
+    if (window.matchMedia?.('(prefers-reduced-motion: reduce)').matches) {
+      return false;
+    }
+    return true;
+  };
+
+  const flushPendingViewTransition = () => {
+    if (pendingTransitionCommit) {
+      const commit = pendingTransitionCommit;
+      pendingTransitionCommit = null;
+      commit();
+    }
+    if (activeViewTransition) {
+      try {
+        activeViewTransition.skipTransition();
+      } catch {
+        // Ignore if transition already finished
+      }
+      activeViewTransition = null;
+    }
+  };
+
+  const runWithThemeViewTransition = <T>(commit: () => T, animate = true): Promise<T> => {
+    flushPendingViewTransition();
+
+    let owner: symbol | null = null;
+    let outcome: { value: T } | { error: unknown } | undefined;
+    const executeCommit = (): T => {
+      if (!outcome) {
+        pendingTransitionCommit = null;
+        owner = beginThemeSwitch();
+        try {
+          outcome = { value: commit() };
+        } catch (error) {
+          outcome = { error };
+        }
+      }
+      if ('error' in outcome) throw outcome.error;
+      return outcome.value;
+    };
+
+    const commitWithoutSnapshot = async (): Promise<T> => {
+      try {
+        return executeCommit();
+      } finally {
+        await settleThemeWithoutSnapshot(owner);
+      }
+    };
+
+    if (!animate || !canUseViewTransition()) return commitWithoutSnapshot();
+
+    const doc = document as DocumentWithViewTransition;
+    return new Promise<T>((resolve, reject) => {
+      pendingTransitionCommit = () => {
+        try {
+          resolve(executeCommit());
+        } catch (err) {
+          reject(err);
+        }
+      };
+
+      try {
+        const transition = doc.startViewTransition!(async () => {
+          executeCommit();
+          await nextTick();
+        });
+        activeViewTransition = transition;
+        // 主动跳过时 ready 会拒绝，清理仍统一由 finished 承接。
+        void transition.ready.catch(() => {});
+
+        transition.updateCallbackDone.then(
+          () => resolve(executeCommit()),
+          (err) => {
+            if (!outcome) {
+              try {
+                resolve(executeCommit());
+              } catch (commitErr) {
+                reject(commitErr);
+              }
+            } else {
+              reject(err);
+            }
+          },
+        );
+
+        transition.finished.catch(() => {}).finally(() => {
+          if (activeViewTransition === transition) {
+            activeViewTransition = null;
+          }
+          finishThemeSwitch(owner);
+        });
+      } catch {
+        pendingTransitionCommit = null;
+        void commitWithoutSnapshot().then(resolve, reject);
+      }
+    });
   };
 
 
@@ -278,7 +346,9 @@ export const useThemeStore = defineStore('theme', () => {
     themeThumbnails.value = thumbs;
   };
 
-  const applyThemeFile = async (fileName: string): Promise<ThemeApplyResult> => {
+  const applyThemeSelection = async (fileName: string, restoredMode?: ThemeMode, persist = true): Promise<ThemeApplyResult> => {
+    flushPendingViewTransition();
+
     const resolved = findThemeModule(fileName);
     if (!resolved) {
       const error = `Theme module not found: ${String(fileName)}`;
@@ -299,9 +369,13 @@ export const useThemeStore = defineStore('theme', () => {
       return { ok: false, themeKey: null, error };
     }
 
-    let previousStoredTheme: string | null;
+    let previousStoredTheme: string | null = null;
+    let previousStoredMode: string | null = null;
     try {
-      previousStoredTheme = localStorage.getItem(THEME_NAME_STORAGE_KEY);
+      if (persist) {
+        previousStoredTheme = localStorage.getItem(THEME_NAME_STORAGE_KEY);
+        if (restoredMode !== undefined) previousStoredMode = localStorage.getItem('vcp-theme-mode');
+      }
     } catch (error) {
       return {
         ok: false,
@@ -310,101 +384,153 @@ export const useThemeStore = defineStore('theme', () => {
       };
     }
 
-    const previousTheme = currentTheme.value;
-    const previousThemeInfo = currentThemeInfo.value;
-    const previousThemeModule = currentThemeModule;
-    const previousVarKeys = [...lastAppliedVarKeys.value];
-    const nextVars = isDarkResolved.value ? mod.variables.dark : mod.variables.light;
-    const affectedVarKeys = Array.from(new Set([...previousVarKeys, ...Object.keys(nextVars)]));
-    const previousRootVariables = affectedVarKeys.map((property) => ({
-      property,
-      value: document.documentElement.style.getPropertyValue(property),
-      priority: document.documentElement.style.getPropertyPriority(property),
-    }));
-    const existingStyleTag = document.getElementById('vcp-custom-theme');
-    const previousStyleText = existingStyleTag?.textContent ?? '';
-    let createdStyleTag = false;
-
-    try {
-      triggerThemeSwitchTransition();
-      console.log('[themeStore] Loaded module for', themeKey, mod.meta.name);
-
-      injectVariables(nextVars);
-
-      currentThemeModule = mod;
-      currentThemeInfo.value = {
-        fileName: themeKey,
-        name: mod.meta.name,
-        variables: mod.variables,
-      };
-      currentTheme.value = themeKey;
-
-      // Inject extra CSS rules (non-variable styles like .tool-bubble)
-      let styleTag = document.getElementById('vcp-custom-theme');
-      if (!styleTag) {
-        styleTag = document.createElement('style');
-        styleTag.id = 'vcp-custom-theme';
-        document.head.appendChild(styleTag);
-        createdStyleTag = true;
-      }
-      styleTag.textContent = mod.extraCss || '';
-
-      // Persist only after the complete visual state has been prepared. A storage
-      // failure rolls the DOM and refs back to the previously applied theme.
-      localStorage.setItem(THEME_NAME_STORAGE_KEY, themeKey);
-      return { ok: true, themeKey };
-    } catch (error) {
-      console.error('Failed to apply theme file:', error);
-
-      for (const snapshot of previousRootVariables) {
-        if (snapshot.value) {
-          document.documentElement.style.setProperty(
-            snapshot.property,
-            snapshot.value,
-            snapshot.priority,
-          );
-        } else {
-          document.documentElement.style.removeProperty(snapshot.property);
-        }
-      }
-      lastAppliedVarKeys.value = previousVarKeys;
-      currentTheme.value = previousTheme;
-      currentThemeInfo.value = previousThemeInfo;
-      currentThemeModule = previousThemeModule;
-
-      const styleTag = document.getElementById('vcp-custom-theme');
-      if (createdStyleTag) {
-        styleTag?.remove();
-      } else if (styleTag) {
-        styleTag.textContent = previousStyleText;
-      }
+    const commitSelection = (): ThemeApplyResult => {
+      const previousTheme = currentTheme.value;
+      const previousThemeInfo = currentThemeInfo.value;
+      const previousThemeModule = currentThemeModule;
+      const previousMode = mode.value;
+      const previousDark = isDarkResolved.value;
+      const previousDarkClass = document.documentElement.classList.contains('dark');
+      const previousLightClass = document.body.classList.contains('light-theme');
+      const previousVarKeys = [...lastAppliedVarKeys.value];
+      const nextDark = restoredMode === undefined ? previousDark : restoredMode === 'dark'
+        || (restoredMode === 'system' && window.matchMedia('(prefers-color-scheme: dark)').matches);
+      const nextVars = nextDark ? mod.variables.dark : mod.variables.light;
+      const affectedVarKeys = Array.from(new Set([...previousVarKeys, ...Object.keys(nextVars)]));
+      const previousRootVariables = affectedVarKeys.map((property) => ({
+        property,
+        value: document.documentElement.style.getPropertyValue(property),
+        priority: document.documentElement.style.getPropertyPriority(property),
+      }));
+      const existingStyleTag = document.getElementById('vcp-custom-theme');
+      const previousStyleText = existingStyleTag?.textContent ?? '';
+      let createdStyleTag = false;
+      let themePersisted = false;
+      let modePersisted = false;
 
       try {
-        if (previousStoredTheme === null) {
-          localStorage.removeItem(THEME_NAME_STORAGE_KEY);
-        } else {
-          localStorage.setItem(THEME_NAME_STORAGE_KEY, previousStoredTheme);
-        }
-      } catch (rollbackError) {
-        console.error('[themeStore] Failed to restore persisted theme:', rollbackError);
-      }
+        console.log('[themeStore] Loaded module for', themeKey, mod.meta.name);
 
-      return {
-        ok: false,
-        themeKey: null,
-        error: `主题应用失败：${errorMessage(error)}`,
-      };
-    }
+        injectVariables(nextVars);
+        if (restoredMode !== undefined) {
+          isDarkResolved.value = nextDark;
+          document.documentElement.classList.toggle('dark', nextDark);
+          document.body.classList.toggle('light-theme', !nextDark);
+        }
+
+        currentThemeModule = mod;
+        currentThemeInfo.value = {
+          fileName: themeKey,
+          name: mod.meta.name,
+          variables: mod.variables,
+        };
+        currentTheme.value = themeKey;
+
+        // Inject extra CSS rules (non-variable styles like .tool-bubble)
+        let styleTag = document.getElementById('vcp-custom-theme');
+        if (!styleTag) {
+          styleTag = document.createElement('style');
+          styleTag.id = 'vcp-custom-theme';
+          document.head.appendChild(styleTag);
+          createdStyleTag = true;
+        }
+        styleTag.textContent = mod.extraCss || '';
+
+        // Persist only after the complete visual state has been prepared. A storage
+        // failure rolls the DOM and refs back to the previously applied theme.
+        if (persist) {
+          localStorage.setItem(THEME_NAME_STORAGE_KEY, themeKey);
+          themePersisted = true;
+        }
+        if (restoredMode !== undefined) {
+          if (persist) {
+            localStorage.setItem('vcp-theme-mode', restoredMode);
+            modePersisted = true;
+          }
+          restoringMode = true;
+          try { mode.value = restoredMode; } finally { restoringMode = false; }
+        }
+        return { ok: true, themeKey };
+      } catch (error) {
+        console.error('Failed to apply theme file:', error);
+
+        for (const snapshot of previousRootVariables) {
+          if (snapshot.value) {
+            document.documentElement.style.setProperty(
+              snapshot.property,
+              snapshot.value,
+              snapshot.priority,
+            );
+          } else {
+            document.documentElement.style.removeProperty(snapshot.property);
+          }
+        }
+        lastAppliedVarKeys.value = previousVarKeys;
+        currentTheme.value = previousTheme;
+        currentThemeInfo.value = previousThemeInfo;
+        currentThemeModule = previousThemeModule;
+        isDarkResolved.value = previousDark;
+        document.documentElement.classList.toggle('dark', previousDarkClass);
+        document.body.classList.toggle('light-theme', previousLightClass);
+        restoringMode = true;
+        try { mode.value = previousMode; } finally { restoringMode = false; }
+
+        const styleTag = document.getElementById('vcp-custom-theme');
+        if (createdStyleTag) {
+          styleTag?.remove();
+        } else if (styleTag) {
+          styleTag.textContent = previousStyleText;
+        }
+
+        let rollbackFailure = '';
+        try {
+          if (themePersisted) {
+            if (previousStoredTheme === null) localStorage.removeItem(THEME_NAME_STORAGE_KEY);
+            else localStorage.setItem(THEME_NAME_STORAGE_KEY, previousStoredTheme);
+          }
+          if (modePersisted) {
+            if (previousStoredMode === null) localStorage.removeItem('vcp-theme-mode');
+            else localStorage.setItem('vcp-theme-mode', previousStoredMode);
+          }
+        } catch (rollbackError) {
+          console.error('[themeStore] Failed to restore persisted theme:', rollbackError);
+          rollbackFailure = `；恢复原主题存储失败：${errorMessage(rollbackError)}`;
+        }
+
+        return {
+          ok: false,
+          themeKey: null,
+          error: `主题应用失败：${errorMessage(error)}${rollbackFailure}`,
+        };
+      }
+    };
+
+    return runWithThemeViewTransition(commitSelection, restoredMode === undefined);
+  };
+
+  const applyThemeFile = (fileName: string) => applyThemeSelection(fileName);
+
+  // Backup restore is a persisted operation, independent of tap debouncing.
+  const restorePreferences = (candidate: unknown): Promise<ThemeApplyResult> => {
+    const preferences = normalizeThemePreferencePatch(candidate);
+    if (!Object.keys(preferences).length) return Promise.resolve({ ok: true, themeKey: currentTheme.value });
+    return applyThemeSelection(preferences.themeKey ?? currentTheme.value, preferences.mode);
   };
 
   const initTheme = async () => {
-    const savedTheme = normalizeThemeModuleKey(readStoredValue(THEME_NAME_STORAGE_KEY)) || DEFAULT_THEME;
+    const stored = readLocalPreference(THEME_NAME_STORAGE_KEY);
+    if (!stored.ok) console.warn('[themeStore] Failed to read theme:', stored.error);
+    const savedTheme = normalizeThemeModuleKey(stored.ok ? stored.raw : null) ?? DEFAULT_THEME;
 
     try {
       // 1. 优先只加载当前主题，确保背景和基础样式瞬间呈现
-      const result = await applyThemeFile(savedTheme);
+      const result = await applyThemeSelection(savedTheme, undefined, false);
+      if (result.ok && stored.ok && stored.raw !== null && stored.raw !== savedTheme) {
+        const repair = writeLocalPreference(THEME_NAME_STORAGE_KEY, savedTheme);
+        if (!repair.ok) console.warn('[themeStore] Failed to repair theme:', repair.error);
+      }
       if (!result.ok && savedTheme !== DEFAULT_THEME) {
-        await applyThemeFile(DEFAULT_THEME);
+        await applyThemeSelection(DEFAULT_THEME, undefined, false);
       }
 
       // 2. 优雅地在浏览器空闲时再扫描全量主题元数据
@@ -418,7 +544,6 @@ export const useThemeStore = defineStore('theme', () => {
   };
 
   const applyTheme = (newMode: ThemeMode) => {
-    triggerThemeSwitchTransition();
     const isDark =
       newMode === 'dark' ||
       (newMode === 'system' && window.matchMedia('(prefers-color-scheme: dark)').matches);
@@ -426,7 +551,10 @@ export const useThemeStore = defineStore('theme', () => {
     isDarkResolved.value = isDark;
     document.documentElement.classList.toggle('dark', isDark);
     document.body.classList.toggle('light-theme', !isDark);
-    localStorage.setItem('vcp-theme-mode', newMode);
+    if (!isInitializing || (storedMode.ok && storedMode.raw !== null && storedMode.raw !== newMode)) {
+      const saved = writeLocalPreference('vcp-theme-mode', newMode);
+      if (!saved.ok) console.warn('[themeStore] Failed to save mode:', saved.error);
+    }
 
     // Re-inject variables for the new mode if a theme is already loaded
     if (currentThemeModule) {
@@ -436,14 +564,16 @@ export const useThemeStore = defineStore('theme', () => {
   };
 
   watch(mode, (newMode) => {
-    applyTheme(newMode);
-  }, { immediate: true });
+    if (!restoringMode) applyTheme(newMode);
+  }, { immediate: true, flush: 'sync' });
 
   // Listen for system theme changes
   const mediaQuery = window.matchMedia('(prefers-color-scheme: dark)');
   const handleMediaChange = () => {
     if (mode.value === 'system') {
-      applyTheme('system');
+      void runWithThemeViewTransition(() => {
+        applyTheme('system');
+      });
     }
   };
   mediaQuery.addEventListener('change', handleMediaChange);
@@ -459,50 +589,9 @@ export const useThemeStore = defineStore('theme', () => {
     }
 
     lastModeSwitchAt.value = now;
-    mode.value = newMode;
-  };
-
-  const setPresentationMode = (candidate: unknown): PresentationChangeResult => {
-    const nextMode = normalizeChatPresentationMode(candidate);
-    if (presentationMode.value === nextMode) {
-      return { ok: true, changed: false, mode: nextMode };
-    }
-
-    try {
-      localStorage.setItem(PRESENTATION_STORAGE_KEY, nextMode);
-      presentationMode.value = nextMode;
-      return { ok: true, changed: true, mode: nextMode };
-    } catch (error) {
-      console.error('[themeStore] Failed to persist presentation mode:', error);
-      return {
-        ok: false,
-        changed: false,
-        mode: presentationMode.value,
-        error: `消息呈现设置保存失败：${errorMessage(error)}`,
-      };
-    }
-  };
-
-  const setSmoothStreamingEnabled = (
-    enabled: boolean,
-  ): SmoothStreamingChangeResult => {
-    if (smoothStreamingEnabled.value === enabled) {
-      return { ok: true, changed: false, enabled };
-    }
-
-    try {
-      localStorage.setItem(SMOOTH_STREAMING_STORAGE_KEY, String(enabled));
-      smoothStreamingEnabled.value = enabled;
-      return { ok: true, changed: true, enabled };
-    } catch (error) {
-      console.error('[themeStore] Failed to persist smooth streaming preference:', error);
-      return {
-        ok: false,
-        changed: false,
-        enabled: smoothStreamingEnabled.value,
-        error: `平滑流式设置保存失败：${errorMessage(error)}`,
-      };
-    }
+    void runWithThemeViewTransition(() => {
+      mode.value = newMode;
+    });
   };
 
   const toggleTheme = () => {
@@ -513,6 +602,8 @@ export const useThemeStore = defineStore('theme', () => {
   };
 
   onScopeDispose(() => {
+    flushPendingViewTransition();
+    finishThemeSwitch(themeSwitchOwner);
     mediaQuery.removeEventListener('change', handleMediaChange);
   });
 
@@ -525,7 +616,9 @@ export const useThemeStore = defineStore('theme', () => {
       setTimeout(() => {
         console.log('[themeStore] HMR reload triggered, re-applying theme:', currentTheme.value);
         if (currentTheme.value) {
-          void applyThemeFile(currentTheme.value);
+          void applyThemeFile(currentTheme.value).finally(() => {
+            isInitializing = false;
+          });
         }
       }, 100);
     }
@@ -535,19 +628,16 @@ export const useThemeStore = defineStore('theme', () => {
   return {
     mode,
     isDarkResolved,
-    presentationMode,
-    smoothStreamingEnabled,
     currentTheme,
     currentThemeInfo,
     availableThemes,
     themeThumbnails,
     fetchThemes,
     applyThemeFile,
+    restorePreferences,
     initTheme,
     toggleTheme,
     setMode,
-    setPresentationMode,
-    setSmoothStreamingEnabled,
   };
 });
 

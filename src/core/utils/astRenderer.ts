@@ -2,6 +2,9 @@ import { convertFileSrc } from "@tauri-apps/api/core";
 import type { MarkdownNode, InlineNode } from "../types/chat";
 import { currentLocalMediaTargets, rewriteLocalMediaUrl } from "./localMediaRewrite";
 
+// AST 占位、历史 raw HTML 与 marked 代码块共享同一图表身份。
+export const MERMAID_CONTENT_SELECTOR = '[data-content-kind="mermaid"], .mermaid-placeholder, .mermaid, code.language-mermaid';
+
 const ACTIVE_URL_ATTRIBUTES = new Set([
   "action",
   "archive",
@@ -35,6 +38,8 @@ const HOST_CAPABILITY_IN_HANDLER = /(?:__TAURI(?:_INTERNALS__)?|\binvoke\s*\(|\b
 function compactScheme(value: string): string {
   return value
     .trim()
+    // URL schemes may hide active prefixes with control characters or whitespace.
+    // eslint-disable-next-line no-control-regex
     .replace(/[\u0000-\u0020\u007f-\u009f\u00a0\u1680\u180e\u2000-\u200a\u2028\u2029\u202f\u205f\u3000]/g, "")
     .toLowerCase();
 }
@@ -208,6 +213,10 @@ export function withCodeBlockClass(html: string): string {
   return html.replace(/<pre>/g, '<pre class="vcp-code-block vcp-scrollable">');
 }
 
+interface AstRenderContext {
+  requiresHtmlGuard: boolean;
+}
+
 /**
  * 将 Rust 预渲染的 AST 节点树转换为 HTML 字符串
  */
@@ -224,7 +233,11 @@ export function renderMarkdownNodes(
     if (cached !== undefined) return cached;
   }
 
-  const html = filterTrustedRichHtml(nodes.map(node => renderNode(node, messageId)).join(''));
+  const context: AstRenderContext = { requiresHtmlGuard: false };
+  const generated = nodes.map(node => renderNode(node, context)).join('');
+  // 原始 HTML 的开、闭标签可能跨越多个 AST 节点，必须在完整上下文中审核。
+  // 纯生成节点已逐字段转义并过滤 URL，无需再构造一次隐藏 DOM。
+  const html = context.requiresHtmlGuard ? filterTrustedRichHtml(generated) : generated;
 
   // 无 hash 时不缓存，避免不同内容但节点数量相同的 legacy AST 串用 HTML
   if (!key) return html;
@@ -237,21 +250,26 @@ export function renderMarkdownNodes(
   return html;
 }
 
-function renderNode(node: MarkdownNode, messageId: string): string {
+function renderNode(node: MarkdownNode, context: AstRenderContext): string {
   switch (node.type) {
     case 'paragraph':
-      return `<p>${node.children.map(renderInline).join('')}</p>`;
+      return `<p>${node.children.map(child => renderInline(child, context)).join('')}</p>`;
     
-    case 'heading':
+    case 'heading': {
       const level = node.level || 1;
-      return `<h${level}>${node.children.map(renderInline).join('')}</h${level}>`;
+      // 非生产标题级别保留原审核路径，不在展示层另设纠错规则。
+      if (!Number.isInteger(level) || level < 1 || level > 6) context.requiresHtmlGuard = true;
+      return `<h${level}>${node.children.map(child => renderInline(child, context)).join('')}</h${level}>`;
+    }
     
     case 'code_block': {
       if (node.lang === 'mermaid') {
-        return `<div class="mermaid-placeholder">${escapeHtml(node.code)}</div>`;
+        const source = escapeHtml(node.code);
+        return `<div class="mermaid-placeholder" data-content-kind="mermaid" data-mermaid-source="${source}">${source}</div>`;
       }
       let html = node.highlighted_html;
       if (html) {
+        context.requiresHtmlGuard = true;
         // 兼容旧 AST：如果 highlighted_html 是 <pre><code> 包裹内层 <pre> 的嵌套结构，提取单层
         const nestedPreMatch = html.match(/<pre[^>]*>\s*<code>([\s\S]*?)<\/code>\s*<\/pre>/i);
         if (nestedPreMatch && nestedPreMatch[1].trim().startsWith('<pre')) {
@@ -266,22 +284,24 @@ function renderNode(node: MarkdownNode, messageId: string): string {
     }
     
     case 'blockquote':
-      return `<blockquote>${node.children.map((n) => renderNode(n, messageId)).join('')}</blockquote>`;
+      return `<blockquote>${node.children.map((n) => renderNode(n, context)).join('')}</blockquote>`;
     
-    case 'list':
+    case 'list': {
       const tag = node.ordered ? 'ol' : 'ul';
       const itemsHtml = node.items.map(itemNodes =>
-        `<li>${itemNodes.map(n => renderNode(n, messageId)).join('')}</li>`
+        `<li>${itemNodes.map(n => renderNode(n, context)).join('')}</li>`
       ).join('');
       return `<${tag}>${itemsHtml}</${tag}>`;
+    }
     
-    case 'table':
-      const headerHtml = `<tr>${node.header.map(cell => `<th>${cell.map(renderInline).join('')}</th>`).join('')}</tr>`;
+    case 'table': {
+      const headerHtml = `<tr>${node.header.map(cell => `<th>${cell.map(child => renderInline(child, context)).join('')}</th>`).join('')}</tr>`;
       const bodyHtml = node.rows.map(row =>
-        `<tr>${row.map(cell => `<td>${cell.map(renderInline).join('')}</td>`).join('')}</tr>`
+        `<tr>${row.map(cell => `<td>${cell.map(child => renderInline(child, context)).join('')}</td>`).join('')}</tr>`
       ).join('');
-      const wrapper = node.wrapper_class || 'vcp-table-wrapper';
+      const wrapper = escapeHtml(node.wrapper_class || 'vcp-table-wrapper');
       return `<div class="${wrapper}"><table><thead>${headerHtml}</thead><tbody>${bodyHtml}</tbody></table></div>`;
+    }
     
     case 'thematic_break':
       return '<hr/>';
@@ -289,6 +309,7 @@ function renderNode(node: MarkdownNode, messageId: string): string {
 
     
     case 'raw_html':
+      context.requiresHtmlGuard = true;
       return node.content;
     
     default:
@@ -296,19 +317,19 @@ function renderNode(node: MarkdownNode, messageId: string): string {
   }
 }
 
-function renderInline(node: InlineNode): string {
+function renderInline(node: InlineNode, context: AstRenderContext): string {
   switch (node.type) {
     case 'text':
       return escapeHtml(node.value);
     
     case 'strong':
-      return `<strong>${node.children.map(renderInline).join('')}</strong>`;
+      return `<strong>${node.children.map(child => renderInline(child, context)).join('')}</strong>`;
     
     case 'emphasis':
-      return `<em>${node.children.map(renderInline).join('')}</em>`;
+      return `<em>${node.children.map(child => renderInline(child, context)).join('')}</em>`;
     
     case 'strikethrough':
-      return `<del>${node.children.map(renderInline).join('')}</del>`;
+      return `<del>${node.children.map(child => renderInline(child, context)).join('')}</del>`;
     
     case 'code':
       return `<code>${escapeHtml(node.value)}</code>`;
@@ -319,7 +340,7 @@ function renderInline(node: InlineNode): string {
         : node.href;
       const href = filterTrustedRichHtmlUrl(rawHref, 'a', 'href');
       const hrefAttribute = href === null ? '' : ` href="${escapeHtml(href)}"`;
-      return `<a${hrefAttribute} title="${escapeHtml(node.title || '')}" target="_blank" rel="noopener noreferrer">${node.children.map(renderInline).join('')}</a>`;
+      return `<a${hrefAttribute} title="${escapeHtml(node.title || '')}" target="_blank" rel="noopener noreferrer">${node.children.map(child => renderInline(child, context)).join('')}</a>`;
     }
     
     case 'image': {
@@ -342,15 +363,16 @@ function renderInline(node: InlineNode): string {
     }
     
     case 'vcp_custom': {
-      const cls = `vcp-custom-${node.kind}`;
+      const cls = `vcp-custom-${escapeHtml(node.kind)}`;
       if (node.children && node.children.length > 0) {
-        const innerContent = (node.children || []).map(renderInline).join('');
+        const innerContent = node.children.map(child => renderInline(child, context)).join('');
         return `<span class="${cls}">${innerContent}</span>`;
       }
       return `<span class="${cls}">${escapeHtml(node.value || '')}</span>`;
     }
     
     case 'raw_html_inline':
+      context.requiresHtmlGuard = true;
       return node.content || '';
     
     default:

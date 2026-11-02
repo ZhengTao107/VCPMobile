@@ -27,6 +27,7 @@ const WAIT_POLL_MS = 100;
 const STABILITY_GAP_MS = 120;
 const CARD_GAP = 12;
 const CARD_MAX_WIDTH = 320;
+const NOTICE_MAX_WIDTH = 440;
 const SAFE_MARGIN = 8;
 
 interface SpotRect {
@@ -42,6 +43,7 @@ const guideStore = useGuideStore();
 
 const isActive = computed(() => guideStore.activeGuideId !== null);
 const step = computed(() => guideStore.activeStep);
+const isNotice = computed(() => step.value?.target === null);
 const stepKey = computed(
   () => `${guideStore.activeGuideId ?? 'none'}:${guideStore.activeStepIndex}`,
 );
@@ -51,6 +53,9 @@ const isLastStep = computed(() => {
 });
 
 const cardEl = ref<HTMLElement | null>(null);
+const surfaceRef = ref<HTMLElement | null>(null);
+const surfaceBounds = () => surfaceRef.value?.getBoundingClientRect()
+  ?? { left: 0, top: 0, width: window.innerWidth, height: window.innerHeight };
 const spotRect = ref<SpotRect | null>(null);
 const cardStyle = ref<Record<string, string>>({ top: '-9999px', left: '-9999px' });
 /** 卡片完成首次定位后才启用位置过渡（避免 -9999px 占位处飞入）。 */
@@ -125,13 +130,14 @@ const clearTimers = () => {
 
 const rectOf = (el: HTMLElement): SpotRect => {
   const r = el.getBoundingClientRect();
+  const surface = surfaceBounds();
   return {
-    top: r.top,
-    left: r.left,
+    top: r.top - surface.top,
+    left: r.left - surface.left,
     width: r.width,
     height: r.height,
-    right: r.right,
-    bottom: r.bottom,
+    right: r.right - surface.left,
+    bottom: r.bottom - surface.top,
   };
 };
 
@@ -144,8 +150,8 @@ const sameRect = (a: SpotRect, b: SpotRect): boolean =>
 const isInViewport = (r: SpotRect): boolean =>
   r.top >= -1 &&
   r.left >= -1 &&
-  r.right <= window.innerWidth + 1 &&
-  r.bottom <= window.innerHeight + 1;
+  r.right <= surfaceBounds().width + 1 &&
+  r.bottom <= surfaceBounds().height + 1;
 
 const readSafeInsets = () => {
   const style = getComputedStyle(document.documentElement);
@@ -184,7 +190,7 @@ const targetIdOf = (): string | null => {
 const clampX = (x: number, cardW: number, insets: { left: number; right: number }): number => {
   const maxLeft = Math.max(
     insets.left + SAFE_MARGIN,
-    window.innerWidth - insets.right - SAFE_MARGIN - cardW,
+    surfaceBounds().width - insets.right - SAFE_MARGIN - cardW,
   );
   return Math.min(Math.max(x, insets.left + SAFE_MARGIN), maxLeft);
 };
@@ -192,28 +198,30 @@ const clampX = (x: number, cardW: number, insets: { left: number; right: number 
 const clampY = (y: number, cardH: number, insets: { top: number; bottom: number }): number => {
   const maxTop = Math.max(
     insets.top + SAFE_MARGIN,
-    window.innerHeight - insets.bottom - SAFE_MARGIN - cardH,
+    surfaceBounds().height - insets.bottom - SAFE_MARGIN - cardH,
   );
   return Math.min(Math.max(y, insets.top + SAFE_MARGIN), maxTop);
 };
 
 /** 卡片方位：首选 → 四向翻转 → 全不满足时取空间最大侧并钳制进安全区。 */
 const positionCard = (r: SpotRect | null) => {
-  const vw = window.innerWidth;
-  const vh = window.innerHeight;
+  const { width: vw, height: vh } = surfaceBounds();
   const insets = readSafeInsets();
   const measuredW = cardEl.value?.offsetWidth ?? 0;
   const measuredH = cardEl.value?.offsetHeight ?? 0;
   const cardW =
     measuredW > 0
       ? measuredW
-      : Math.min(CARD_MAX_WIDTH, Math.max(120, vw - insets.left - insets.right - SAFE_MARGIN * 2));
+      : Math.min(isNotice.value ? NOTICE_MAX_WIDTH : CARD_MAX_WIDTH, Math.max(120, vw - insets.left - insets.right - SAFE_MARGIN * 2));
   const cardH = measuredH > 0 ? measuredH : 140;
 
   if (!r) {
     cardStyle.value = {
-      top: `${Math.max(insets.top + SAFE_MARGIN, (vh - cardH) / 2)}px`,
+      top: `${clampY((vh - cardH) / 2, cardH, insets)}px`,
       left: `${clampX((vw - cardW) / 2, cardW, insets)}px`,
+      ...(isNotice.value ? {
+        maxHeight: `${Math.max(0, vh - insets.top - insets.bottom - SAFE_MARGIN * 2)}px`,
+      } : {}),
     };
     return;
   }
@@ -250,22 +258,31 @@ const positionCard = (r: SpotRect | null) => {
     chosen = best;
   }
 
-  let top = 0;
-  let left = 0;
+  let top: number;
+  let left: number;
+  let maxH: number;
   if (chosen === 'bottom') {
     top = r.bottom + CARD_GAP;
     left = clampX(r.left + r.width / 2 - cardW / 2, cardW, insets);
+    maxH = Math.max(120, vh - insets.bottom - SAFE_MARGIN - top);
   } else if (chosen === 'top') {
     top = Math.max(insets.top + SAFE_MARGIN, r.top - CARD_GAP - cardH);
     left = clampX(r.left + r.width / 2 - cardW / 2, cardW, insets);
+    maxH = Math.max(120, r.top - CARD_GAP - (insets.top + SAFE_MARGIN));
   } else if (chosen === 'left') {
     left = Math.max(insets.left + SAFE_MARGIN, r.left - CARD_GAP - cardW);
     top = clampY(r.top + r.height / 2 - cardH / 2, cardH, insets);
+    maxH = Math.max(120, vh - insets.top - insets.bottom - SAFE_MARGIN * 2);
   } else {
     left = r.right + CARD_GAP;
     top = clampY(r.top + r.height / 2 - cardH / 2, cardH, insets);
+    maxH = Math.max(120, vh - insets.top - insets.bottom - SAFE_MARGIN * 2);
   }
-  cardStyle.value = { top: `${top}px`, left: `${left}px` };
+  cardStyle.value = {
+    top: `${top}px`,
+    left: `${left}px`,
+    maxHeight: `${maxH}px`,
+  };
 };
 
 const skipStep = (token: number) => {
@@ -331,7 +348,7 @@ const startStabilitySampling = (token: number, s: GuideStep) => {
 const pollTarget = (token: number, id: string, s: GuideStep) => {
   if (token !== stepToken) return;
   if (s.waitFor) {
-    let gateOk = false;
+    let gateOk: boolean;
     try {
       gateOk = s.waitFor() === true;
     } catch {
@@ -358,6 +375,10 @@ const beginStep = () => {
   clearTimers();
   targetEl = null;
   lastSample = null;
+  if (cardStyle.value.maxHeight) {
+    const { maxHeight: _, ...rest } = cardStyle.value;
+    cardStyle.value = rest;
+  }
   // 保留旧 spotRect：步间推进不闪黑纱，新目标就绪后经 CSS 过渡滑移聚焦。
   targetObserver?.disconnect();
   targetObserver = null;
@@ -365,6 +386,13 @@ const beginStep = () => {
   const s = step.value;
   if (!s) {
     skipStep(token);
+    return;
+  }
+
+  if (s.target === null) {
+    // 纯说明没有等待中的靶点，不启动超时跳过，也不沿用上一教学步骤的聚光。
+    spotRect.value = null;
+    positionCard(null);
     return;
   }
 
@@ -379,6 +407,14 @@ const beginStep = () => {
 };
 
 const restartMeasure = () => {
+  if (cardStyle.value.maxHeight) {
+    const { maxHeight: _, ...rest } = cardStyle.value;
+    cardStyle.value = rest;
+  }
+  if (isNotice.value) {
+    positionCard(null);
+    return;
+  }
   if (!step.value || !targetEl) return;
   const s = step.value;
   const token = stepToken;
@@ -403,6 +439,8 @@ const bindCardRef = (el: unknown) => {
     });
     observer.observe(node);
     cardObserver = observer;
+  }
+  if (node) {
     // 挂载后立即定位一次（消除初始 -9999px 占位），随后启用位置过渡。
     positionCard(spotRect.value);
     cardPlaced.value = true;
@@ -437,6 +475,7 @@ onMounted(() => {
   guideStore.init();
   window.addEventListener('resize', restartMeasure);
   window.addEventListener('vcp-keyboard-inset', restartMeasure);
+  window.addEventListener('vcp-window-geometry-applied', restartMeasure);
   listen<{ state: string }>('vcp-lifecycle-changed', (event) => {
     if (event.payload?.state === 'resume') restartMeasure();
   })
@@ -451,6 +490,7 @@ onMounted(() => {
 onBeforeUnmount(() => {
   window.removeEventListener('resize', restartMeasure);
   window.removeEventListener('vcp-keyboard-inset', restartMeasure);
+  window.removeEventListener('vcp-window-geometry-applied', restartMeasure);
   lifecycleUnlisten?.();
   clearTimers();
   targetObserver?.disconnect();
@@ -462,7 +502,9 @@ onBeforeUnmount(() => {
   <Transition name="guide-fade">
     <div
       v-if="isActive"
-      class="guide-overlay fixed inset-0 z-guide select-none"
+      ref="surfaceRef"
+      class="vcp-viewport-surface guide-overlay fixed inset-0 z-guide select-none"
+      :class="{ 'guide-overlay--notice': isNotice }"
       @click.prevent
       @contextmenu.prevent
       @wheel.prevent
@@ -502,16 +544,17 @@ onBeforeUnmount(() => {
         key="guide-card"
         :ref="bindCardRef"
         class="guide-card pointer-events-auto"
-        :class="{ 'guide-card--placed': cardPlaced }"
+        :class="{ 'guide-card--placed': cardPlaced, 'guide-card--notice': isNotice }"
         :style="cardStyle"
         @click.stop
+        @wheel.stop
         @touchstart.stop
         @touchmove.stop
         @touchend.stop
         @touchcancel.stop
       >
         <div class="guide-card-head">
-          <span class="guide-card-step">[{{ guideStore.activeStepIndex + 1 }}/{{ guideStore.activeGuide?.steps.length }}]</span>
+          <span v-if="!isNotice || (guideStore.activeGuide?.steps.length ?? 0) > 1" class="guide-card-step">[{{ guideStore.activeStepIndex + 1 }}/{{ guideStore.activeGuide?.steps.length }}]</span>
           <span class="guide-card-title">{{ step.title }}</span>
         </div>
         <p class="guide-card-content">{{ step.content }}</p>
@@ -528,6 +571,10 @@ onBeforeUnmount(() => {
 .guide-overlay {
   touch-action: none;
   overscroll-behavior: contain;
+}
+
+.guide-overlay--notice {
+  touch-action: pan-y;
 }
 
 .guide-spot {
@@ -602,6 +649,9 @@ onBeforeUnmount(() => {
 
 .guide-card {
   position: absolute;
+  display: flex;
+  flex-direction: column;
+  box-sizing: border-box;
   width: min(320px, calc(100vw - var(--vcp-safe-left, 0px) - var(--vcp-safe-right, 0px) - 16px));
   background: var(--vcp-panel-bg-97, var(--secondary-bg));
   border: 1px solid var(--border-color);
@@ -610,6 +660,7 @@ onBeforeUnmount(() => {
   box-shadow: 0 6px 16px rgba(0, 0, 0, 0.16);
   color: var(--primary-text);
   animation: guide-card-in 0.2s ease-out both;
+  overflow: hidden;
 }
 
 /* 完成首次定位后启用位置过渡（与聚光同步滑移，避免 -9999px 飞入） */
@@ -617,6 +668,27 @@ onBeforeUnmount(() => {
   transition:
     top 0.26s cubic-bezier(0.4, 0, 0.2, 1),
     left 0.26s cubic-bezier(0.4, 0, 0.2, 1);
+}
+
+.guide-card-head,
+.guide-card-actions {
+  flex-shrink: 0;
+}
+
+.guide-card--notice {
+  width: min(440px, calc(100% - var(--vcp-safe-left, 0px) - var(--vcp-safe-right, 0px) - 16px));
+}
+
+.guide-card--notice .guide-card-content {
+  font-size: 14px;
+}
+
+.guide-card--notice .guide-card-title {
+  font-size: 14px;
+}
+
+.guide-card--notice .guide-btn {
+  min-height: 44px;
 }
 
 @keyframes guide-card-in {
@@ -654,6 +726,12 @@ onBeforeUnmount(() => {
   font-size: 12px;
   line-height: 1.6;
   opacity: 0.85;
+  white-space: pre-line;
+  word-break: break-word;
+  min-height: 0;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  touch-action: pan-y;
 }
 
 .guide-card-actions {

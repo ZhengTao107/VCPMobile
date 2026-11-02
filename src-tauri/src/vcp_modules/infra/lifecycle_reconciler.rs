@@ -1,34 +1,6 @@
-use crate::vcp_modules::infra::lifecycle_state::LifecycleState;
-use crate::vcp_modules::infra::local_server;
-use crate::vcp_modules::settings_manager::{read_settings, SettingsState};
+use crate::vcp_modules::infra::vcp_ws_endpoint::resolve_distributed_connection;
+use crate::vcp_modules::settings_manager::{read_config, SettingsState};
 use tauri::{AppHandle, Manager};
-
-/// 根据设置决定启动或停止划词助手本地服务器
-#[allow(dead_code)] // DORMANT ASSET: retained for a possible future assistant redesign.
-pub async fn reconcile_local_server(
-    app_handle: &AppHandle,
-    lifecycle: &LifecycleState,
-    enable_assistant: bool,
-) {
-    let mut handle_lock = lifecycle.local_server_handle.lock().await;
-    let has_server = handle_lock.is_some();
-
-    match (enable_assistant, has_server) {
-        (true, false) => {
-            log::info!("[Lifecycle] enableAssistant=true, starting local server...");
-            *handle_lock = Some(local_server::start_server(app_handle.clone()));
-        }
-        (false, true) => {
-            log::info!("[Lifecycle] enableAssistant=false, stopping local server...");
-            if let Some(h) = handle_lock.take() {
-                h.shutdown().await;
-            }
-        }
-        _ => {
-            // 无需变更
-        }
-    }
-}
 
 /// 根据设置决定启动或停止分布式节点连接
 pub async fn reconcile_distributed_node(app_handle: &AppHandle, force_reconnect: bool) {
@@ -44,7 +16,7 @@ pub async fn reconcile_distributed_node(app_handle: &AppHandle, force_reconnect:
 
     // 读取全局 settings，获取连接参数
     let settings_state = app_handle.state::<SettingsState>();
-    let settings = match read_settings(app_handle.clone(), settings_state).await {
+    let settings = match read_config(app_handle.clone(), settings_state).await {
         Ok(s) => s,
         Err(e) => {
             log::error!(
@@ -57,7 +29,7 @@ pub async fn reconcile_distributed_node(app_handle: &AppHandle, force_reconnect:
 
     // iOS owns no background execution resource for this node. Background
     // settings writes must not recreate a session after lifecycle suspension.
-    let distributed_enabled = settings.distributed_enabled
+    let distributed_enabled = settings.distributed.enabled
         && (!cfg!(target_os = "ios")
             || crate::vcp_modules::infra::lifecycle_manager::is_app_in_foreground(app_handle));
 
@@ -76,21 +48,17 @@ pub async fn reconcile_distributed_node(app_handle: &AppHandle, force_reconnect:
                 );
                 return;
             }
-            let ws_url = settings.distributed_ws_url;
-            let vcp_key = settings.distributed_vcp_key;
-            let device_name = if settings.distributed_device_name.is_empty() {
-                "VCPMobile".to_string()
-            } else {
-                settings.distributed_device_name
-            };
+            let connection = resolve_distributed_connection(&settings);
+            let device_name = "VCPMobile".to_string();
             log::info!(
                 "[Lifecycle] distributedEnabled=true, starting distributed node connection..."
             );
             if let Err(e) = client
                 .start(
                     app_handle.clone(),
-                    ws_url,
-                    vcp_key,
+                    connection.url.to_string(),
+                    connection.key.to_string(),
+                    connection.base_kind(),
                     device_name,
                     distributed_state.registry.clone(),
                 )
