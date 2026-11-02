@@ -1,18 +1,23 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import "@/tests/mocks/tauri";
+import { openTabKey, type OpenTabRef } from "@/core/stores/openTabsStore";
 import {
+  computerRestoreState,
   createOpenTabsRemote,
   createTopicTitleResolver,
   formatDeviceFreshness,
+  formatOpenAllSummary,
   getOrCreateDeviceId,
   isValidDeviceId,
   OPEN_TABS_DEVICE_ID_KEY,
   OPEN_TABS_POLL_MS,
   OPEN_TABS_REPORT_DEBOUNCE_MS,
+  openDeviceTabs,
   parseSnapshot,
   toReportTabs,
   type OpenTabsHttpResponse,
   type OpenTabsRemoteDeps,
+  type RemoteDevice,
 } from "@/core/sync/openTabsRemote";
 
 const target = { baseUrl: "http://sync.example:5974", token: "test-token" };
@@ -35,6 +40,7 @@ const snapshotBody = {
       ],
     },
     { deviceId: "mac-1", kind: "mac", updatedAt: 300, tabs: "nope" },
+    { deviceId: "pad-1", kind: "android", updatedAt: 250, tabs: [] },
     { deviceId: "bad/id", deviceName: "x", updatedAt: 1, tabs: [] },
   ],
 };
@@ -66,14 +72,12 @@ afterEach(() => {
 });
 
 describe("snapshot parsing", () => {
-  it("filters out this device, invalid ids and tabs; sorts devices and tabs", () => {
+  it("filters out this device and invalid entries; windows first, then newest", () => {
     const snapshot = parseSnapshot(snapshotBody, SELF)!;
     expect(snapshot.revision).toBe(5);
-    expect(snapshot.devices.map((d) => d.deviceId)).toEqual(["mac-1", "pc-1"]);
-    const pc = snapshot.devices[1];
-    expect(pc.tabs.map((t) => t.topicId)).toEqual(["t1", "t2"]);
-    const mac = snapshot.devices[0];
-    expect(mac).toMatchObject({ deviceName: "mac-1", kind: "mac", tabs: [] });
+    expect(snapshot.devices.map((d) => d.deviceId)).toEqual(["pc-1", "mac-1", "pad-1"]);
+    expect(snapshot.devices[0].tabs.map((t) => t.topicId)).toEqual(["t1", "t2"]);
+    expect(snapshot.devices[1]).toMatchObject({ deviceName: "mac-1", kind: "mac", tabs: [] });
   });
 
   it("rejects malformed bodies", () => {
@@ -81,14 +85,95 @@ describe("snapshot parsing", () => {
     expect(parseSnapshot({ devices: "x" }, SELF)).toBeNull();
   });
 
-  it("shows freshness and offline duration", () => {
+  it("always shows 'updated N ago' and never 'offline'", () => {
     const now = 10 * 60 * 60_000;
     expect(formatDeviceFreshness(0, now)).toBe("更新时间未知");
     expect(formatDeviceFreshness(now - 20_000, now)).toBe("刚刚更新");
     expect(formatDeviceFreshness(now - 3 * 60_000, now)).toBe("3 分钟前更新");
-    expect(formatDeviceFreshness(now - 25 * 60_000, now)).toBe("离线 25 分钟");
-    expect(formatDeviceFreshness(now - 3 * 60 * 60_000, now)).toBe("离线 3 小时");
-    expect(formatDeviceFreshness(now - 50 * 60 * 60_000, now + 0)).toBe("离线 2 天");
+    expect(formatDeviceFreshness(now - 25 * 60_000, now)).toBe("25 分钟前更新");
+    expect(formatDeviceFreshness(now - 3 * 60 * 60_000, now)).toBe("3 小时前更新");
+    expect(formatDeviceFreshness(now - 50 * 60 * 60_000, now)).toBe("2 天前更新");
+    expect(formatDeviceFreshness(now - 25 * 60_000, now)).not.toContain("离线");
+  });
+});
+
+describe("open all / restore computer tabs", () => {
+  const ref = (topicId: string, ownerId = "a"): OpenTabRef => ({
+    ownerType: "agent",
+    ownerId,
+    topicId,
+  });
+  const device = (tabs: Array<OpenTabRef & { order: number }>, kind = "windows"): RemoteDevice => ({
+    deviceId: "pc-1",
+    deviceName: "台式机",
+    kind,
+    updatedAt: 1,
+    tabs,
+  });
+
+  it("opens in order, skips already-open and unsynced, activates the first open by order", async () => {
+    const open = new Set([openTabKey(ref("t1"))]);
+    const titles: Record<string, string | null> = { t2: "第二", t4: "第四", t3: null };
+    const openTabsInBackground = vi.fn((items: Array<OpenTabRef & { title: string }>) => ({
+      opened: items,
+      alreadyOpen: [],
+      missing: [],
+    }));
+    const activateTab = vi.fn(async () => true);
+    const result = await openDeviceTabs(
+      device([
+        { ...ref("t4"), order: 3 },
+        { ...ref("t3"), order: 0 },
+        { ...ref("t1"), order: 1 },
+        { ...ref("t2"), order: 2 },
+      ]),
+      {
+        isOpen: (t) => open.has(openTabKey(t)),
+        resolveTitle: async (t) => titles[t.topicId] ?? null,
+        openTabsInBackground,
+        activateTab,
+      },
+    );
+    expect(openTabsInBackground).toHaveBeenCalledWith([
+      { ...ref("t2"), title: "第二" },
+      { ...ref("t4"), title: "第四" },
+    ]);
+    expect(activateTab).toHaveBeenCalledWith(ref("t1"));
+    expect(result).toEqual({ opened: 2, alreadyOpen: 1, skipped: 1, activated: true });
+    expect(formatOpenAllSummary(result.opened, result.skipped)).toBe("已打开 2，跳过 1（未同步）");
+  });
+
+  it("counts owners missing on this device as skipped and activates nothing when all skipped", async () => {
+    const activateTab = vi.fn(async () => true);
+    const result = await openDeviceTabs(device([{ ...ref("t1", "zz"), order: 0 }]), {
+      isOpen: () => false,
+      resolveTitle: async () => "有名字",
+      openTabsInBackground: (items) => ({ opened: [], alreadyOpen: [], missing: items }),
+      activateTab,
+    });
+    expect(result).toEqual({ opened: 0, alreadyOpen: 0, skipped: 1, activated: false });
+    expect(activateTab).not.toHaveBeenCalled();
+  });
+
+  it("reports why 'restore computer tabs' is unavailable", () => {
+    const pc = device([{ ...ref("t1"), order: 0 }]);
+    const state = (status: "ok" | "unavailable" | "loading" | "error", devices: RemoteDevice[]) => ({
+      status,
+      devices,
+    });
+    expect(computerRestoreState(false, state("ok", [pc])).reason).toBe(
+      "未开启自动同步或未配置同步地址",
+    );
+    expect(computerRestoreState(true, state("unavailable", [])).reason).toBe("电脑端未启用");
+    expect(computerRestoreState(true, state("ok", [device([], "mac")])).reason).toBe(
+      "没有电脑的标签快照",
+    );
+    expect(computerRestoreState(true, state("loading", [])).reason).toBe("加载中…");
+    expect(computerRestoreState(true, state("ok", [device([])])).device).toBeNull();
+    expect(computerRestoreState(true, state("ok", [device([], "mac"), pc]))).toEqual({
+      device: pc,
+      reason: null,
+    });
   });
 });
 
@@ -128,7 +213,7 @@ describe("open tabs remote client", () => {
     const { remote } = makeRemote();
     await remote.refresh();
     expect(remote.state.status).toBe("ok");
-    expect(remote.state.devices.map((d) => d.deviceId)).toEqual(["mac-1", "pc-1"]);
+    expect(remote.state.devices.map((d) => d.deviceId)).toEqual(["pc-1", "mac-1", "pad-1"]);
     expect(remote.state.fetchedAt).toBe(1_000);
   });
 
@@ -148,7 +233,7 @@ describe("open tabs remote client", () => {
     await remote.refresh();
     await remote.refresh();
     expect(remote.state.status).toBe("error");
-    expect(remote.state.devices).toHaveLength(2);
+    expect(remote.state.devices).toHaveLength(3);
   });
 
   it("polls every 30s while started and stops cleanly", async () => {
@@ -182,7 +267,7 @@ describe("device id", () => {
 });
 
 describe("topic title resolver", () => {
-  it("uses known titles, then loads the owner once; missing topics are null", async () => {
+  it("uses known titles, loads each owner once; missing topics resolve to null", async () => {
     vi.useRealTimers();
     const fetchTopics = vi.fn(async () => [{ id: "t2", name: "第二个" }]);
     const resolver = createTopicTitleResolver({
@@ -193,10 +278,18 @@ describe("topic title resolver", () => {
     expect(resolver.resolve(ref("t1"))).toBe("已知");
     resolver.prefetch([ref("t1"), ref("t2"), ref("t3")]);
     expect(resolver.resolve(ref("t2"))).toBeUndefined();
-    await Promise.resolve();
-    await Promise.resolve();
+    const [t2, t3] = await Promise.all([resolver.resolveAsync(ref("t2")), resolver.resolveAsync(ref("t3"))]);
+    expect([t2, t3]).toEqual(["第二个", null]);
     expect(fetchTopics).toHaveBeenCalledTimes(1);
     expect(resolver.resolve(ref("t2"))).toBe("第二个");
-    expect(resolver.resolve(ref("t3"))).toBeNull();
+  });
+
+  it("treats a failed owner load as unsynced", async () => {
+    vi.useRealTimers();
+    const resolver = createTopicTitleResolver({
+      known: () => null,
+      fetchTopics: vi.fn(async () => Promise.reject(new Error("db"))),
+    });
+    expect(await resolver.resolveAsync({ ownerType: "group", ownerId: "g", topicId: "x" })).toBeNull();
   });
 });

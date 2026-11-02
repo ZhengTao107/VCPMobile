@@ -18,8 +18,6 @@ import { hintTargetFromSettings, onRemoteHint, type HintTarget } from "./remoteC
  */
 export const OPEN_TABS_REPORT_DEBOUNCE_MS = 2_000;
 export const OPEN_TABS_POLL_MS = 30_000;
-/** 设备快照超过此时长未更新即显示“离线 N 分钟”。上报只在标签变化时发生，属估计口径。 */
-export const OPEN_TABS_OFFLINE_AFTER_MS = 10 * 60_000;
 export const OPEN_TABS_DEVICE_ID_KEY = "vcp_open_tabs_device_id_v1";
 export const OPEN_TABS_DEVICE_KIND = "android";
 export const UNSYNCED_TOPIC_TITLE = "未同步的话题";
@@ -126,7 +124,7 @@ const parseRemoteTabs = (value: unknown): RemoteOpenTab[] => {
   return tabs.sort((a, b) => a.order - b.order);
 };
 
-/** 校验快照并去掉本机；格式不符返回 null。设备按更新时间新到旧，标签按 order。 */
+/** 校验快照并去掉本机；格式不符返回 null。Windows 分组在前，其余按更新时间新到旧；标签按 order。 */
 export function parseSnapshot(body: unknown, selfDeviceId: string): OpenTabsSnapshot | null {
   if (!body || typeof body !== "object") return null;
   const { revision, devices } = body as Record<string, unknown>;
@@ -145,22 +143,113 @@ export function parseSnapshot(body: unknown, selfDeviceId: string): OpenTabsSnap
       tabs: parseRemoteTabs(record.tabs),
     });
   }
-  parsed.sort((a, b) => b.updatedAt - a.updatedAt);
+  // Windows（电脑）分组固定第一，其余按更新时间新到旧。
+  parsed.sort(
+    (a, b) =>
+      Number(b.kind === "windows") - Number(a.kind === "windows") || b.updatedAt - a.updatedAt,
+  );
   return { revision: isFiniteNumber(revision) ? revision : 0, devices: parsed };
 }
 
-/** 设备分组副标题：近期显示“N 分钟前更新”，超过离线阈值显示“离线 N 分钟/小时/天”。 */
+/**
+ * 设备分组副标题：统一显示“N 分钟前更新”，不判离线（电脑端无心跳，updatedAt 取
+ * open-tabs.json 的 mtime，标签不动就不更新）。超过 1 小时按小时/天。
+ */
 export function formatDeviceFreshness(updatedAt: number, now: number): string {
   if (!updatedAt) return "更新时间未知";
-  const age = Math.max(0, now - updatedAt);
-  const minutes = Math.floor(age / 60_000);
-  if (age >= OPEN_TABS_OFFLINE_AFTER_MS) {
-    if (minutes < 60) return `离线 ${minutes} 分钟`;
-    const hours = Math.floor(minutes / 60);
-    if (hours < 24) return `离线 ${hours} 小时`;
-    return `离线 ${Math.floor(hours / 24)} 天`;
+  const minutes = Math.floor(Math.max(0, now - updatedAt) / 60_000);
+  if (minutes < 1) return "刚刚更新";
+  if (minutes < 60) return `${minutes} 分钟前更新`;
+  const hours = Math.floor(minutes / 60);
+  if (hours < 24) return `${hours} 小时前更新`;
+  return `${Math.floor(hours / 24)} 天前更新`;
+}
+
+export const formatOpenAllSummary = (opened: number, skipped: number) =>
+  `已打开 ${opened}，跳过 ${skipped}（未同步）`;
+
+export interface OpenDeviceTabsDeps {
+  isOpen: (target: OpenTabRef) => boolean;
+  /** 本机话题名；null 表示本机没有这个话题（未同步）。 */
+  resolveTitle: (target: OpenTabRef) => Promise<string | null>;
+  openTabsInBackground: (items: Array<OpenTabRef & { title: string }>) => {
+    opened: OpenTabRef[];
+    alreadyOpen: OpenTabRef[];
+    missing: OpenTabRef[];
+  };
+  activateTab: (target: OpenTabRef) => Promise<boolean>;
+}
+
+export interface OpenDeviceTabsResult {
+  opened: number;
+  alreadyOpen: number;
+  /** 本机查不到（未同步话题或 owner）而跳过的数量。 */
+  skipped: number;
+  activated: boolean;
+}
+
+/**
+ * 「全部打开」：按 order 依次本机新开（只挂标签、不逐个激活、不触发生成，不限数量），
+ * 已开的跳过，本机查不到的跳过；最后激活该设备 order 最前的已打开话题。
+ */
+export async function openDeviceTabs(
+  device: RemoteDevice,
+  deps: OpenDeviceTabsDeps,
+): Promise<OpenDeviceTabsResult> {
+  const ordered = [...device.tabs]
+    .sort((a, b) => a.order - b.order)
+    .map((tab) => ({ ownerType: tab.ownerType, ownerId: tab.ownerId, topicId: tab.topicId }));
+  const present = ordered.filter((tab) => deps.isOpen(tab));
+  const candidates = ordered.filter((tab) => !deps.isOpen(tab));
+  const titles = await Promise.all(
+    candidates.map((tab) => deps.resolveTitle(tab).catch(() => null)),
+  );
+  const toOpen: Array<OpenTabRef & { title: string }> = [];
+  let unsynced = 0;
+  candidates.forEach((tab, index) => {
+    const title = titles[index];
+    if (title) toOpen.push({ ...tab, title });
+    else unsynced += 1;
+  });
+  const result = toOpen.length
+    ? deps.openTabsInBackground(toOpen)
+    : { opened: [], alreadyOpen: [], missing: [] };
+  const usable = new Set([...present, ...result.opened, ...result.alreadyOpen].map(openTabKey));
+  const first = ordered.find((tab) => usable.has(openTabKey(tab)));
+  const activated = first ? await deps.activateTab(first) : false;
+  return {
+    opened: result.opened.length,
+    alreadyOpen: present.length + result.alreadyOpen.length,
+    skipped: unsynced + result.missing.length,
+    activated,
+  };
+}
+
+export interface ComputerRestoreState {
+  device: RemoteDevice | null;
+  /** 不可用时的原因；可用时为 null。 */
+  reason: string | null;
+}
+
+/** 「恢复电脑的标签」= 对 Windows 分组执行「全部打开」；无快照或电脑端未启用时给出原因。 */
+export function computerRestoreState(
+  enabled: boolean,
+  state: Pick<OpenTabsRemoteState, "status" | "devices">,
+): ComputerRestoreState {
+  if (!enabled) return { device: null, reason: "未开启自动同步或未配置同步地址" };
+  if (state.status === "unavailable") return { device: null, reason: "电脑端未启用" };
+  const device = state.devices.find((item) => item.kind === "windows") ?? null;
+  if (!device) {
+    const reason =
+      state.status === "loading" || state.status === "idle"
+        ? "加载中…"
+        : state.status === "error"
+          ? "获取失败，稍后重试"
+          : "没有电脑的标签快照";
+    return { device: null, reason };
   }
-  return minutes < 1 ? "刚刚更新" : `${minutes} 分钟前更新`;
+  if (device.tabs.length === 0) return { device: null, reason: "电脑没有打开的标签" };
+  return { device, reason: null };
 }
 
 export const toReportTabs = (tabs: readonly OpenTabRef[]): RemoteOpenTab[] =>
@@ -319,26 +408,42 @@ type OwnerTopics = Map<string, string> | "pending" | "failed";
 
 /**
  * 远端标签的话题名：先查本地已知（标签/历史/当前列表），否则按 owner 读一次本机话题库。
- * resolve 返回 undefined 表示还在查，null 表示本机没有（显示“未同步的话题”）。
+ * resolve 返回 undefined 表示还在查，null 表示本机没有（显示“未同步的话题”）；
+ * resolveAsync 等查完再给结果（null = 未同步）。
  */
 export function createTopicTitleResolver(deps: TopicTitleResolverDeps) {
   const owners = shallowReactive(new Map<string, OwnerTopics>());
+  const loading = new Map<string, Promise<void>>();
   const ownerKey = (ownerType: string, ownerId: string) => `${ownerType}\u0000${ownerId}`;
 
-  const load = (ownerType: ConversationOwnerType, ownerId: string) => {
+  const load = (ownerType: ConversationOwnerType, ownerId: string): Promise<void> => {
     const key = ownerKey(ownerType, ownerId);
-    if (owners.has(key)) return;
+    const running = loading.get(key);
+    if (running) return running;
+    if (owners.has(key)) return Promise.resolve();
     owners.set(key, "pending");
-    void deps.fetchTopics(ownerType, ownerId).then(
-      (topics) => {
-        const names = new Map<string, string>();
-        for (const topic of Array.isArray(topics) ? topics : []) {
-          if (topic && isNonEmptyString(topic.id)) names.set(topic.id, topic.name || topic.id);
-        }
-        owners.set(key, names);
-      },
-      () => owners.set(key, "failed"),
-    );
+    let fetched: Promise<Array<{ id: string; name?: string | null }>>;
+    try {
+      fetched = Promise.resolve(deps.fetchTopics(ownerType, ownerId));
+    } catch (error) {
+      fetched = Promise.reject(error);
+    }
+    const task = fetched
+      .then(
+        (topics) => {
+          const names = new Map<string, string>();
+          for (const topic of Array.isArray(topics) ? topics : []) {
+            if (topic && isNonEmptyString(topic.id)) names.set(topic.id, topic.name || topic.id);
+          }
+          owners.set(key, names);
+        },
+        () => {
+          owners.set(key, "failed");
+        },
+      )
+      .finally(() => loading.delete(key));
+    loading.set(key, task);
+    return task;
   };
 
   const resolve = (target: OpenTabRef): string | null | undefined => {
@@ -350,13 +455,25 @@ export function createTopicTitleResolver(deps: TopicTitleResolverDeps) {
     return entry.get(target.topicId) ?? null;
   };
 
+  const resolveAsync = async (target: OpenTabRef): Promise<string | null> => {
+    const known = deps.known(target);
+    if (known) return known;
+    await load(target.ownerType, target.ownerId);
+    return resolve(target) ?? null;
+  };
+
   const prefetch = (targets: readonly OpenTabRef[]) => {
     for (const target of targets) {
-      if (!deps.known(target)) load(target.ownerType, target.ownerId);
+      if (!deps.known(target)) void load(target.ownerType, target.ownerId);
     }
   };
 
-  return { resolve, prefetch, reset: () => owners.clear() };
+  const reset = () => {
+    owners.clear();
+    loading.clear();
+  };
+
+  return { resolve, resolveAsync, prefetch, reset };
 }
 
 export const deviceNameFromSettings = (settings: AppSettings | null | undefined) => {
