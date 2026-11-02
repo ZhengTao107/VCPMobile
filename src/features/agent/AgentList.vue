@@ -7,6 +7,7 @@ import { useLayoutStore } from "../../core/stores/layout";
 import { useSettingsStore } from "../../core/stores/settings";
 import { useOverlayStore } from "../../core/stores/overlay";
 import VcpAvatar from "../../components/ui/VcpAvatar.vue";
+import GroupAvatar from "./GroupAvatar.vue";
 import { sortByOrder } from "./agentOrder";
 import { activeSwipeId, currentSwipeX, MAX_SWIPE } from "./swipeController";
 import type {
@@ -370,8 +371,8 @@ const filteredCombinedItems = computed<AssistantListItem[]>(() => {
               ]" :style="{
                 transform: `translateX(${activeSwipeId === ownerSwipeKey('group', group.id) ? currentSwipeX : 0}px)`,
               }">
-            <VcpAvatar owner-type="group" :owner-id="group.id" :fallback-name="group.name" size="w-10 h-10"
-              rounded="rounded-full" dominant-color="var(--highlight-text)" />
+            <GroupAvatar :group-id="group.id" :group-name="group.name" :members="group.members"
+              size="w-10 h-10" dominant-color="var(--highlight-text)" />
             <div class="flex flex-col overflow-hidden flex-1">
               <span class="font-bold text-sm truncate text-primary-text">{{
                 group.name
