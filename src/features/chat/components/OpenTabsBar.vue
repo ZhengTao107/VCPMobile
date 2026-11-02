@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed, nextTick, ref, watch } from "vue";
-import { Loader2, X } from "lucide-vue-next";
+import { Loader2, Plus, X } from "lucide-vue-next";
 import VcpAvatar from "../../../components/ui/VcpAvatar.vue";
 import {
   openTabKey,
@@ -8,10 +8,32 @@ import {
   type OpenTab,
 } from "../../../core/stores/openTabsStore";
 import { useChatStreamStore } from "../../../core/stores/chatStreamStore";
+import { useChatSessionStore } from "../../../core/stores/chatSessionStore";
 
 const tabsStore = useOpenTabsStore();
 const streamStore = useChatStreamStore();
+const sessionStore = useChatSessionStore();
 const scrollerRef = ref<HTMLElement | null>(null);
+const creating = ref(false);
+
+const currentOwner = computed(() => {
+  const item = sessionStore.currentSelectedItem;
+  return item && (item.type === "agent" || item.type === "group")
+    ? { ownerId: item.id, ownerType: item.type }
+    : null;
+});
+
+/** 对应 VCPChat openItemChatTab：为当前 owner 新建话题并在新标签打开。 */
+const openNewTab = async () => {
+  const owner = currentOwner.value;
+  if (!owner || creating.value) return;
+  creating.value = true;
+  try {
+    await tabsStore.openNewEmptyTab(owner.ownerType, owner.ownerId);
+  } finally {
+    creating.value = false;
+  }
+};
 
 const items = computed(() =>
   tabsStore.tabs.map((tab) => {
@@ -82,6 +104,12 @@ watch(
           <X :size="12" />
         </button>
       </div>
+      <button type="button" aria-label="新建话题标签" title="新建话题标签"
+        class="open-tab-add shrink-0 w-7 h-7 flex items-center justify-center rounded-full border border-black/5 dark:border-white/10 bg-black/5 dark:bg-white/5 opacity-80 active:scale-90 transition-transform disabled:opacity-40"
+        :disabled="!currentOwner || creating" @click="openNewTab">
+        <Loader2 v-if="creating" :size="14" class="animate-spin" aria-hidden="true" />
+        <Plus v-else :size="14" />
+      </button>
     </div>
   </nav>
 </template>

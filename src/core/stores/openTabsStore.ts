@@ -67,7 +67,9 @@ const sameTab = (a: OpenTab, b: OpenTab) =>
 
 /**
  * 打开的话题标签。数量不设上限；生成并发仍由传输层 8 路上限约束。
- * 当前会话由 chatSessionStore 决定，本 store 只维护列表：选中任何话题即自动打开。
+ * 语义对齐 VCPChat：当前会话由 chatSessionStore 决定；普通选择一个未打开的话题时，
+ * 原位替换当前标签（activeTabKey 槽位），不新增标签；只有 openInNewTab /
+ * openNewEmptyTab 这类显式操作才增加标签数。
  */
 export const useOpenTabsStore = defineStore("openTabs", () => {
   const sessionStore = useChatSessionStore();
@@ -75,6 +77,10 @@ export const useOpenTabsStore = defineStore("openTabs", () => {
   const assistantStore = useAssistantStore();
 
   const tabs = ref<OpenTab[]>([]);
+  /** 标签栏中的当前槽位；随持久化保存。会话为空时仍保留，供下一次选择原位替换。 */
+  const activeTabKey = ref<string | null>(null);
+  const indexOfKey = (key: string | null) =>
+    key ? tabs.value.findIndex((tab) => openTabKey(tab) === key) : -1;
 
   const activeKey = computed(() => {
     const key = sessionStore.currentConversationKey;
@@ -126,8 +132,15 @@ export const useOpenTabsStore = defineStore("openTabs", () => {
       avatarColor: item?.avatarCalculatedColor ?? previous?.avatarColor ?? null,
       unread: false,
     };
-    if (index >= 0) replaceAt(index, next);
-    else tabs.value.push(next);
+    if (index >= 0) {
+      replaceAt(index, next);
+    } else {
+      // 浏览未打开的话题：原位替换当前槽位并保留位置；没有槽位时才追加。
+      const slot = indexOfKey(activeTabKey.value);
+      if (slot >= 0) tabs.value.splice(slot, 1, next);
+      else tabs.value.push(next);
+    }
+    activeTabKey.value = openTabKey(next);
   };
 
   /** 显式打开但不激活（例如从别处预先挂一个标签）。 */
@@ -137,17 +150,72 @@ export const useOpenTabsStore = defineStore("openTabs", () => {
     if (normalized) tabs.value.push(normalized);
   };
 
+  /** 切到某个标签对应的会话；成功返回 true。 */
   const activateTab = async (target: OpenTabRef) => {
-    if (isActive(target)) return;
+    const markSlot = () => {
+      if (indexOfTab(target) >= 0) activeTabKey.value = openTabKey(target);
+    };
+    if (isActive(target)) {
+      markSlot();
+      return true;
+    }
     try {
       await sessionStore.selectTopicById(target.ownerId, target.ownerType, target.topicId);
+      markSlot();
+      return true;
     } catch (error) {
       // selectTopicById 只在 owner 不存在时抛错；列表尚未加载时不据此清理。
       console.warn("[OpenTabs] Failed to activate tab:", error);
       if (assistantStore.agents.length > 0 || assistantStore.groups.length > 0) {
         removeWhere((tab) => sameOwner(tab, target.ownerId, target.ownerType));
       }
+      return false;
     }
+  };
+
+  /** 对应 VCPChat 的“在新标签页打开”：插到当前标签右侧并激活；已打开则只切换。 */
+  const openInNewTab = async (
+    tab: OpenTabRef & Partial<Omit<OpenTab, keyof OpenTabRef>>,
+  ) => {
+    if (indexOfTab(tab) >= 0) return activateTab(tab);
+    const [normalized] = normalizeOpenTabs([tab]);
+    if (!normalized) return false;
+    const slot = indexOfKey(activeTabKey.value);
+    tabs.value.splice(slot >= 0 ? slot + 1 : tabs.value.length, 0, normalized);
+    const activated = await activateTab(normalized);
+    if (!activated) {
+      const key = openTabKey(normalized);
+      removeWhere((item) => openTabKey(item) === key);
+    }
+    return activated;
+  };
+
+  /**
+   * 对应 VCPChat openItemChatTab：为 owner 新建话题并在新标签打开，返回新话题 id。
+   * 移动端没有“复用空话题”的语义，总是新建；命名沿用 TopicCreator。
+   */
+  const openNewEmptyTab = async (ownerType: ConversationOwnerType, ownerId: string) => {
+    const name = `新话题 ${new Date().toLocaleTimeString([], {
+      hour: "2-digit",
+      minute: "2-digit",
+      second: "2-digit",
+    })}`;
+    let topicId: string | undefined;
+    let title = name;
+    try {
+      const created = await topicStore.createTopic(ownerId, ownerType, name);
+      topicId = created?.id;
+      title = created?.name || name;
+    } catch {
+      return null; // createTopic 已发出错误通知。
+    }
+    if (!topicId) return null;
+    const opened = await openInNewTab({ ownerId, ownerType, topicId, title });
+    if (!opened) return null;
+    if (!topicStore.topics.some((t) => sameOwner(t, ownerId, ownerType) && t.id === topicId)) {
+      void topicStore.loadTopicList(ownerId, ownerType).catch(() => {});
+    }
+    return topicId;
   };
 
   /** 关闭标签不中止其后台生成。关闭当前标签时切到相邻标签。 */
@@ -173,6 +241,15 @@ export const useOpenTabsStore = defineStore("openTabs", () => {
   /** 持久化恢复后调用：校验数据并补上当前会话。 */
   const sanitizeTabs = () => {
     tabs.value = normalizeOpenTabs(tabs.value);
+    // 旧持久化数据没有 activeTabKey：以当前会话所在标签为准。
+    if (indexOfKey(activeKey.value) >= 0) {
+      activeTabKey.value = activeKey.value;
+    } else if (
+      typeof activeTabKey.value !== "string" ||
+      indexOfKey(activeTabKey.value) < 0
+    ) {
+      activeTabKey.value = null;
+    }
     upsertCurrent();
   };
 
@@ -282,15 +359,18 @@ export const useOpenTabsStore = defineStore("openTabs", () => {
   return {
     tabs,
     activeKey,
+    activeTabKey,
     openTab,
     activateTab,
+    openInNewTab,
+    openNewEmptyTab,
     closeTab,
     moveTab,
     sanitizeTabs,
   };
 }, {
   persist: {
-    pick: ["tabs"],
+    pick: ["tabs", "activeTabKey"],
     afterHydrate: (context) => {
       (context.store as unknown as { sanitizeTabs: () => void }).sanitizeTabs();
     },
