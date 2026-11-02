@@ -203,6 +203,26 @@ export function createRemoteChangeHint(deps: RemoteChangeHintDeps): RemoteChange
   return { update, dispose: () => update(null) };
 }
 
+const hintListeners = new Set<() => void>();
+
+/** 订阅电脑端变化提示（与 requestAutoSync('remote-hint') 同时触发）；返回取消函数。 */
+export function onRemoteHint(listener: () => void): () => void {
+  hintListeners.add(listener);
+  return () => {
+    hintListeners.delete(listener);
+  };
+}
+
+const notifyRemoteHint = () => {
+  for (const listener of [...hintListeners]) {
+    try {
+      listener();
+    } catch (error) {
+      console.warn("[RemoteChangeHint] listener failed:", error);
+    }
+  }
+};
+
 let activeDispose: (() => void) | null = null;
 
 /** 应用级单例：由 useAppLifecycle 挂载，返回卸载函数。 */
@@ -214,7 +234,10 @@ export function useRemoteChangeHint(isForeground: () => boolean): () => void {
   const hint = createRemoteChangeHint({
     wait: (request) => invoke<HintWaitResponse>("sync_hint_wait", { ...request }),
     cancel: (requestId) => invoke("sync_hint_cancel", { requestId }),
-    onChange: () => requestAutoSync("remote-hint"),
+    onChange: () => {
+      requestAutoSync("remote-hint");
+      notifyRemoteHint();
+    },
   });
   const stopWatch = watch(
     () => hintTargetFromSettings(settingsStore.settings, isForeground()),

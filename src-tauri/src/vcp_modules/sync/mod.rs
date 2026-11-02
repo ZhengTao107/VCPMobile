@@ -1,4 +1,5 @@
 pub mod attachment_blob;
+pub mod open_tabs;
 pub mod sync_dto;
 pub mod sync_error;
 pub mod sync_executor;

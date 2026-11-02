@@ -59,6 +59,111 @@ export const normalizeOpenTabs = (value: unknown): OpenTab[] => {
   return result;
 };
 
+/** 最近关闭历史上限：照抄 VCPChat tab-history-controller.js（entries `.slice(0, 100)`）。 */
+export const CLOSED_TAB_HISTORY_LIMIT = 100;
+/** 单个批次的子项上限：照 VCPChat normalize（batch.tabs 超过 200 视为无效）。 */
+export const CLOSED_BATCH_TAB_LIMIT = 200;
+
+export interface ClosedTab extends OpenTabRef {
+  title: string;
+  ownerName: string;
+  avatarColor: string | null;
+  closedAt: number;
+}
+
+/** 单个关闭的标签。 */
+export interface ClosedTabEntry extends ClosedTab {
+  kind: "tab";
+}
+
+/** 「关闭其他 / 关闭全部」一次关掉的一批（对齐 VCPChat 整窗关闭批次）。 */
+export interface ClosedTabBatch {
+  kind: "batch";
+  id: string;
+  closedAt: number;
+  tabs: ClosedTab[];
+}
+
+export type ClosedHistoryEntry = ClosedTabEntry | ClosedTabBatch;
+
+/** 面板展示用的批次：只含尚未打开的子项，标题按剩余数量计算。 */
+export interface ClosedTabBatchView extends ClosedTabBatch {
+  title: string;
+}
+
+export type RecentlyClosedEntry = ClosedTabEntry | ClosedTabBatchView;
+
+export const closedBatchTitle = (count: number) => `关闭了 ${count} 个标签`;
+
+const positiveTime = (value: unknown, fallback = 0) => {
+  const time = Number(value);
+  return Number.isFinite(time) && time > 0 ? time : fallback;
+};
+
+const toClosedTab = (raw: unknown, fallbackClosedAt = 0): ClosedTab | null => {
+  const [tab] = normalizeOpenTabs([raw]);
+  if (!tab) return null;
+  return {
+    ownerId: tab.ownerId,
+    ownerType: tab.ownerType,
+    topicId: tab.topicId,
+    title: tab.title,
+    ownerName: tab.ownerName,
+    avatarColor: tab.avatarColor,
+    closedAt: positiveTime((raw as Record<string, unknown>).closedAt, fallbackClosedAt),
+  };
+};
+
+/**
+ * 校验持久化的关闭历史：单条按身份去重（保留靠前的较新条目）；批次按 id 去重，
+ * 子项去重，空批次或超过 200 子项的批次丢弃；整体截到上限。旧数据没有 kind，按单条处理。
+ */
+export const normalizeClosedTabs = (value: unknown): ClosedHistoryEntry[] => {
+  if (!Array.isArray(value)) return [];
+  const seenTabs = new Set<string>();
+  const seenBatches = new Set<string>();
+  const result: ClosedHistoryEntry[] = [];
+  for (const raw of value) {
+    if (result.length >= CLOSED_TAB_HISTORY_LIMIT) break;
+    if (!raw || typeof raw !== "object") continue;
+    const record = raw as Record<string, unknown>;
+    if (record.kind === "batch") {
+      const id = typeof record.id === "string" ? record.id.slice(0, 256) : "";
+      if (!id || seenBatches.has(id) || !Array.isArray(record.tabs)) continue;
+      if (record.tabs.length > CLOSED_BATCH_TAB_LIMIT) continue;
+      const closedAt = positiveTime(record.closedAt);
+      const childKeys = new Set<string>();
+      const tabs: ClosedTab[] = [];
+      for (const child of record.tabs) {
+        const tab = toClosedTab(child, closedAt);
+        if (!tab || childKeys.has(openTabKey(tab))) continue;
+        childKeys.add(openTabKey(tab));
+        tabs.push(tab);
+      }
+      if (tabs.length === 0) continue;
+      seenBatches.add(id);
+      result.push({ kind: "batch", id, closedAt, tabs });
+      continue;
+    }
+    const tab = toClosedTab(record);
+    if (!tab) continue;
+    const key = openTabKey(tab);
+    if (seenTabs.has(key)) continue;
+    seenTabs.add(key);
+    result.push({ kind: "tab", ...tab });
+  }
+  return result;
+};
+
+const pickTab = (tab: ClosedTab) => ({
+  ownerId: tab.ownerId,
+  ownerType: tab.ownerType,
+  topicId: tab.topicId,
+  title: tab.title,
+  ownerName: tab.ownerName,
+  avatarColor: tab.avatarColor,
+});
+
 const sameTab = (a: OpenTab, b: OpenTab) =>
   a.title === b.title &&
   a.ownerName === b.ownerName &&
@@ -79,6 +184,8 @@ export const useOpenTabsStore = defineStore("openTabs", () => {
   const tabs = ref<OpenTab[]>([]);
   /** 标签栏中的当前槽位；随持久化保存。会话为空时仍保留，供下一次选择原位替换。 */
   const activeTabKey = ref<string | null>(null);
+  /** 最近关闭（单条与批次），新的在前；持久化。话题或 owner 被删除时同步移除。 */
+  const closedTabs = ref<ClosedHistoryEntry[]>([]);
   const indexOfKey = (key: string | null) =>
     key ? tabs.value.findIndex((tab) => openTabKey(tab) === key) : -1;
 
@@ -105,6 +212,100 @@ export const useOpenTabsStore = defineStore("openTabs", () => {
   const removeWhere = (predicate: (tab: OpenTab) => boolean) => {
     if (!tabs.value.some(predicate)) return;
     tabs.value = tabs.value.filter((tab) => !predicate(tab));
+  };
+
+  /** 话题或 owner 已不存在：标签与关闭历史（含批次子项）一起清理。 */
+  const pruneWhere = (predicate: (tab: OpenTabRef) => boolean) => {
+    removeWhere(predicate);
+    const hit = closedTabs.value.some((entry) =>
+      entry.kind === "batch" ? entry.tabs.some(predicate) : predicate(entry),
+    );
+    if (!hit) return;
+    closedTabs.value = closedTabs.value.flatMap((entry): ClosedHistoryEntry[] => {
+      if (entry.kind !== "batch") return predicate(entry) ? [] : [entry];
+      const rest = entry.tabs.filter((tab) => !predicate(tab));
+      return rest.length ? [{ ...entry, tabs: rest }] : [];
+    });
+  };
+
+  const toClosed = (tab: OpenTab, closedAt: number): ClosedTab => ({
+    ownerId: tab.ownerId,
+    ownerType: tab.ownerType,
+    topicId: tab.topicId,
+    title: tab.title,
+    ownerName: tab.ownerName,
+    avatarColor: tab.avatarColor,
+    closedAt,
+  });
+
+  /** 记入最近关闭：单个关闭记单条（同身份旧单条去重）；asBatch 且多于 1 个时记为一批。 */
+  const recordClosed = (closed: OpenTab[], asBatch = false) => {
+    if (closed.length === 0) return;
+    const closedAt = Date.now();
+    if (asBatch && closed.length > 1) {
+      const batch: ClosedTabBatch = {
+        kind: "batch",
+        id: `batch-${closedAt.toString(36)}-${Math.random().toString(36).slice(2, 8)}`,
+        closedAt,
+        tabs: closed.slice(0, CLOSED_BATCH_TAB_LIMIT).map((tab) => toClosed(tab, closedAt)),
+      };
+      closedTabs.value = [batch, ...closedTabs.value].slice(0, CLOSED_TAB_HISTORY_LIMIT);
+      return;
+    }
+    const entries: ClosedTabEntry[] = closed.map((tab) => ({
+      kind: "tab",
+      ...toClosed(tab, closedAt),
+    }));
+    const keys = new Set(entries.map(openTabKey));
+    closedTabs.value = [
+      ...entries,
+      ...closedTabs.value.filter((entry) => entry.kind === "batch" || !keys.has(openTabKey(entry))),
+    ].slice(0, CLOSED_TAB_HISTORY_LIMIT);
+  };
+
+  /**
+   * 最近关闭（对齐 VCPChat menuEntries）：已打开的单条与子项不出现；
+   * 子项全部已打开的批次不出现，部分打开的只列未打开的子项并重算标题。
+   */
+  const recentlyClosed = computed<RecentlyClosedEntry[]>(() => {
+    const open = new Set(tabs.value.map(openTabKey));
+    const result: RecentlyClosedEntry[] = [];
+    for (const entry of closedTabs.value) {
+      if (entry.kind !== "batch") {
+        if (!open.has(openTabKey(entry))) result.push(entry);
+        continue;
+      }
+      const rest = entry.tabs.filter((tab) => !open.has(openTabKey(tab)));
+      if (rest.length) result.push({ ...entry, tabs: rest, title: closedBatchTitle(rest.length) });
+    }
+    return result;
+  });
+
+  const closedTitle = (key: string): string | null => {
+    for (const entry of closedTabs.value) {
+      const hit =
+        entry.kind === "batch"
+          ? entry.tabs.find((tab) => openTabKey(tab) === key)
+          : openTabKey(entry) === key
+            ? entry
+            : undefined;
+      if (hit) return hit.title;
+    }
+    return null;
+  };
+
+  const findBatch = (batchId: string) =>
+    closedTabs.value.find(
+      (entry): entry is ClosedTabBatch => entry.kind === "batch" && entry.id === batchId,
+    );
+
+  /** 从批次移除已恢复的子项；子项清空时整批移除（VCPChat saveBatchProgress 置 closedAt=0）。 */
+  const removeBatchChildren = (batchId: string, keys: Set<string>) => {
+    closedTabs.value = closedTabs.value.flatMap((entry): ClosedHistoryEntry[] => {
+      if (entry.kind !== "batch" || entry.id !== batchId) return [entry];
+      const rest = entry.tabs.filter((tab) => !keys.has(openTabKey(tab)));
+      return rest.length ? [{ ...entry, tabs: rest }] : [];
+    });
   };
 
   const findOwner = (ownerType: ConversationOwnerType, ownerId: string) => {
@@ -167,7 +368,7 @@ export const useOpenTabsStore = defineStore("openTabs", () => {
       // selectTopicById 只在 owner 不存在时抛错；列表尚未加载时不据此清理。
       console.warn("[OpenTabs] Failed to activate tab:", error);
       if (assistantStore.agents.length > 0 || assistantStore.groups.length > 0) {
-        removeWhere((tab) => sameOwner(tab, target.ownerId, target.ownerType));
+        pruneWhere((tab) => sameOwner(tab, target.ownerId, target.ownerType));
       }
       return false;
     }
@@ -223,10 +424,138 @@ export const useOpenTabsStore = defineStore("openTabs", () => {
     const index = indexOfTab(target);
     if (index < 0) return;
     const wasActive = isActive(target);
-    tabs.value.splice(index, 1);
+    recordClosed(tabs.value.splice(index, 1));
     if (wasActive && tabs.value.length > 0) {
       await activateTab(tabs.value[Math.min(index, tabs.value.length - 1)]);
     }
+  };
+
+  /** VCPChat「关闭其他」：保留目标并切过去，其余记入最近关闭。 */
+  const closeOtherTabs = async (target: OpenTabRef) => {
+    const index = indexOfTab(target);
+    if (index < 0 || tabs.value.length < 2) return;
+    const kept = tabs.value[index];
+    recordClosed(tabs.value.filter((_, i) => i !== index), true);
+    tabs.value = [kept];
+    if (!isActive(kept)) await activateTab(kept);
+  };
+
+  /** VCPChat「关闭全部」：全部记入最近关闭；当前会话不动（与关闭最后一个标签一致）。 */
+  const closeAllTabs = () => {
+    if (tabs.value.length === 0) return;
+    recordClosed(tabs.value, true);
+    tabs.value = [];
+  };
+
+  /**
+   * 批量挂标签：按顺序插到当前标签右侧，不激活、不触发生成，数量不设上限。
+   * 已打开的跳过；owner 在本机不存在的跳过（owner 列表未加载时不判定）。
+   */
+  const openTabsInBackground = (
+    items: Array<OpenTabRef & Partial<Omit<OpenTab, keyof OpenTabRef>>>,
+  ) => {
+    const opened: OpenTab[] = [];
+    const alreadyOpen: OpenTabRef[] = [];
+    const missing: OpenTabRef[] = [];
+    const ownersLoaded = assistantStore.agents.length > 0 || assistantStore.groups.length > 0;
+    let slot = indexOfKey(activeTabKey.value);
+    for (const item of items) {
+      if (indexOfTab(item) >= 0) {
+        alreadyOpen.push(item);
+        continue;
+      }
+      const owner = findOwner(item.ownerType, item.ownerId);
+      if (!owner && ownersLoaded) {
+        missing.push(item);
+        continue;
+      }
+      const [normalized] = normalizeOpenTabs([
+        {
+          ...item,
+          ownerName: item.ownerName || owner?.name || "",
+          avatarColor: item.avatarColor ?? owner?.avatarCalculatedColor ?? null,
+        },
+      ]);
+      if (!normalized) {
+        missing.push(item);
+        continue;
+      }
+      const at = slot >= 0 ? slot + 1 : tabs.value.length;
+      tabs.value.splice(at, 0, normalized);
+      if (slot >= 0) slot = at;
+      opened.push(normalized);
+    }
+    return { opened, alreadyOpen, missing };
+  };
+
+  /** 最近关闭 · 单条恢复：本机新开（已开则切换），成功后移出历史。 */
+  const restoreClosed = async (target: OpenTabRef) => {
+    const key = openTabKey(target);
+    const entry = closedTabs.value.find(
+      (item): item is ClosedTabEntry => item.kind === "tab" && openTabKey(item) === key,
+    );
+    const opened = await openInNewTab(
+      entry ? pickTab(entry) : { ownerId: target.ownerId, ownerType: target.ownerType, topicId: target.topicId },
+    );
+    if (opened) {
+      closedTabs.value = closedTabs.value.filter(
+        (item) => item.kind === "batch" || openTabKey(item) !== key,
+      );
+    }
+    return opened;
+  };
+
+  /** 批次 · 恢复单个子项（VCPChat 子项恢复 + saveBatchProgress）。 */
+  const restoreClosedBatchChild = async (batchId: string, target: OpenTabRef) => {
+    const key = openTabKey(target);
+    const child = findBatch(batchId)?.tabs.find((tab) => openTabKey(tab) === key);
+    if (!child) return false;
+    const opened = await openInNewTab(pickTab(child));
+    if (opened) removeBatchChildren(batchId, new Set([key]));
+    return opened;
+  };
+
+  /** 批次 · 整批恢复：子项按原顺序挂上（不逐个激活），随后激活第一项；恢复的子项移出批次。 */
+  const restoreClosedBatch = async (batchId: string) => {
+    const batch = findBatch(batchId);
+    if (!batch) return { opened: 0, skipped: 0, activated: false };
+    const result = openTabsInBackground(batch.tabs.map(pickTab));
+    const restored = new Set([...result.opened, ...result.alreadyOpen].map(openTabKey));
+    removeBatchChildren(batchId, restored);
+    const first = batch.tabs.find((tab) => restored.has(openTabKey(tab)));
+    const activated = first ? await activateTab(first) : false;
+    return { opened: result.opened.length, skipped: result.missing.length, activated };
+  };
+
+  /** 标签菜单「重命名话题」：走 topicStore.updateTopicTitle（与话题长按「修改标题」同一入口）。 */
+  const renameTab = async (target: OpenTabRef, title: string) => {
+    const next = title.trim();
+    if (!next) return false;
+    const result = await topicStore.updateTopicTitle(
+      target.ownerId,
+      target.ownerType,
+      target.topicId,
+      next,
+    );
+    if (result === false) return false;
+    // 非当前 owner 时 topicStore 不更新列表，标签标题在这里补上。
+    const index = indexOfTab(target);
+    if (index >= 0) replaceAt(index, { ...tabs.value[index], title: next });
+    return true;
+  };
+
+  /** 本地已知的话题名（当前话题列表、标签、关闭历史）；查不到返回 null。 */
+  const knownTitle = (target: OpenTabRef): string | null => {
+    const key = openTabKey(target);
+    const topic = topicStore.topics.find(
+      (item) => openTabKey({ ...item, topicId: item.id }) === key,
+    );
+    if (topic?.name) return topic.name;
+    return (
+      tabs.value.find((tab) => openTabKey(tab) === key)?.title ??
+      closedTitle(key) ??
+      null
+    );
   };
 
   const moveTab = (from: number, to: number) => {
@@ -241,6 +570,7 @@ export const useOpenTabsStore = defineStore("openTabs", () => {
   /** 持久化恢复后调用：校验数据并补上当前会话。 */
   const sanitizeTabs = () => {
     tabs.value = normalizeOpenTabs(tabs.value);
+    closedTabs.value = normalizeClosedTabs(closedTabs.value);
     // 旧持久化数据没有 activeTabKey：以当前会话所在标签为准。
     if (indexOfKey(activeKey.value) >= 0) {
       activeTabKey.value = activeKey.value;
@@ -306,14 +636,14 @@ export const useOpenTabsStore = defineStore("openTabs", () => {
             .filter((topic) => sameOwner(topic, ownerId, ownerType))
             .map((topic) => topic.id),
         );
-        removeWhere((tab) => sameOwner(tab, ownerId, ownerType) && !live.has(tab.topicId));
+        pruneWhere((tab) => sameOwner(tab, ownerId, ownerType) && !live.has(tab.topicId));
       });
       return;
     }
     if (name === "deleteTopic") {
       const [ownerId, ownerType, topicId] = args as [string, string, string];
       after(() =>
-        removeWhere((tab) => sameOwner(tab, ownerId, ownerType) && tab.topicId === topicId),
+        pruneWhere((tab) => sameOwner(tab, ownerId, ownerType) && tab.topicId === topicId),
       );
       return;
     }
@@ -333,7 +663,7 @@ export const useOpenTabsStore = defineStore("openTabs", () => {
     if (name === "deleteAgent" || name === "deleteGroup") {
       const [ownerId] = args as [string];
       const ownerType: ConversationOwnerType = name === "deleteAgent" ? "agent" : "group";
-      after(() => removeWhere((tab) => sameOwner(tab, ownerId, ownerType)));
+      after(() => pruneWhere((tab) => sameOwner(tab, ownerId, ownerType)));
       return;
     }
     if (name === "fetchAgentsAndGroups") {
@@ -342,7 +672,7 @@ export const useOpenTabsStore = defineStore("openTabs", () => {
         // 被后续快照覆盖或列表为空（未加载/加载被作废）时不清理，避免误删全部标签。
         if (epoch !== snapshotEpoch) return;
         if (assistantStore.agents.length === 0 && assistantStore.groups.length === 0) return;
-        removeWhere((tab) => !findOwner(tab.ownerType, tab.ownerId));
+        pruneWhere((tab) => !findOwner(tab.ownerType, tab.ownerId));
         tabs.value.forEach((tab, index) => {
           const owner = findOwner(tab.ownerType, tab.ownerId);
           if (!owner) return;
@@ -358,6 +688,12 @@ export const useOpenTabsStore = defineStore("openTabs", () => {
 
   return {
     tabs,
+    closedTabs,
+    recentlyClosed,
+    openTabsInBackground,
+    restoreClosed,
+    restoreClosedBatch,
+    restoreClosedBatchChild,
     activeKey,
     activeTabKey,
     openTab,
@@ -365,12 +701,16 @@ export const useOpenTabsStore = defineStore("openTabs", () => {
     openInNewTab,
     openNewEmptyTab,
     closeTab,
+    closeOtherTabs,
+    closeAllTabs,
+    renameTab,
+    knownTitle,
     moveTab,
     sanitizeTabs,
   };
 }, {
   persist: {
-    pick: ["tabs", "activeTabKey"],
+    pick: ["tabs", "activeTabKey", "closedTabs"],
     afterHydrate: (context) => {
       (context.store as unknown as { sanitizeTabs: () => void }).sanitizeTabs();
     },
