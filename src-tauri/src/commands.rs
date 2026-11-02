@@ -104,6 +104,7 @@ macro_rules! app_command_handler {
             clear_old_sync_logs, list_sync_log_files, prepare_sync_log_share_file,
             read_sync_log_file, start_manual_sync, stop_sync,
         };
+        use crate::vcp_modules::sync::sync_hint::{sync_hint_cancel, sync_hint_wait};
         use crate::vcp_modules::taskcenter::{
             delegation_cancel, delegation_list, task_agent_list, task_create, task_delete,
             task_get_config, task_get_status, task_set_enabled, task_set_global_enabled,
@@ -342,6 +343,8 @@ macro_rules! app_command_handler {
                 read_sync_log_file,
                 start_manual_sync,
                 stop_sync,
+                sync_hint_cancel,
+                sync_hint_wait,
                 // ── 分布式（distributed；reconcile 寄居 lifecycle_manager）──
                 distributed::execute_distributed_tool,
                 distributed::get_distributed_status,

@@ -3,6 +3,7 @@ import { listen, type UnlistenFn } from '@tauri-apps/api/event';
 import { useAppLifecycleStore } from '../stores/appLifecycle';
 import { useChatStreamStore } from '../stores/chatStreamStore';
 import { requestAutoSync } from '../sync/autoSyncTrigger';
+import { useRemoteChangeHint } from '../sync/remoteChangeHint';
 import { isIOS } from '../utils/platform';
 import type { LifecycleSnapshotDto } from '../types/lifecycle';
 
@@ -59,6 +60,14 @@ export function useAppLifecycle() {
     }
   });
 
+  // 电脑端数据变化提示：仅前台时长轮询；切后台中止在途请求，回前台续订。
+  const disposeRemoteHint = useRemoteChangeHint(() => {
+    if (documentHidden.value) return false;
+    const phase = lifecycleStore.lifecycleSnapshot?.phase;
+    if (isIOS && !phase) return false;
+    return !phase || phase === 'active';
+  });
+
   const handleVisibilityChange = () => {
     if (typeof document !== 'undefined') {
       documentHidden.value = document.hidden;
@@ -108,6 +117,7 @@ export function useAppLifecycle() {
 
   onUnmounted(() => {
     disposed = true;
+    disposeRemoteHint();
     if (typeof window !== 'undefined') {
       document.removeEventListener("visibilitychange", handleVisibilityChange);
       window.removeEventListener("online", handleOnline);
