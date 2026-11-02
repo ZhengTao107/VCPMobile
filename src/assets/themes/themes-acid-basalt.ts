@@ -1,0 +1,88 @@
+export const meta = {
+  fileName: 'themes-acid-basalt.css',
+  name: '酸性玄武',
+};
+
+export const variables = {
+  dark: {
+  "--chat-wallpaper-dark": "'vcp_acid_basalt_dark.webp'",
+  "--primary-bg": "#0D1013",
+  "--secondary-bg": "#15191F",
+  "--tertiary-bg": "#0D1013",
+  "--accent-bg": "#1F252E",
+  "--border-color": "#2B3441",
+  "--input-bg": "#14181E",
+  "--panel-bg-dark": "rgba(21, 25, 31, 0.86)",
+  "--primary-text": "#F0F4F8",
+  "--secondary-text": "#8C96A5",
+  "--highlight-text": "#D4FF00",
+  "--text-on-accent": "#0D1013",
+  "--placeholder-text": "#606B7B",
+  "--quoted-text": "#00E5FF",
+  "--user-text": "#F0F4F8",
+  "--agent-text": "#F0F4F8",
+  "--user-bubble-bg": "rgba(97, 117, 19, 0.9)",
+  "--assistant-bubble-bg": "rgba(21, 25, 31, 0.84)",
+  "--button-bg": "#D4FF00",
+  "--button-hover-bg": "#E2FF4D",
+  "--danger-color": "#FF4D4D",
+  "--danger-hover-bg": "#FF6666",
+  "--success-color": "#00E5FF",
+  "--notification-bg": "rgba(21, 25, 31, 0.94)",
+  "--notification-header-bg": "rgba(31, 37, 46, 0.94)",
+  "--notification-border": "#2B3441",
+  "--tool-bubble-bg": "rgba(0, 229, 255, 0.08)",
+  "--tool-bubble-border": "rgba(0, 229, 255, 0.55)",
+  "--scrollbar-track": "rgba(13, 16, 19, 0.55)",
+  "--scrollbar-thumb": "rgba(212, 255, 0, 0.52)",
+  "--scrollbar-thumb-hover": "rgba(212, 255, 0, 0.82)",
+  "--shimmer-color-transparent": "rgba(212, 255, 0, 0.06)",
+  "--shimmer-color-highlight": "rgba(212, 255, 0, 0.42)",
+  "--panel-text-shadow": "0 1px 3px rgba(0, 0, 0, 0.75)",
+  "--panel-bg": "var(--panel-bg-dark)"
+},
+  light: {
+  "--chat-wallpaper-light": "'vcp_sterile_lab_light.webp'",
+  "--primary-bg": "#F4F6F9",
+  "--secondary-bg": "#FFFFFF",
+  "--tertiary-bg": "#EAEFF5",
+  "--accent-bg": "#E1E7EF",
+  "--border-color": "#CBD5E1",
+  "--input-bg": "#FEFEFF",
+  "--panel-bg-light": "rgba(255, 255, 255, 0.88)",
+  "--primary-text": "#0F172A",
+  "--secondary-text": "#475569",
+  "--highlight-text": "#709600",
+  "--text-on-accent": "#0F172A",
+  "--placeholder-text": "#94A3B8",
+  "--quoted-text": "#00838F",
+  "--user-text": "#0F172A",
+  "--agent-text": "#0F172A",
+  "--user-bubble-bg": "rgba(224, 255, 102, 0.9)",
+  "--assistant-bubble-bg": "rgba(255, 255, 255, 0.90)",
+  "--button-bg": "#CCFF00",
+  "--button-hover-bg": "#B8E600",
+  "--danger-color": "#EF4444",
+  "--danger-hover-bg": "#DC2626",
+  "--success-color": "#00838F",
+  "--notification-bg": "rgba(255, 255, 255, 0.95)",
+  "--notification-header-bg": "rgba(241, 245, 249, 0.95)",
+  "--notification-border": "#CBD5E1",
+  "--tool-bubble-bg": "rgba(0, 131, 143, 0.08)",
+  "--tool-bubble-border": "rgba(0, 131, 143, 0.45)",
+  "--scrollbar-track": "rgba(203, 213, 225, 0.48)",
+  "--scrollbar-thumb": "rgba(112, 150, 0, 0.48)",
+  "--scrollbar-thumb-hover": "rgba(112, 150, 0, 0.78)",
+  "--shimmer-color-transparent": "rgba(112, 150, 0, 0.05)",
+  "--shimmer-color-highlight": "rgba(112, 150, 0, 0.32)",
+  "--panel-text-shadow": "0 1px 0 rgba(255, 255, 255, 0.6)",
+  "--panel-bg": "var(--panel-bg-light)"
+},
+};
+
+export const extraCss = `
+.tool-bubble {
+    border: 1px solid var(--tool-bubble-border);
+    background: var(--tool-bubble-bg);
+}
+`;

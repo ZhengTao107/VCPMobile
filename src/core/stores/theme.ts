@@ -81,7 +81,16 @@ const LEGACY_THEME_MAP: Record<string, string> = {
   'themes星渊雪境.css': 'themes-star-abyss.css',
   'themes熊熊假日.css': 'themes-bear-holiday.css',
   'themes雪境晨昏.css': 'themes-snow-morning.css',
-  'themes夜樱猫语.css': 'themes-night-sakura-cat.css'
+  'themes夜樱猫语.css': 'themes-night-sakura-cat.css',
+  'themesCodeIDE.css': 'themes-code-ide.css',
+  'themesEva.css': 'themes-eva.css',
+  'themes赤与白昼.css': 'themes-red-white-daylight.css',
+  'themes第一适格者.css': 'themes-first-children.css',
+  'themes黑曜与星火.css': 'themes-obsidian-starfire.css',
+  'themes极简Aero.css': 'themes-minimal-aero.css',
+  'themes酸性玄武.css': 'themes-acid-basalt.css',
+  'themes月影春信.css': 'themes-moon-spring.css',
+  'themes纸墨与机芯.css': 'themes-paper-ink-clockwork.css'
 };
 
 interface ThemeModule {

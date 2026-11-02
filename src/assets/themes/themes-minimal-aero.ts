@@ -1,0 +1,88 @@
+export const meta = {
+  fileName: 'themes-minimal-aero.css',
+  name: '极简Aero',
+};
+
+export const variables = {
+  dark: {
+  "--chat-wallpaper-dark": "none",
+  "--primary-bg": "#252a30",
+  "--secondary-bg": "#30363d",
+  "--tertiary-bg": "#2a3037",
+  "--accent-bg": "#39434c",
+  "--border-color": "#46515c",
+  "--input-bg": "#2B3138",
+  "--panel-bg-dark": "#30363d",
+  "--primary-text": "#edf4f8",
+  "--secondary-text": "#aab7c1",
+  "--highlight-text": "#76b9e6",
+  "--text-on-accent": "#10212d",
+  "--placeholder-text": "#81909b",
+  "--quoted-text": "#8bc8ef",
+  "--user-text": "#edf4f8",
+  "--agent-text": "#edf4f8",
+  "--user-bubble-bg": "#3a4650",
+  "--assistant-bubble-bg": "#343b43",
+  "--button-bg": "#76b9e6",
+  "--button-hover-bg": "#91c9ed",
+  "--danger-color": "#ef7b86",
+  "--danger-hover-bg": "#d96672",
+  "--success-color": "#79c99e",
+  "--notification-bg": "#30363d",
+  "--notification-header-bg": "#39434c",
+  "--notification-border": "#76b9e6",
+  "--tool-bubble-bg": "#35414a",
+  "--tool-bubble-border": "#668aa2",
+  "--scrollbar-track": "#2a3037",
+  "--scrollbar-thumb": "#566572",
+  "--scrollbar-thumb-hover": "#718493",
+  "--shimmer-color-transparent": "#52616d",
+  "--shimmer-color-highlight": "#91c9ed",
+  "--panel-text-shadow": "none",
+  "--panel-bg": "#30363d"
+},
+  light: {
+  "--chat-wallpaper-light": "none",
+  "--primary-bg": "#edf1f5",
+  "--secondary-bg": "#ffffff",
+  "--tertiary-bg": "#f5f7f9",
+  "--accent-bg": "#dce5ec",
+  "--border-color": "#cbd6df",
+  "--input-bg": "#FFFFFF",
+  "--panel-bg-light": "#ffffff",
+  "--primary-text": "#22303a",
+  "--secondary-text": "#667784",
+  "--highlight-text": "#397da8",
+  "--text-on-accent": "#ffffff",
+  "--placeholder-text": "#92a0aa",
+  "--quoted-text": "#397da8",
+  "--user-text": "#22303a",
+  "--agent-text": "#22303a",
+  "--user-bubble-bg": "#e2edf4",
+  "--assistant-bubble-bg": "#f4f7f9",
+  "--button-bg": "#4f91ba",
+  "--button-hover-bg": "#397da8",
+  "--danger-color": "#cf5663",
+  "--danger-hover-bg": "#b94350",
+  "--success-color": "#39936b",
+  "--notification-bg": "#f5f7f9",
+  "--notification-header-bg": "#e7eef3",
+  "--notification-border": "#4f91ba",
+  "--tool-bubble-bg": "#edf3f7",
+  "--tool-bubble-border": "#8aaabd",
+  "--scrollbar-track": "#e7edf1",
+  "--scrollbar-thumb": "#b5c4ce",
+  "--scrollbar-thumb-hover": "#91a7b5",
+  "--shimmer-color-transparent": "#c8d4dc",
+  "--shimmer-color-highlight": "#ffffff",
+  "--panel-text-shadow": "none",
+  "--panel-bg": "#ffffff"
+},
+};
+
+export const extraCss = `
+.tool-bubble {
+    border: 1px solid var(--tool-bubble-border);
+    background: var(--tool-bubble-bg);
+}
+`;

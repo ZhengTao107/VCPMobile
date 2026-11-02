@@ -103,6 +103,8 @@ describe('theme and chat presentation store contracts', () => {
   it('normalizes legacy CSS theme identities to the compiled TS module key', () => {
     expect(normalizeThemeModuleKey('themes-bear-holiday.css')).toBe('themes-bear-holiday.ts');
     expect(normalizeThemeModuleKey('themes熊熊假日.css')).toBe('themes-bear-holiday.ts');
+    expect(normalizeThemeModuleKey('themesCodeIDE.css')).toBe('themes-code-ide.ts');
+    expect(normalizeThemeModuleKey('themes纸墨与机芯.css')).toBe('themes-paper-ink-clockwork.ts');
     expect(normalizeThemeModuleKey('themes-bear-holiday.ts')).toBe('themes-bear-holiday.ts');
     expect(normalizeThemeModuleKey('../themes-bear-holiday.ts')).toBeNull();
     expect(normalizeThemeModuleKey('https://example.com/theme.ts')).toBeNull();
@@ -166,7 +168,7 @@ describe('theme and chat presentation store contracts', () => {
     const store = useThemeStore();
     await store.fetchThemes();
 
-    expect(store.availableThemes).toHaveLength(13);
+    expect(store.availableThemes).toHaveLength(22);
     expect(store.availableThemes.every((theme) => theme.fileName.endsWith('.ts'))).toBe(true);
     store.$dispose();
   });
