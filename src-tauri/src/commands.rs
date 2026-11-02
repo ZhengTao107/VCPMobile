@@ -110,6 +110,7 @@ macro_rules! app_command_handler {
             canvas_push, canvas_wait, canvas_wait_cancel,
         };
         use crate::vcp_modules::sync::open_tabs::{open_tabs_get, open_tabs_put};
+        use crate::vcp_modules::sync::settings_sync::{settings_sync_get, settings_sync_put};
         use crate::vcp_modules::sync::sync_hint::{sync_hint_cancel, sync_hint_wait};
         use crate::vcp_modules::taskcenter::{
             delegation_cancel, delegation_list, task_agent_list, task_create, task_delete,
@@ -353,6 +354,8 @@ macro_rules! app_command_handler {
                 sync_hint_wait,
                 open_tabs_get,
                 open_tabs_put,
+                settings_sync_get,
+                settings_sync_put,
                 canvas_manifest,
                 canvas_pull,
                 canvas_push,
