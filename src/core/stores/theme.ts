@@ -68,7 +68,7 @@ const THEME_NAME_STORAGE_KEY = 'vcp-theme-name';
 const PRESENTATION_STORAGE_KEY = 'vcp-chat-presentation-mode';
 const SMOOTH_STREAMING_STORAGE_KEY = 'vcp-smooth-streaming-enabled';
 
-const LEGACY_THEME_MAP: Record<string, string> = {
+export const LEGACY_THEME_MAP: Readonly<Record<string, string>> = {
   'themes冰火魔歌.css': 'themes-ice-fire.css',
   'themes瓷与锦.css': 'themes-porcelain-brocade.css',
   'themes绯红天穹.css': 'themes-crimson-sky.css',
