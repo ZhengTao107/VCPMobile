@@ -95,6 +95,29 @@ pub async fn init_db(app_handle: &AppHandle) -> Result<(Pool<Sqlite>, std::path:
         .pragma("cache_size", "-8000")
         .pragma("foreign_keys", "1");
 
+    // [fork ptp4g#32] 首次全量后库可达数百 MB，下方 quick_check 在真机上实测约 26s，
+    // 超过前端 15s 就绪等待；与 VACUUM 路径一致先上报 optimizing，前端据此暂停超时。
+    if db_path.exists() {
+        let lifecycle =
+            app_handle.state::<crate::vcp_modules::infra::lifecycle_state::LifecycleState>();
+        {
+            let mut status_lock = lifecycle.status.write().await;
+            *status_lock = crate::vcp_modules::infra::lifecycle_state::CoreStatus::Optimizing;
+            let mut msg_lock = lifecycle.status_message.write().await;
+            *msg_lock = "正在检查数据库完整性...".to_string();
+        }
+
+        let _ = app_handle.emit(
+            "vcp-system-event",
+            serde_json::json!({
+                "type": "vcp-core-status",
+                "status": "optimizing",
+                "message": "正在检查数据库完整性...",
+                "source": "Core"
+            }),
+        );
+    }
+
     let pool = match open_and_check_db(&connect_options, &db_path).await {
         Ok(p) => p,
         Err(DbOpenFailure::Unavailable(e)) => {
