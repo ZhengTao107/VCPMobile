@@ -59,6 +59,42 @@ export const normalizeOpenTabs = (value: unknown): OpenTab[] => {
   return result;
 };
 
+/** 最近关闭历史上限：照抄 VCPChat tab-history-controller.js（entries `.slice(0, 100)`）。 */
+export const CLOSED_TAB_HISTORY_LIMIT = 100;
+
+export interface ClosedTab extends OpenTabRef {
+  title: string;
+  ownerName: string;
+  avatarColor: string | null;
+  closedAt: number;
+}
+
+/** 校验持久化的关闭历史：身份不完整的丢弃，按身份去重（保留靠前的较新条目），截到上限。 */
+export const normalizeClosedTabs = (value: unknown): ClosedTab[] => {
+  if (!Array.isArray(value)) return [];
+  const seen = new Set<string>();
+  const result: ClosedTab[] = [];
+  for (const raw of value) {
+    const [tab] = normalizeOpenTabs([raw]);
+    if (!tab) continue;
+    const key = openTabKey(tab);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    const closedAt = Number((raw as Record<string, unknown>).closedAt);
+    result.push({
+      ownerId: tab.ownerId,
+      ownerType: tab.ownerType,
+      topicId: tab.topicId,
+      title: tab.title,
+      ownerName: tab.ownerName,
+      avatarColor: tab.avatarColor,
+      closedAt: Number.isFinite(closedAt) && closedAt > 0 ? closedAt : 0,
+    });
+    if (result.length >= CLOSED_TAB_HISTORY_LIMIT) break;
+  }
+  return result;
+};
+
 const sameTab = (a: OpenTab, b: OpenTab) =>
   a.title === b.title &&
   a.ownerName === b.ownerName &&
@@ -79,6 +115,8 @@ export const useOpenTabsStore = defineStore("openTabs", () => {
   const tabs = ref<OpenTab[]>([]);
   /** 标签栏中的当前槽位；随持久化保存。会话为空时仍保留，供下一次选择原位替换。 */
   const activeTabKey = ref<string | null>(null);
+  /** 显式关闭的标签，新的在前；持久化。话题或 owner 被删除时同步移除。 */
+  const closedTabs = ref<ClosedTab[]>([]);
   const indexOfKey = (key: string | null) =>
     key ? tabs.value.findIndex((tab) => openTabKey(tab) === key) : -1;
 
@@ -106,6 +144,39 @@ export const useOpenTabsStore = defineStore("openTabs", () => {
     if (!tabs.value.some(predicate)) return;
     tabs.value = tabs.value.filter((tab) => !predicate(tab));
   };
+
+  /** 话题或 owner 已不存在：标签与关闭历史一起清理。 */
+  const pruneWhere = (predicate: (tab: OpenTabRef) => boolean) => {
+    removeWhere(predicate);
+    if (closedTabs.value.some(predicate)) {
+      closedTabs.value = closedTabs.value.filter((tab) => !predicate(tab));
+    }
+  };
+
+  const recordClosed = (closed: OpenTab[]) => {
+    if (closed.length === 0) return;
+    const closedAt = Date.now();
+    const entries: ClosedTab[] = closed.map((tab) => ({
+      ownerId: tab.ownerId,
+      ownerType: tab.ownerType,
+      topicId: tab.topicId,
+      title: tab.title,
+      ownerName: tab.ownerName,
+      avatarColor: tab.avatarColor,
+      closedAt,
+    }));
+    const keys = new Set(entries.map(openTabKey));
+    closedTabs.value = [
+      ...entries,
+      ...closedTabs.value.filter((entry) => !keys.has(openTabKey(entry))),
+    ].slice(0, CLOSED_TAB_HISTORY_LIMIT);
+  };
+
+  /** 最近关闭（对齐 VCPChat 历史菜单）：已打开的不出现。 */
+  const recentlyClosed = computed(() => {
+    const open = new Set(tabs.value.map(openTabKey));
+    return closedTabs.value.filter((entry) => !open.has(openTabKey(entry)));
+  });
 
   const findOwner = (ownerType: ConversationOwnerType, ownerId: string) => {
     const owner =
@@ -167,7 +238,7 @@ export const useOpenTabsStore = defineStore("openTabs", () => {
       // selectTopicById 只在 owner 不存在时抛错；列表尚未加载时不据此清理。
       console.warn("[OpenTabs] Failed to activate tab:", error);
       if (assistantStore.agents.length > 0 || assistantStore.groups.length > 0) {
-        removeWhere((tab) => sameOwner(tab, target.ownerId, target.ownerType));
+        pruneWhere((tab) => sameOwner(tab, target.ownerId, target.ownerType));
       }
       return false;
     }
@@ -223,10 +294,58 @@ export const useOpenTabsStore = defineStore("openTabs", () => {
     const index = indexOfTab(target);
     if (index < 0) return;
     const wasActive = isActive(target);
-    tabs.value.splice(index, 1);
+    recordClosed(tabs.value.splice(index, 1));
     if (wasActive && tabs.value.length > 0) {
       await activateTab(tabs.value[Math.min(index, tabs.value.length - 1)]);
     }
+  };
+
+  /** VCPChat「关闭其他」：保留目标并切过去，其余记入最近关闭。 */
+  const closeOtherTabs = async (target: OpenTabRef) => {
+    const index = indexOfTab(target);
+    if (index < 0 || tabs.value.length < 2) return;
+    const kept = tabs.value[index];
+    recordClosed(tabs.value.filter((_, i) => i !== index));
+    tabs.value = [kept];
+    if (!isActive(kept)) await activateTab(kept);
+  };
+
+  /** VCPChat「关闭全部」：全部记入最近关闭；当前会话不动（与关闭最后一个标签一致）。 */
+  const closeAllTabs = () => {
+    if (tabs.value.length === 0) return;
+    recordClosed(tabs.value);
+    tabs.value = [];
+  };
+
+  /** 标签菜单「重命名话题」：走 topicStore.updateTopicTitle（与话题长按「修改标题」同一入口）。 */
+  const renameTab = async (target: OpenTabRef, title: string) => {
+    const next = title.trim();
+    if (!next) return false;
+    const result = await topicStore.updateTopicTitle(
+      target.ownerId,
+      target.ownerType,
+      target.topicId,
+      next,
+    );
+    if (result === false) return false;
+    // 非当前 owner 时 topicStore 不更新列表，标签标题在这里补上。
+    const index = indexOfTab(target);
+    if (index >= 0) replaceAt(index, { ...tabs.value[index], title: next });
+    return true;
+  };
+
+  /** 本地已知的话题名（当前话题列表、标签、关闭历史）；查不到返回 null。 */
+  const knownTitle = (target: OpenTabRef): string | null => {
+    const key = openTabKey(target);
+    const topic = topicStore.topics.find(
+      (item) => openTabKey({ ...item, topicId: item.id }) === key,
+    );
+    if (topic?.name) return topic.name;
+    return (
+      tabs.value.find((tab) => openTabKey(tab) === key)?.title ??
+      closedTabs.value.find((entry) => openTabKey(entry) === key)?.title ??
+      null
+    );
   };
 
   const moveTab = (from: number, to: number) => {
@@ -241,6 +360,7 @@ export const useOpenTabsStore = defineStore("openTabs", () => {
   /** 持久化恢复后调用：校验数据并补上当前会话。 */
   const sanitizeTabs = () => {
     tabs.value = normalizeOpenTabs(tabs.value);
+    closedTabs.value = normalizeClosedTabs(closedTabs.value);
     // 旧持久化数据没有 activeTabKey：以当前会话所在标签为准。
     if (indexOfKey(activeKey.value) >= 0) {
       activeTabKey.value = activeKey.value;
@@ -306,14 +426,14 @@ export const useOpenTabsStore = defineStore("openTabs", () => {
             .filter((topic) => sameOwner(topic, ownerId, ownerType))
             .map((topic) => topic.id),
         );
-        removeWhere((tab) => sameOwner(tab, ownerId, ownerType) && !live.has(tab.topicId));
+        pruneWhere((tab) => sameOwner(tab, ownerId, ownerType) && !live.has(tab.topicId));
       });
       return;
     }
     if (name === "deleteTopic") {
       const [ownerId, ownerType, topicId] = args as [string, string, string];
       after(() =>
-        removeWhere((tab) => sameOwner(tab, ownerId, ownerType) && tab.topicId === topicId),
+        pruneWhere((tab) => sameOwner(tab, ownerId, ownerType) && tab.topicId === topicId),
       );
       return;
     }
@@ -333,7 +453,7 @@ export const useOpenTabsStore = defineStore("openTabs", () => {
     if (name === "deleteAgent" || name === "deleteGroup") {
       const [ownerId] = args as [string];
       const ownerType: ConversationOwnerType = name === "deleteAgent" ? "agent" : "group";
-      after(() => removeWhere((tab) => sameOwner(tab, ownerId, ownerType)));
+      after(() => pruneWhere((tab) => sameOwner(tab, ownerId, ownerType)));
       return;
     }
     if (name === "fetchAgentsAndGroups") {
@@ -342,7 +462,7 @@ export const useOpenTabsStore = defineStore("openTabs", () => {
         // 被后续快照覆盖或列表为空（未加载/加载被作废）时不清理，避免误删全部标签。
         if (epoch !== snapshotEpoch) return;
         if (assistantStore.agents.length === 0 && assistantStore.groups.length === 0) return;
-        removeWhere((tab) => !findOwner(tab.ownerType, tab.ownerId));
+        pruneWhere((tab) => !findOwner(tab.ownerType, tab.ownerId));
         tabs.value.forEach((tab, index) => {
           const owner = findOwner(tab.ownerType, tab.ownerId);
           if (!owner) return;
@@ -358,6 +478,8 @@ export const useOpenTabsStore = defineStore("openTabs", () => {
 
   return {
     tabs,
+    closedTabs,
+    recentlyClosed,
     activeKey,
     activeTabKey,
     openTab,
@@ -365,12 +487,16 @@ export const useOpenTabsStore = defineStore("openTabs", () => {
     openInNewTab,
     openNewEmptyTab,
     closeTab,
+    closeOtherTabs,
+    closeAllTabs,
+    renameTab,
+    knownTitle,
     moveTab,
     sanitizeTabs,
   };
 }, {
   persist: {
-    pick: ["tabs", "activeTabKey"],
+    pick: ["tabs", "activeTabKey", "closedTabs"],
     afterHydrate: (context) => {
       (context.store as unknown as { sanitizeTabs: () => void }).sanitizeTabs();
     },

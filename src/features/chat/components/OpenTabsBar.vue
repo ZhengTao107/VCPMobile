@@ -1,7 +1,9 @@
 <script setup lang="ts">
-import { computed, nextTick, ref, watch } from "vue";
-import { Loader2, Plus, X } from "lucide-vue-next";
+import { computed, nextTick, onUnmounted, ref, watch } from "vue";
+import { Ellipsis, Loader2, Plus, X } from "lucide-vue-next";
 import VcpAvatar from "../../../components/ui/VcpAvatar.vue";
+import OpenTabsPanel from "./OpenTabsPanel.vue";
+import { buildTabMenuActions } from "./openTabsMenu";
 import {
   openTabKey,
   useOpenTabsStore,
@@ -9,12 +11,21 @@ import {
 } from "../../../core/stores/openTabsStore";
 import { useChatStreamStore } from "../../../core/stores/chatStreamStore";
 import { useChatSessionStore } from "../../../core/stores/chatSessionStore";
+import { useOverlayStore } from "../../../core/stores/overlay";
+import { useNotificationStore } from "../../../core/stores/notification";
+import { useOpenTabsRemote } from "../../../core/sync/openTabsRemote";
 
 const tabsStore = useOpenTabsStore();
 const streamStore = useChatStreamStore();
 const sessionStore = useChatSessionStore();
+const overlayStore = useOverlayStore();
+const notificationStore = useNotificationStore();
 const scrollerRef = ref<HTMLElement | null>(null);
 const creating = ref(false);
+const panelOpen = ref(false);
+// 三端互看：标签栏在时上报本机标签，并供「⋯」面板读取其他设备。
+const { remote, release } = useOpenTabsRemote();
+onUnmounted(release);
 
 const currentOwner = computed(() => {
   const item = sessionStore.currentSelectedItem;
@@ -59,6 +70,24 @@ const avatarTarget = (tab: OpenTab) => ({
   avatarCalculatedColor: tab.avatarColor,
 });
 
+/** 长按标签：对齐 VCPChat 标签右键菜单。 */
+const showTabMenu = (tab: OpenTab) => {
+  overlayStore.openContextMenu(
+    buildTabMenuActions(tab, {
+      tabCount: tabsStore.tabs.length,
+      closeTab: tabsStore.closeTab,
+      closeOtherTabs: tabsStore.closeOtherTabs,
+      closeAllTabs: tabsStore.closeAllTabs,
+      renameTab: tabsStore.renameTab,
+      openPrompt: overlayStore.openPrompt,
+      copyText: (text) => navigator.clipboard.writeText(text),
+      notify: (type, title, message) =>
+        notificationStore.addNotification({ type, title, message, toastOnly: true }),
+    }),
+    labelOf(tab),
+  );
+};
+
 // 当前标签切换后滚入可视区。
 watch(
   () => tabsStore.activeKey,
@@ -74,11 +103,12 @@ watch(
 </script>
 
 <template>
-  <nav v-if="items.length > 1" class="open-tabs-bar shrink-0 border-b border-white/5"
+  <nav v-if="items.length > 0" class="open-tabs-bar shrink-0 border-b border-white/5 flex items-center"
     aria-label="已打开的话题">
     <div ref="scrollerRef" role="tablist"
-      class="open-tabs-scroller overflow-x-auto no-swipe flex items-center gap-2 px-3 py-1.5">
+      class="open-tabs-scroller flex-1 min-w-0 overflow-x-auto no-swipe flex items-center gap-2 pl-3 pr-1 py-1.5">
       <div v-for="item in items" :key="item.key" :data-tab-key="item.key"
+        v-longpress.suppress-click="() => showTabMenu(item.tab)"
         class="open-tab-chip shrink-0 flex items-center max-w-[11rem] rounded-full border transition-colors"
         :class="item.active
           ? 'bg-primary/15 border-primary/40 text-primary-text'
@@ -104,14 +134,22 @@ watch(
           <X :size="12" />
         </button>
       </div>
+    </div>
+    <div class="shrink-0 flex items-center gap-1.5 pl-1 pr-3 py-1.5">
       <button type="button" aria-label="新建话题标签" title="新建话题标签"
         class="open-tab-add shrink-0 w-7 h-7 flex items-center justify-center rounded-full border border-black/5 dark:border-white/10 bg-black/5 dark:bg-white/5 opacity-80 active:scale-90 transition-transform disabled:opacity-40"
         :disabled="!currentOwner || creating" @click="openNewTab">
         <Loader2 v-if="creating" :size="14" class="animate-spin" aria-hidden="true" />
         <Plus v-else :size="14" />
       </button>
+      <button type="button" aria-label="标签页与其他设备" title="标签页与其他设备"
+        class="open-tab-more shrink-0 w-7 h-7 flex items-center justify-center rounded-full border border-black/5 dark:border-white/10 bg-black/5 dark:bg-white/5 opacity-80 active:scale-90 transition-transform"
+        @click="panelOpen = true">
+        <Ellipsis :size="14" />
+      </button>
     </div>
   </nav>
+  <OpenTabsPanel v-model="panelOpen" :remote="remote" />
 </template>
 
 <style scoped>
