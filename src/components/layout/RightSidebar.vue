@@ -105,7 +105,25 @@ const moreTools = [
     label: 'Canvas',
     icon: PenLine,
     open: async () => {
+      const pendingModalBack = Boolean(
+        (window.history.state as { vcpModalId?: string } | null)?.vcpModalId,
+      );
+      const backSettled = pendingModalBack
+        ? new Promise<void>((resolve) => {
+            const timer = window.setTimeout(resolve, 400);
+            window.addEventListener(
+              'popstate',
+              () => {
+                window.clearTimeout(timer);
+                resolve();
+              },
+              { once: true },
+            );
+          })
+        : Promise.resolve();
       emit('close');
+      await backSettled;
+      await new Promise<void>((resolve) => window.setTimeout(resolve, 0));
       try {
         const failure = await router.push('/canvas');
         if (failure) {
