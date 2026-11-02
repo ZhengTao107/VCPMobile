@@ -104,9 +104,26 @@ const moreTools = [
     id: 'canvas',
     label: 'Canvas',
     icon: PenLine,
-    open: () => {
+    open: async () => {
       emit('close');
-      void router.push('/canvas');
+      try {
+        const failure = await router.push('/canvas');
+        if (failure) {
+          store.addNotification({
+            type: 'error',
+            title: 'Canvas 打开失败',
+            message: `导航未完成：${String((failure as { message?: string }).message ?? failure)}`,
+            toastOnly: true,
+          });
+        }
+      } catch (error) {
+        store.addNotification({
+          type: 'error',
+          title: 'Canvas 打开失败',
+          message: error instanceof Error ? `${error.name}: ${error.message}` : String(error),
+          toastOnly: true,
+        });
+      }
     },
   },
   {
