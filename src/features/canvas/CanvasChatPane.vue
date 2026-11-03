@@ -81,7 +81,7 @@ const confirm = async () => {
 
 <template>
   <section class="canvas-chat h-full min-h-0 flex flex-col">
-    <ChatView v-if="binding && active" />
+    <ChatView v-if="binding && active" embedded />
     <p v-else-if="binding && !failed" class="p-4 text-[13px] opacity-60 text-[var(--primary-text)]">正在切换到对应话题…</p>
     <div v-if="showPicker" class="p-4 flex flex-col gap-3 text-[13px] text-[var(--primary-text)]">
       <div v-if="failed" class="flex items-center gap-2 p-3 rounded-xl bg-red-50 dark:bg-red-900/30" role="alert">

@@ -59,6 +59,50 @@ export const normalizeOpenTabs = (value: unknown): OpenTab[] => {
   return result;
 };
 
+/** Canvas 文稿标签（ptp4g#39b）：键为 scoped 路径 `canvas/<文件名>`。与聊天标签分开存放，不进三端上报（Hub 只收 agent/group）。 */
+export const CANVAS_SCOPE_PREFIX = "canvas/";
+export interface CanvasOpenTab {
+  kind: "canvas";
+  path: string;
+  name: string;
+}
+export type CanvasTabRef = Pick<CanvasOpenTab, "kind" | "path">;
+export const canvasPathOf = (name: string) => `${CANVAS_SCOPE_PREFIX}${name}`;
+export const canvasNameOf = (path: string) =>
+  path.startsWith(CANVAS_SCOPE_PREFIX) ? path.slice(CANVAS_SCOPE_PREFIX.length) : "";
+export const canvasTabKey = (path: string) => JSON.stringify(["canvas", path]);
+export const isCanvasTarget = (value: unknown): value is CanvasTabRef =>
+  !!value &&
+  typeof value === "object" &&
+  (value as { kind?: unknown }).kind === "canvas" &&
+  typeof (value as { path?: unknown }).path === "string";
+/** 任一种标签的身份键。 */
+export const anyTabKey = (target: OpenTabRef | CanvasTabRef) =>
+  isCanvasTarget(target) ? canvasTabKey(target.path) : openTabKey(target);
+
+const toCanvasTab = (raw: unknown): CanvasOpenTab | null => {
+  if (!raw || typeof raw !== "object") return null;
+  const path = (raw as Record<string, unknown>).path;
+  if (typeof path !== "string") return null;
+  const name = canvasNameOf(path);
+  if (!name || name.includes("/") || name.includes("\\")) return null;
+  return { kind: "canvas", path, name };
+};
+
+/** 校验持久化的 Canvas 标签：路径须为 canvas 根下单层文件，按路径去重。 */
+export const normalizeCanvasTabs = (value: unknown): CanvasOpenTab[] => {
+  if (!Array.isArray(value)) return [];
+  const seen = new Set<string>();
+  const result: CanvasOpenTab[] = [];
+  for (const raw of value) {
+    const tab = toCanvasTab(raw);
+    if (!tab || seen.has(tab.path)) continue;
+    seen.add(tab.path);
+    result.push(tab);
+  }
+  return result;
+};
+
 /** 最近关闭历史上限：照抄 VCPChat tab-history-controller.js（entries `.slice(0, 100)`）。 */
 export const CLOSED_TAB_HISTORY_LIMIT = 100;
 /** 单个批次的子项上限：照 VCPChat normalize（batch.tabs 超过 200 视为无效）。 */
@@ -76,22 +120,35 @@ export interface ClosedTabEntry extends ClosedTab {
   kind: "tab";
 }
 
+export interface ClosedCanvasTab {
+  path: string;
+  name: string;
+  closedAt: number;
+}
+
+/** 单个关闭的 Canvas 标签。 */
+export interface ClosedCanvasEntry extends ClosedCanvasTab {
+  kind: "canvas";
+}
+
 /** 「关闭其他 / 关闭全部」一次关掉的一批（对齐 VCPChat 整窗关闭批次）。 */
 export interface ClosedTabBatch {
   kind: "batch";
   id: string;
   closedAt: number;
   tabs: ClosedTab[];
+  /** 同批关闭的 Canvas 标签；旧数据没有。 */
+  canvasTabs?: ClosedCanvasTab[];
 }
 
-export type ClosedHistoryEntry = ClosedTabEntry | ClosedTabBatch;
+export type ClosedHistoryEntry = ClosedTabEntry | ClosedTabBatch | ClosedCanvasEntry;
 
 /** 面板展示用的批次：只含尚未打开的子项，标题按剩余数量计算。 */
 export interface ClosedTabBatchView extends ClosedTabBatch {
   title: string;
 }
 
-export type RecentlyClosedEntry = ClosedTabEntry | ClosedTabBatchView;
+export type RecentlyClosedEntry = ClosedTabEntry | ClosedTabBatchView | ClosedCanvasEntry;
 
 export const closedBatchTitle = (count: number) => `关闭了 ${count} 个标签`;
 
@@ -118,9 +175,20 @@ const toClosedTab = (raw: unknown, fallbackClosedAt = 0): ClosedTab | null => {
  * 校验持久化的关闭历史：单条按身份去重（保留靠前的较新条目）；批次按 id 去重，
  * 子项去重，空批次或超过 200 子项的批次丢弃；整体截到上限。旧数据没有 kind，按单条处理。
  */
+const toClosedCanvasTab = (raw: unknown, fallbackClosedAt = 0): ClosedCanvasTab | null => {
+  const tab = toCanvasTab(raw);
+  if (!tab) return null;
+  return {
+    path: tab.path,
+    name: tab.name,
+    closedAt: positiveTime((raw as Record<string, unknown>).closedAt, fallbackClosedAt),
+  };
+};
+
 export const normalizeClosedTabs = (value: unknown): ClosedHistoryEntry[] => {
   if (!Array.isArray(value)) return [];
   const seenTabs = new Set<string>();
+  const seenCanvas = new Set<string>();
   const seenBatches = new Set<string>();
   const result: ClosedHistoryEntry[] = [];
   for (const raw of value) {
@@ -130,7 +198,8 @@ export const normalizeClosedTabs = (value: unknown): ClosedHistoryEntry[] => {
     if (record.kind === "batch") {
       const id = typeof record.id === "string" ? record.id.slice(0, 256) : "";
       if (!id || seenBatches.has(id) || !Array.isArray(record.tabs)) continue;
-      if (record.tabs.length > CLOSED_BATCH_TAB_LIMIT) continue;
+      const canvasRaw = Array.isArray(record.canvasTabs) ? record.canvasTabs : [];
+      if (record.tabs.length + canvasRaw.length > CLOSED_BATCH_TAB_LIMIT) continue;
       const closedAt = positiveTime(record.closedAt);
       const childKeys = new Set<string>();
       const tabs: ClosedTab[] = [];
@@ -140,9 +209,28 @@ export const normalizeClosedTabs = (value: unknown): ClosedHistoryEntry[] => {
         childKeys.add(openTabKey(tab));
         tabs.push(tab);
       }
-      if (tabs.length === 0) continue;
+      const canvasPaths = new Set<string>();
+      const canvasTabs: ClosedCanvasTab[] = [];
+      for (const child of canvasRaw) {
+        const tab = toClosedCanvasTab(child, closedAt);
+        if (!tab || canvasPaths.has(tab.path)) continue;
+        canvasPaths.add(tab.path);
+        canvasTabs.push(tab);
+      }
+      if (tabs.length === 0 && canvasTabs.length === 0) continue;
       seenBatches.add(id);
-      result.push({ kind: "batch", id, closedAt, tabs });
+      result.push(
+        canvasTabs.length
+          ? { kind: "batch", id, closedAt, tabs, canvasTabs }
+          : { kind: "batch", id, closedAt, tabs },
+      );
+      continue;
+    }
+    if (record.kind === "canvas") {
+      const tab = toClosedCanvasTab(record);
+      if (!tab || seenCanvas.has(tab.path)) continue;
+      seenCanvas.add(tab.path);
+      result.push({ kind: "canvas", ...tab });
       continue;
     }
     const tab = toClosedTab(record);
@@ -189,9 +277,23 @@ export const useOpenTabsStore = defineStore("openTabs", () => {
   const indexOfKey = (key: string | null) =>
     key ? tabs.value.findIndex((tab) => openTabKey(tab) === key) : -1;
 
-  const activeKey = computed(() => {
+  /** Canvas 标签与当前激活的那个（scoped 路径）；激活态不持久化，重启回到聊天。 */
+  const canvasTabs = ref<CanvasOpenTab[]>([]);
+  const activeCanvasPath = ref<string | null>(null);
+  const indexOfCanvas = (path: string) => canvasTabs.value.findIndex((tab) => tab.path === path);
+
+  const sessionKey = computed(() => {
     const key = sessionStore.currentConversationKey;
     return key ? openTabKey(key) : null;
+  });
+  /** Canvas 标签激活时即为它；否则由当前会话决定（Canvas 内[对话]切换会话不改变激活标签）。 */
+  const activeKey = computed(() =>
+    activeCanvasPath.value ? canvasTabKey(activeCanvasPath.value) : sessionKey.value,
+  );
+  /** 上一个激活的标签，供关闭当前 Canvas 标签后回退。 */
+  let previousKey: string | null = null;
+  watch(activeKey, (next, prev) => {
+    if (prev && prev !== next) previousKey = prev;
   });
 
   const indexOfTab = (target: OpenTabRef) => {
@@ -218,13 +320,14 @@ export const useOpenTabsStore = defineStore("openTabs", () => {
   const pruneWhere = (predicate: (tab: OpenTabRef) => boolean) => {
     removeWhere(predicate);
     const hit = closedTabs.value.some((entry) =>
-      entry.kind === "batch" ? entry.tabs.some(predicate) : predicate(entry),
+      entry.kind === "batch" ? entry.tabs.some(predicate) : entry.kind === "tab" && predicate(entry),
     );
     if (!hit) return;
     closedTabs.value = closedTabs.value.flatMap((entry): ClosedHistoryEntry[] => {
-      if (entry.kind !== "batch") return predicate(entry) ? [] : [entry];
+      if (entry.kind === "canvas") return [entry];
+      if (entry.kind === "tab") return predicate(entry) ? [] : [entry];
       const rest = entry.tabs.filter((tab) => !predicate(tab));
-      return rest.length ? [{ ...entry, tabs: rest }] : [];
+      return rest.length || entry.canvasTabs?.length ? [{ ...entry, tabs: rest }] : [];
     });
   };
 
@@ -238,28 +341,46 @@ export const useOpenTabsStore = defineStore("openTabs", () => {
     closedAt,
   });
 
-  /** 记入最近关闭：单个关闭记单条（同身份旧单条去重）；asBatch 且多于 1 个时记为一批。 */
-  const recordClosed = (closed: OpenTab[], asBatch = false) => {
-    if (closed.length === 0) return;
+  const toClosedCanvas = (tab: CanvasOpenTab, closedAt: number): ClosedCanvasTab => ({
+    path: tab.path,
+    name: tab.name,
+    closedAt,
+  });
+
+  /** 记入最近关闭：单个关闭记单条（同身份旧单条去重）；asBatch 且合计多于 1 个时记为一批。 */
+  const recordClosed = (closed: OpenTab[], asBatch = false, closedCanvas: CanvasOpenTab[] = []) => {
+    const total = closed.length + closedCanvas.length;
+    if (total === 0) return;
     const closedAt = Date.now();
-    if (asBatch && closed.length > 1) {
+    if (asBatch && total > 1) {
+      const limited = closed.slice(0, CLOSED_BATCH_TAB_LIMIT);
       const batch: ClosedTabBatch = {
         kind: "batch",
         id: `batch-${closedAt.toString(36)}-${Math.random().toString(36).slice(2, 8)}`,
         closedAt,
-        tabs: closed.slice(0, CLOSED_BATCH_TAB_LIMIT).map((tab) => toClosed(tab, closedAt)),
+        tabs: limited.map((tab) => toClosed(tab, closedAt)),
       };
+      const canvasRoom = Math.max(0, CLOSED_BATCH_TAB_LIMIT - limited.length);
+      const canvasClosed = closedCanvas.slice(0, canvasRoom).map((tab) => toClosedCanvas(tab, closedAt));
+      if (canvasClosed.length) batch.canvasTabs = canvasClosed;
       closedTabs.value = [batch, ...closedTabs.value].slice(0, CLOSED_TAB_HISTORY_LIMIT);
       return;
     }
-    const entries: ClosedTabEntry[] = closed.map((tab) => ({
-      kind: "tab",
-      ...toClosed(tab, closedAt),
-    }));
-    const keys = new Set(entries.map(openTabKey));
+    const entries: ClosedHistoryEntry[] = [
+      ...closed.map((tab): ClosedTabEntry => ({ kind: "tab", ...toClosed(tab, closedAt) })),
+      ...closedCanvas.map((tab): ClosedCanvasEntry => ({ kind: "canvas", ...toClosedCanvas(tab, closedAt) })),
+    ];
+    const keys = new Set(closed.map(openTabKey));
+    const paths = new Set(closedCanvas.map((tab) => tab.path));
     closedTabs.value = [
       ...entries,
-      ...closedTabs.value.filter((entry) => entry.kind === "batch" || !keys.has(openTabKey(entry))),
+      ...closedTabs.value.filter((entry) =>
+        entry.kind === "batch"
+          ? true
+          : entry.kind === "canvas"
+            ? !paths.has(entry.path)
+            : !keys.has(openTabKey(entry)),
+      ),
     ].slice(0, CLOSED_TAB_HISTORY_LIMIT);
   };
 
@@ -269,20 +390,28 @@ export const useOpenTabsStore = defineStore("openTabs", () => {
    */
   const recentlyClosed = computed<RecentlyClosedEntry[]>(() => {
     const open = new Set(tabs.value.map(openTabKey));
+    const openCanvas = new Set(canvasTabs.value.map((tab) => tab.path));
     const result: RecentlyClosedEntry[] = [];
     for (const entry of closedTabs.value) {
-      if (entry.kind !== "batch") {
+      if (entry.kind === "canvas") {
+        if (!openCanvas.has(entry.path)) result.push(entry);
+        continue;
+      }
+      if (entry.kind === "tab") {
         if (!open.has(openTabKey(entry))) result.push(entry);
         continue;
       }
       const rest = entry.tabs.filter((tab) => !open.has(openTabKey(tab)));
-      if (rest.length) result.push({ ...entry, tabs: rest, title: closedBatchTitle(rest.length) });
+      const restCanvas = (entry.canvasTabs ?? []).filter((tab) => !openCanvas.has(tab.path));
+      const count = rest.length + restCanvas.length;
+      if (count) result.push({ ...entry, tabs: rest, canvasTabs: restCanvas, title: closedBatchTitle(count) });
     }
     return result;
   });
 
   const closedTitle = (key: string): string | null => {
     for (const entry of closedTabs.value) {
+      if (entry.kind === "canvas") continue;
       const hit =
         entry.kind === "batch"
           ? entry.tabs.find((tab) => openTabKey(tab) === key)
@@ -304,7 +433,9 @@ export const useOpenTabsStore = defineStore("openTabs", () => {
     closedTabs.value = closedTabs.value.flatMap((entry): ClosedHistoryEntry[] => {
       if (entry.kind !== "batch" || entry.id !== batchId) return [entry];
       const rest = entry.tabs.filter((tab) => !keys.has(openTabKey(tab)));
-      return rest.length ? [{ ...entry, tabs: rest }] : [];
+      const restCanvas = (entry.canvasTabs ?? []).filter((tab) => !keys.has(canvasTabKey(tab.path)));
+      if (rest.length === 0 && restCanvas.length === 0) return [];
+      return [{ ...entry, tabs: rest, canvasTabs: restCanvas.length ? restCanvas : undefined }];
     });
   };
 
@@ -318,6 +449,8 @@ export const useOpenTabsStore = defineStore("openTabs", () => {
 
   /** 当前会话写入（或刷新）对应标签，并清掉它的未读点。 */
   const upsertCurrent = () => {
+    // Canvas 标签激活时，[对话] 切换的会话不写入标签栏。
+    if (activeCanvasPath.value) return;
     const key = sessionStore.currentConversationKey;
     if (!key) return;
     const item = sessionStore.currentSelectedItem;
@@ -362,6 +495,7 @@ export const useOpenTabsStore = defineStore("openTabs", () => {
     }
     try {
       await sessionStore.selectTopicById(target.ownerId, target.ownerType, target.topicId);
+      activeCanvasPath.value = null;
       markSlot();
       return true;
     } catch (error) {
@@ -430,21 +564,84 @@ export const useOpenTabsStore = defineStore("openTabs", () => {
     }
   };
 
-  /** VCPChat「关闭其他」：保留目标并切过去，其余记入最近关闭。 */
-  const closeOtherTabs = async (target: OpenTabRef) => {
-    const index = indexOfTab(target);
-    if (index < 0 || tabs.value.length < 2) return;
-    const kept = tabs.value[index];
-    recordClosed(tabs.value.filter((_, i) => i !== index), true);
-    tabs.value = [kept];
-    if (!isActive(kept)) await activateTab(kept);
+  const keyIsOpen = (key: string | null) =>
+    !!key &&
+    (indexOfKey(key) >= 0 || canvasTabs.value.some((tab) => canvasTabKey(tab.path) === key));
+
+  /** 切到 Canvas 标签：不改变当前会话。 */
+  const activateCanvasTab = (path: string) => {
+    if (indexOfCanvas(path) < 0) return false;
+    activeCanvasPath.value = path;
+    return true;
+  };
+
+  /** 按身份键激活任一种标签。 */
+  const activateKey = async (key: string): Promise<boolean> => {
+    const chat = tabs.value.find((tab) => openTabKey(tab) === key);
+    if (chat) return activateTab(chat);
+    const canvasTab = canvasTabs.value.find((tab) => canvasTabKey(tab.path) === key);
+    return canvasTab ? activateCanvasTab(canvasTab.path) : false;
+  };
+
+  /** 打开文稿：已开则切换，否则追加 Canvas 标签并激活。 */
+  const openCanvasTab = (name: string) => {
+    const [tab] = normalizeCanvasTabs([{ kind: "canvas", path: canvasPathOf(name) }]);
+    if (!tab) return false;
+    if (indexOfCanvas(tab.path) < 0) canvasTabs.value.push(tab);
+    return activateCanvasTab(tab.path);
+  };
+
+  /** 离开 Canvas 但不关闭：依次尝试上一个、当前槽位、第一个聊天标签；都没有时只退出激活态。 */
+  const leaveCanvas = async () => {
+    if (!activeCanvasPath.value) return true;
+    const candidates = [previousKey, activeTabKey.value, tabs.value[0] ? openTabKey(tabs.value[0]) : null];
+    for (const key of candidates) {
+      const chat = key ? tabs.value.find((tab) => openTabKey(tab) === key) : undefined;
+      if (chat && (await activateTab(chat))) return true;
+    }
+    activeCanvasPath.value = null;
+    return false;
+  };
+
+  /** 关闭 Canvas 标签；关闭的是当前标签时回到上一个激活标签，其次相邻 Canvas 标签，再次聊天标签。 */
+  const closeCanvasTab = async (target: Pick<CanvasOpenTab, "path">) => {
+    const index = indexOfCanvas(target.path);
+    if (index < 0) return;
+    const wasActive = activeCanvasPath.value === target.path;
+    const back = previousKey;
+    const [closed] = canvasTabs.value.splice(index, 1);
+    recordClosed([], false, [closed]);
+    if (!wasActive) return;
+    if (back && keyIsOpen(back) && (await activateKey(back))) return;
+    const neighbor = canvasTabs.value[Math.min(index, canvasTabs.value.length - 1)];
+    if (neighbor) {
+      activateCanvasTab(neighbor.path);
+      return;
+    }
+    await leaveCanvas();
+  };
+
+  /** VCPChat「关闭其他」：保留目标并切过去，其余（两种标签）记入最近关闭。 */
+  const closeOtherTabs = async (target: OpenTabRef | CanvasTabRef) => {
+    const key = anyTabKey(target);
+    if (!keyIsOpen(key)) return;
+    const chats = tabs.value.filter((tab) => openTabKey(tab) !== key);
+    const canvases = canvasTabs.value.filter((tab) => canvasTabKey(tab.path) !== key);
+    if (chats.length + canvases.length === 0) return;
+    recordClosed(chats, true, canvases);
+    tabs.value = tabs.value.filter((tab) => openTabKey(tab) === key);
+    canvasTabs.value = canvasTabs.value.filter((tab) => canvasTabKey(tab.path) === key);
+    if (isCanvasTarget(target)) activateCanvasTab(target.path);
+    else if (!isActive(target)) await activateTab(target);
   };
 
   /** VCPChat「关闭全部」：全部记入最近关闭；当前会话不动（与关闭最后一个标签一致）。 */
   const closeAllTabs = () => {
-    if (tabs.value.length === 0) return;
-    recordClosed(tabs.value, true);
+    if (tabs.value.length + canvasTabs.value.length === 0) return;
+    recordClosed(tabs.value, true, canvasTabs.value);
     tabs.value = [];
+    canvasTabs.value = [];
+    activeCanvasPath.value = null;
   };
 
   /**
@@ -499,7 +696,7 @@ export const useOpenTabsStore = defineStore("openTabs", () => {
     );
     if (opened) {
       closedTabs.value = closedTabs.value.filter(
-        (item) => item.kind === "batch" || openTabKey(item) !== key,
+        (item) => item.kind !== "tab" || openTabKey(item) !== key,
       );
     }
     return opened;
@@ -520,11 +717,39 @@ export const useOpenTabsStore = defineStore("openTabs", () => {
     const batch = findBatch(batchId);
     if (!batch) return { opened: 0, skipped: 0, activated: false };
     const result = openTabsInBackground(batch.tabs.map(pickTab));
+    const canvasChildren = batch.canvasTabs ?? [];
+    let canvasOpened = 0;
+    for (const child of canvasChildren) {
+      const [tab] = normalizeCanvasTabs([{ kind: "canvas", path: child.path }]);
+      if (!tab || indexOfCanvas(tab.path) >= 0) continue;
+      canvasTabs.value.push(tab);
+      canvasOpened += 1;
+    }
     const restored = new Set([...result.opened, ...result.alreadyOpen].map(openTabKey));
+    canvasChildren.forEach((child) => restored.add(canvasTabKey(child.path)));
     removeBatchChildren(batchId, restored);
     const first = batch.tabs.find((tab) => restored.has(openTabKey(tab)));
-    const activated = first ? await activateTab(first) : false;
-    return { opened: result.opened.length, skipped: result.missing.length, activated };
+    let activated = first ? await activateTab(first) : false;
+    if (!activated && canvasChildren.length > 0) activated = activateCanvasTab(canvasChildren[0].path);
+    return { opened: result.opened.length + canvasOpened, skipped: result.missing.length, activated };
+  };
+
+  /** 最近关闭 · 恢复单个 Canvas 标签：重新打开文稿，成功后移出历史。 */
+  const restoreClosedCanvas = (path: string) => {
+    const opened = openCanvasTab(canvasNameOf(path));
+    if (opened) {
+      closedTabs.value = closedTabs.value.filter((item) => item.kind !== "canvas" || item.path !== path);
+    }
+    return opened;
+  };
+
+  /** 批次 · 恢复单个 Canvas 子项。 */
+  const restoreClosedBatchCanvasChild = (batchId: string, path: string) => {
+    const child = findBatch(batchId)?.canvasTabs?.find((tab) => tab.path === path);
+    if (!child) return false;
+    const opened = openCanvasTab(canvasNameOf(path));
+    if (opened) removeBatchChildren(batchId, new Set([canvasTabKey(path)]));
+    return opened;
   };
 
   /** 标签菜单「重命名话题」：走 topicStore.updateTopicTitle（与话题长按「修改标题」同一入口）。 */
@@ -571,6 +796,7 @@ export const useOpenTabsStore = defineStore("openTabs", () => {
   const sanitizeTabs = () => {
     tabs.value = normalizeOpenTabs(tabs.value);
     closedTabs.value = normalizeClosedTabs(closedTabs.value);
+    canvasTabs.value = normalizeCanvasTabs(canvasTabs.value);
     // 旧持久化数据没有 activeTabKey：以当前会话所在标签为准。
     if (indexOfKey(activeKey.value) >= 0) {
       activeTabKey.value = activeKey.value;
@@ -696,6 +922,14 @@ export const useOpenTabsStore = defineStore("openTabs", () => {
     restoreClosedBatchChild,
     activeKey,
     activeTabKey,
+    canvasTabs,
+    activeCanvasPath,
+    openCanvasTab,
+    activateCanvasTab,
+    closeCanvasTab,
+    leaveCanvas,
+    restoreClosedCanvas,
+    restoreClosedBatchCanvasChild,
     openTab,
     activateTab,
     openInNewTab,
@@ -710,7 +944,7 @@ export const useOpenTabsStore = defineStore("openTabs", () => {
   };
 }, {
   persist: {
-    pick: ["tabs", "activeTabKey", "closedTabs"],
+    pick: ["tabs", "activeTabKey", "closedTabs", "canvasTabs"],
     afterHydrate: (context) => {
       (context.store as unknown as { sanitizeTabs: () => void }).sanitizeTabs();
     },

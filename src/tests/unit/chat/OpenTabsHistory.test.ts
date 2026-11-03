@@ -31,7 +31,9 @@ const agent = (id: string) => ({ id, name: `Agent ${id}`, avatarCalculatedColor:
 const describeEntry = (entry: RecentlyClosedEntry | ClosedHistoryEntry) =>
   entry.kind === "batch"
     ? `[${entry.tabs.map((tab) => `${tab.ownerId}/${tab.topicId}`).join(",")}]`
-    : `${entry.ownerId}/${entry.topicId}`;
+    : entry.kind === "canvas"
+      ? entry.path
+      : `${entry.ownerId}/${entry.topicId}`;
 
 function setup() {
   installPersistedPinia();
