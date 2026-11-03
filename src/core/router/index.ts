@@ -5,6 +5,7 @@ const routes = [
   { path: '/', redirect: '/chat' },
   { path: '/chat', name: 'chat', component: ChatView },
   { path: '/canvas', name: 'canvas', component: () => import('../../features/canvas/CanvasView.vue') },
+  { path: '/sidechat', name: 'sidechat', component: () => import('../../features/sidechat/SidechatView.vue') },
 ];
 
 export const router = createRouter({
