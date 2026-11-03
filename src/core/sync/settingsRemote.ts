@@ -98,6 +98,8 @@ export interface SettingsRemoteDeps {
   fetchSettings: (target: HintTarget) => Promise<SettingsHttpResponse>;
   putSettings: (target: HintTarget, values: Record<string, string>) => Promise<SettingsHttpResponse>;
   now?: () => number;
+  /** 套用电脑主题（手机主题键）；未提供时不跟随主题。 */
+  applyComputerTheme?: (themeKey: string) => Promise<unknown> | unknown;
 }
 
 export interface SettingsRemote {
@@ -118,6 +120,35 @@ export function createSettingsRemote(deps: SettingsRemoteDeps): SettingsRemote {
   let backoffMs = 0;
   let blockedUntil = 0;
   let disposed = false;
+  /** 电脑主题文件上次拉到的值：只在它变化时套用，手机手动换的主题不会被每次同步打回。 */
+  let lastComputerTheme: string | null = null;
+  const warnedThemes = new Set<string>();
+
+  const followComputerTheme = async (values: unknown) => {
+    if (!values || typeof values !== "object" || Array.isArray(values)) return;
+    const name = (values as Record<string, unknown>).currentThemeFile;
+    if (typeof name !== "string" || !name.trim() || name === lastComputerTheme) return;
+    const themeKey = mobileThemeFromComputer(name);
+    if (!themeKey) {
+      if (!warnedThemes.has(name)) {
+        warnedThemes.add(name);
+        console.warn(`[SettingsRemote] 电脑主题 ${name} 在手机上没有对应主题，保持当前主题。`);
+      }
+      lastComputerTheme = name;
+      return;
+    }
+    if (!deps.applyComputerTheme) return;
+    try {
+      const result = await deps.applyComputerTheme(themeKey);
+      if ((result as { ok?: boolean } | null)?.ok === false) {
+        console.warn("[SettingsRemote] theme apply failed:", (result as { error?: string }).error);
+        return;
+      }
+      lastComputerTheme = name;
+    } catch (error) {
+      console.warn("[SettingsRemote] theme apply failed:", error);
+    }
+  };
 
   const backingOff = () => now() < blockedUntil;
   const backOff = () => {
@@ -158,6 +189,8 @@ export function createSettingsRemote(deps: SettingsRemoteDeps): SettingsRemote {
     const remote: SyncedValues = localFromRemote(values);
     const local = deps.readLocal();
     if (!local) return;
+    await followComputerTheme(values);
+    if (seq !== pullSeq || disposed) return;
     const base = synced;
     const patch: SyncedValues = {};
     for (const key of SYNCED_KEYS) {
@@ -255,6 +288,7 @@ export function useSettingsRemote(isForeground: () => boolean): () => void {
         await settingsStore.updateFields({ "identity.userName": patch.userName });
       }
     },
+    applyComputerTheme: (themeKey) => themeStore.applyThemeFile(themeKey),
     fetchSettings: (target) =>
       invoke<SettingsHttpResponse>("settings_sync_get", {
         baseUrl: target.baseUrl,
