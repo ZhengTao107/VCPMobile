@@ -168,6 +168,11 @@ impl SyncHttpClient {
         Self { inner, meter }
     }
 
+    /// fork p8lk4#15：附件 blob 同步沿用自己的请求构造，复用同一连接池。
+    pub(crate) fn reqwest_client(&self) -> reqwest::Client {
+        self.inner.clone()
+    }
+
     pub fn post(&self, url: impl reqwest::IntoUrl) -> SyncRequestBuilder {
         SyncRequestBuilder {
             inner: self.inner.post(url),

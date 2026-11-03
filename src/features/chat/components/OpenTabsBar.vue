@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed, nextTick, ref, watch } from "vue";
-import { Loader2, X } from "lucide-vue-next";
+import { Loader2, X } from "@lucide/vue";
 import VcpAvatar from "../../../components/ui/VcpAvatar.vue";
 import {
   openTabKey,

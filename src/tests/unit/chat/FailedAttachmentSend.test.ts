@@ -7,6 +7,7 @@ import { useAttachmentStore } from "@/core/stores/attachmentStore";
 import { useNotificationStore } from "@/core/stores/notification";
 import { invokeMock, mockInvoke } from "@/tests/mocks/tauri";
 import type { Attachment } from "@/core/types/chat";
+import { makeConfigSnapshot, makeSettings } from "@/tests/helpers/config";
 
 const done = (name: string): Attachment => ({
   id: `att_${name}`,
@@ -40,13 +41,12 @@ describe("sendMessage skips failed attachment cards", () => {
     mockInvoke("load_chat_history", () => []);
     mockInvoke("append_single_message", () => ({ blocks: [], topicUpdatedAt: 1 }));
     mockInvoke("handle_agent_chat_message", () => null);
-    useSettingsStore().settings = {
-      userName: "User",
-      vcpServerUrl: "https://example.invalid",
-      vcpApiKey: "key",
-    } as any;
-    useChatSessionStore().setConversation({ id: "agent-a", type: "agent" }, "topic-a");
-    await useChatHistoryStore().loadHistoryPaginated("agent-a", "agent", "topic-a");
+    useSettingsStore().snapshot = makeConfigSnapshot(makeSettings({
+      "identity.userName": "User", "server.url": "https://example.invalid", "server.apiKey": "key",
+    }));
+    const session = useChatSessionStore();
+    session.setConversation({ id: "agent-a", type: "agent" }, "topic-a");
+    useChatHistoryStore().loadedConversationKey = session.currentConversationKey;
   });
 
   it("sends only ready attachments and clears failed cards with a light hint", async () => {

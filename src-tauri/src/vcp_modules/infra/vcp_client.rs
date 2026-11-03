@@ -1589,6 +1589,9 @@ pub(crate) async fn perform_vcp_request_registered<R: Runtime>(
         }
     }
 
+    let attachment_tokens = crate::vcp_modules::chat::context_metrics::estimate_attachment_tokens(
+        &request_body["messages"],
+    );
     let prepared_body = request_body::prepare(
         app.path()
             .app_cache_dir()
@@ -1617,6 +1620,7 @@ pub(crate) async fn perform_vcp_request_registered<R: Runtime>(
             &final_url,
             &payload.vcp_api_key,
             Some(request_body),
+            attachment_tokens,
             message_id,
             transport_request_id,
             context,
@@ -2299,7 +2303,8 @@ fn absorb_sse_data(
             .unwrap_or("Upstream SSE request failed");
         return Err(message.to_string());
     }
-    if let Some(round) = crate::vcp_modules::chat::context_metrics::extract_from_sse_payload(&value) {
+    if let Some(round) = crate::vcp_modules::chat::context_metrics::extract_from_sse_payload(&value)
+    {
         metrics.record(round);
         return Ok(false);
     }
@@ -2356,6 +2361,7 @@ async fn handle_streaming_request<R: Runtime>(
     final_url: &str,
     api_key: &str,
     request_body: Option<PreparedBody>,
+    attachment_tokens: u64,
     message_id: String,
     transport_request_id: String,
     context: Option<Value>,
@@ -2373,8 +2379,6 @@ async fn handle_streaming_request<R: Runtime>(
     let mut pending_chunk = String::new();
     let mut last_finish_reason = None;
     let mut metrics_rounds = crate::vcp_modules::chat::context_metrics::RoundCollector::default();
-    let attachment_tokens =
-        crate::vcp_modules::chat::context_metrics::estimate_attachment_tokens(&request_body["messages"]);
     let send_update = |buffer: &mut AuroraBuffer| {
         output.send_aurora(buffer, &message_id, &context, None, false);
     };
@@ -4003,6 +4007,7 @@ async fn resume_claimed_generation<R: Runtime>(
         "",
         "",
         None,
+        0,
         msg_id.clone(),
         transport_request_id,
         Some(context.clone()),
@@ -5347,6 +5352,7 @@ mod active_request_tests {
             &endpoint,
             "",
             empty_request_body().await,
+            0,
             "message".into(),
             "transport".into(),
             None,
@@ -5396,6 +5402,7 @@ mod active_request_tests {
             &endpoint,
             "",
             empty_request_body().await,
+            0,
             "message".into(),
             "transport".into(),
             None,
@@ -5441,6 +5448,7 @@ mod active_request_tests {
             &endpoint,
             "",
             empty_request_body().await,
+            0,
             "message".into(),
             "transport".into(),
             None,
@@ -5494,6 +5502,7 @@ mod active_request_tests {
                 &endpoint,
                 "",
                 empty_request_body().await,
+                0,
                 "message".to_string(),
                 "transport".to_string(),
                 None,

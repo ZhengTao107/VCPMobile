@@ -89,7 +89,11 @@ fn base64_byte_length(data: &str) -> u64 {
         .bytes()
         .filter(|byte| !byte.is_ascii_whitespace())
         .collect();
-    let padding = compact.iter().rev().take_while(|byte| **byte == b'=').count() as u64;
+    let padding = compact
+        .iter()
+        .rev()
+        .take_while(|byte| **byte == b'=')
+        .count() as u64;
     ((compact.len() as u64 * 3) / 4).saturating_sub(padding)
 }
 
@@ -331,7 +335,10 @@ mod tests {
         ]);
         let generic = (r#"{"type":"custom","x":1}"#.len() as u64 + 11) / 12;
         assert_eq!(base64_byte_length(audio), 4);
-        assert_eq!(estimate_attachment_tokens(&messages), 765 + 85 + 1 + 24 + generic);
+        assert_eq!(
+            estimate_attachment_tokens(&messages),
+            765 + 85 + 1 + 24 + generic
+        );
         assert_eq!(estimate_attachment_tokens(&json!("not-array")), 0);
     }
 
@@ -345,10 +352,12 @@ mod tests {
             .execute(&pool)
             .await
             .expect("baseline");
-        sqlx::raw_sql(include_str!("../../../migrations/9001_add_message_context_metrics.sql"))
-            .execute(&pool)
-            .await
-            .expect("9001");
+        sqlx::raw_sql(include_str!(
+            "../../../migrations/9001_add_message_context_metrics.sql"
+        ))
+        .execute(&pool)
+        .await
+        .expect("9001");
         sqlx::query(
             "INSERT INTO messages (owner_type, owner_id, topic_id, msg_id, role, content,
                 timestamp, created_at, updated_at)
@@ -364,16 +373,31 @@ mod tests {
     async fn persist_merges_rounds_and_load_returns_them_without_touching_hash() {
         let db = db().await;
         let key = MessageKey::new(TopicKey::new("agent", "a", "t"), "m");
-        persist(&db, &key, &[json!({"totalContextTokens": 10, "roundIndex": 0})], 765)
-            .await
-            .expect("first");
-        persist(&db, &key, &[json!({"totalContextTokens": 20, "roundIndex": 1})], 765)
-            .await
-            .expect("second");
+        persist(
+            &db,
+            &key,
+            &[json!({"totalContextTokens": 10, "roundIndex": 0})],
+            765,
+        )
+        .await
+        .expect("first");
+        persist(
+            &db,
+            &key,
+            &[json!({"totalContextTokens": 20, "roundIndex": 1})],
+            765,
+        )
+        .await
+        .expect("second");
         persist(&db, &key, &[], 0).await.expect("noop");
-        persist(&db, &key, &[json!({"totalContextTokens": 21, "roundIndex": 1})], 0)
-            .await
-            .expect("resume keeps estimate");
+        persist(
+            &db,
+            &key,
+            &[json!({"totalContextTokens": 21, "roundIndex": 1})],
+            0,
+        )
+        .await
+        .expect("resume keeps estimate");
         let missing = MessageKey::new(TopicKey::new("agent", "a", "t"), "absent");
         persist(&db, &missing, &[json!({"totalContextTokens": 5})], 0)
             .await

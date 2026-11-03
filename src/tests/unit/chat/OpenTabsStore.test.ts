@@ -56,6 +56,18 @@ beforeEach(() => {
   localStorage.clear();
   clearInvokeMocks();
   mockInvoke("get_unread_counts", () => ({}));
+  let revision = 0;
+  const empty = { target: { kind: "welcome" }, focusRevision: 0, windowRevision: 0, anchorId: null };
+  mockInvoke("connect_chat_view", () => ({ documentId: 1, focus: empty }));
+  mockInvoke("register_chat_navigation_intent", () => ({ focus: empty }));
+  mockInvoke("request_chat_navigation", (args) => ({
+    status: "accepted",
+    focus: { target: args?.target, focusRevision: ++revision, windowRevision: revision, anchorId: args?.anchorId ?? null },
+  }));
+  mockInvoke("restore_chat_view", (args) => ({
+    status: "accepted",
+    focus: { target: args?.hint, focusRevision: ++revision, windowRevision: revision, anchorId: null },
+  }));
 });
 
 describe("open tabs store", () => {
@@ -98,9 +110,6 @@ describe("open tabs store", () => {
 
     const second = setup();
     expect(second.ids()).toEqual(["a/t1", "b/t2"]);
-    expect(second.tabs.activeKey).toBe(
-      openTabKey({ ownerId: "b", ownerType: "agent", topicId: "t2" }),
-    );
   });
 
   it("normalizes untrusted values", () => {

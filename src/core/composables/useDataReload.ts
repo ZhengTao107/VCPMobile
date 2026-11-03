@@ -65,7 +65,7 @@ export function useDataReload() {
     }
     if (plan.reloadCurrentHistory && selected && topicId) {
       clearHtmlCache();
-      await chatHistoryStore.loadHistoryPaginated(selected.id, selected.type, topicId);
+      await chatHistoryStore.reconcileWindow(true);
     }
     return true;
   };

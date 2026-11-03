@@ -5,9 +5,9 @@ pub mod chat_manager;
 pub(crate) mod chat_navigation;
 pub(crate) mod chat_window;
 pub mod content_parser;
-pub mod context_metrics;
 pub mod context_assembler;
 pub mod context_injection;
+pub mod context_metrics;
 pub mod context_sanitizer;
 pub mod emoticon_manager;
 #[cfg(any(target_os = "ios", test))]

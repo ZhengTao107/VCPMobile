@@ -232,15 +232,6 @@ export const useAttachmentStore = defineStore("attachment", () => {
           const reason = String(error);
           if (activeOperations.has(id) && !reason.toLowerCase().includes("cancel")) {
             failures.push(`${file.name}: ${reason}`);
-            // fork ptp4g#12：多选失败卡片保留并标明原因，可手动移除；发送时由 sendMessage 过滤。
-            const index = mode === "camera" ? -1 : stagedAttachments.value.findIndex(a => a.id === id);
-            if (index !== -1) {
-              stagedAttachments.value[index] = {
-                ...stagedAttachments.value[index], src: "", status: "failed", failReason: reason,
-                progress: undefined, transferredBytes: undefined,
-              };
-              continue;
-            }
           }
           stagedAttachments.value = stagedAttachments.value.filter(a => a.id !== id);
         } finally {

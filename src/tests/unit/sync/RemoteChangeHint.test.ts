@@ -203,18 +203,23 @@ describe("remote change hint loop", () => {
 });
 
 describe("hint target from settings", () => {
-  const settings = {
-    syncServerUrl: "ws://sync.example:5975/ws-sync",
-    syncHttpUrl: " http://sync.example:5974 ",
-    syncToken: "fake-token-a",
-  } as unknown as AppSettings;
+  const withSync = (sync: Record<string, unknown>) =>
+    ({
+      sync: {
+        serverUrl: "ws://sync.example:5975/ws-sync",
+        httpUrl: " http://sync.example:5974 ",
+        token: "fake-token-a",
+        ...sync,
+      },
+    }) as unknown as AppSettings;
+  const settings = withSync({});
 
   it("requires foreground, auto sync, http url and token", () => {
     expect(hintTargetFromSettings(settings, true)).toEqual(TARGET);
     expect(hintTargetFromSettings(settings, false)).toBeNull();
-    expect(hintTargetFromSettings({ ...settings, autoSync: false }, true)).toBeNull();
-    expect(hintTargetFromSettings({ ...settings, syncHttpUrl: "  " }, true)).toBeNull();
-    expect(hintTargetFromSettings({ ...settings, syncToken: "" }, true)).toBeNull();
+    expect(hintTargetFromSettings(withSync({ autoSync: false }), true)).toBeNull();
+    expect(hintTargetFromSettings(withSync({ httpUrl: "  " }), true)).toBeNull();
+    expect(hintTargetFromSettings(withSync({ token: "" }), true)).toBeNull();
     expect(hintTargetFromSettings(null, true)).toBeNull();
   });
 });
@@ -240,11 +245,15 @@ describe("useRemoteChangeHint wiring", () => {
     await flush();
     expect(waitCalls()).toHaveLength(0);
 
-    store.settings = {
-      syncServerUrl: "ws://sync.example:5975/ws-sync",
-      syncHttpUrl: "http://sync.example:5974",
-      syncToken: "fake-token-a",
-    } as AppSettings;
+    store.snapshot = {
+      data: {
+        sync: {
+          serverUrl: "ws://sync.example:5975/ws-sync",
+          httpUrl: "http://sync.example:5974",
+          token: "fake-token-a",
+        },
+      },
+    } as unknown as typeof store.snapshot;
     await nextTick();
     await flush();
     expect(waitCalls()).toHaveLength(1);

@@ -88,7 +88,11 @@ describe("渲染单点接入（astRenderer）", () => {
   const withSettings = (settings: Record<string, unknown> | null) => {
     const pinia = createPinia();
     setActivePinia(pinia);
-    if (settings) pinia.state.value.settings = { settings };
+    if (settings) {
+      pinia.state.value.settings = {
+        snapshot: { data: { server: { url: settings.vcpServerUrl }, sync: { httpUrl: settings.syncHttpUrl } } },
+      };
+    }
   };
 
   it("无设置时 currentLocalMediaTargets 为空，渲染保持原样", () => {

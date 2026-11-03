@@ -10,10 +10,10 @@ export const CONFIG_DOMAIN_LABELS: Record<ConfigDomain, string> = {
 const FIELD_LABELS: Record<SettingsFieldPath, string> = {
   'identity.userName': '用户名',
   'server.url': 'Chat 服务器地址', 'server.apiKey': 'Chat API Key', 'server.endpointMode': 'Chat 请求入口',
-  'server.adminUsername': '管理员账号', 'server.adminPassword': '管理员密码', 'server.fileKey': '图床密钥',
+  'server.adminUsername': '管理员账号', 'server.adminPassword': '管理员密码', 'server.fileKey': '图床密钥', 'server.connectionProfiles': '连接档案',
   'log.url': '日志服务器地址', 'log.key': '日志鉴权 Key',
   'sync.httpUrl': '同步 HTTP 地址', 'sync.serverUrl': '同步 WebSocket 地址', 'sync.token': '同步 Token',
-  'sync.logLevel': '同步日志级别', 'sync.prerenderEnabled': '同步预渲染',
+  'sync.logLevel': '同步日志级别', 'sync.prerenderEnabled': '同步预渲染', 'sync.autoSync': '自动同步', 'sync.attachmentBlobSync': '附件同步',
   'distributed.enabled': '分布式连接开关', 'distributed.wsUrl': '分布式服务器地址',
   'distributed.vcpKey': '分布式鉴权 Key', 'distributed.deviceName': '设备名称',
   'conversation.topicSummaryModel': '话题总结模型',

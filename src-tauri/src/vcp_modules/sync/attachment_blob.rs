@@ -426,17 +426,17 @@ impl<R: Runtime> BlobLocal for TauriBlobLocal<'_, R> {
             .to_str()
             .ok_or_else(|| "附件目标路径不是有效 UTF-8".to_string())?
             .to_string();
-        crate::vcp_modules::file_manager::register_attachment_internal(
-            self.app,
-            &self.pool,
-            blob.hash.clone(),
-            blob.name.clone(),
-            mime.to_string(),
+        use tauri::Manager;
+        let db = self.app.state::<crate::vcp_modules::db_manager::DbState>();
+        crate::vcp_modules::file_manager::commit_registered_attachment(
+            &db,
+            &blob.hash,
+            mime,
             size,
-            internal_path,
+            &internal_path,
+            crate::vcp_modules::infra::utils::now_secs() as i64,
         )
         .await
-        .map(|_| ())
     }
 }
 
@@ -888,13 +888,7 @@ impl AttachmentBlobSync {
 
         // rename 进 CAS 后立即注册，中间不插入其他 await 点之外的工作。
         let dest = root.join(cas_file_name(&blob.hash, &blob.name));
-        if let Err(error) = install_verified_upload(
-            fetched.temp.path(),
-            &dest,
-            size,
-        )
-        .await
-        {
+        if let Err(error) = install_verified_upload(fetched.temp.path(), &dest, size).await {
             self.log(
                 LogLevel::Warning,
                 &format!("附件 {} 安装失败: {error}", blob.hash),
@@ -1190,7 +1184,7 @@ mod tests {
         let router = Router::new()
             .route("/api/mobile-sync-blob/probe", post(probe_handler))
             .route(
-                "/api/mobile-sync-blob/:hash",
+                "/api/mobile-sync-blob/{hash}",
                 put(put_handler).get(get_handler).head(head_handler),
             )
             .with_state(state);

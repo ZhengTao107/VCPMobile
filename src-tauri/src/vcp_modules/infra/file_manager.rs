@@ -846,7 +846,7 @@ fn ensure_safe_path(app_handle: &AppHandle, path: &std::path::Path) -> Result<()
 /// 2. 无 BOM 时使用 chardetng 统计检测（Firefox 同款）
 use super::file_extractor::try_extract_text;
 
-async fn commit_registered_attachment(
+pub(crate) async fn commit_registered_attachment(
     db_state: &DbState,
     hash: &str,
     mime_type: &str,

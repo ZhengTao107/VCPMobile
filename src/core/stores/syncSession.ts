@@ -811,6 +811,8 @@ export const useSyncSessionStore = defineStore("syncSession", () => {
    */
   const hide = () => {
     if (!isOpen.value || quiet.value || canDismiss.value) return false;
+    // 会话号返回前收起会让 Rust 侧随后建立的会话无人认领；与 cancel() 同一守卫。
+    if (activeSessionId.value === null) return false;
     backgrounded.value = true;
     return true;
   };

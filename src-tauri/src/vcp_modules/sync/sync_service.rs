@@ -1855,7 +1855,7 @@ async fn run_sync_session(
     // 附件本体同步的预算与路由缺失标记按会话共享，跨 attempt 不重置。
     let attachment_blob = Arc::new(
         crate::vcp_modules::sync::attachment_blob::AttachmentBlobSync::new(
-            http_client.clone(),
+            http_client.reqwest_client(),
             http_url.clone(),
             sync_token.clone(),
             attachment_blob_sync,
@@ -4720,6 +4720,8 @@ mod tests {
                 token: "sync-token".to_string(),
                 log_level: "DEBUG".to_string(),
                 prerender_enabled: true,
+                auto_sync: true,
+                attachment_blob_sync: true,
             },
             ..Settings::default()
         }

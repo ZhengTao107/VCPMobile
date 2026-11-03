@@ -269,7 +269,7 @@ describe("sync session ownership", () => {
     await overlay.closeSyncSession();
   });
 
-  it("backgrounds a connecting page while start_manual_sync is pending and finalizes on terminal", async () => {
+  it("backgrounds a sync page once start_manual_sync returns a session and finalizes on terminal", async () => {
     const pendingStart = deferred<number>();
     mockInvoke("plugin:vcp-mobile|get_battery_status", () => ({
       level: 80,
@@ -293,6 +293,12 @@ describe("sync session ownership", () => {
     expect(store.status).toBe("connecting");
     expect(store.canDismiss).toBe(false);
 
+    emitTauriEvent("vcp-sync-status", { sessionId: 23, status: "open" });
+    pendingStart.resolve(23);
+    await starting;
+    expect(store.status).toBe("connected");
+
+    // ptp4g#31：上游要求会话号返回前保持挂载；拿到会话号后系统返回才收起到后台。
     window.dispatchEvent(
       new PopStateEvent("popstate", { state: { vcpMain: true } }),
     );
@@ -300,15 +306,6 @@ describe("sync session ownership", () => {
     expect(overlay.isSyncSessionOpen).toBe(false);
     expect(store.isOpen).toBe(true);
     expect(store.backgrounded).toBe(true);
-    expect(
-      invokeMock.mock.calls.some(([command]) => command === "stop_sync"),
-    ).toBe(false);
-
-    emitTauriEvent("vcp-sync-status", { sessionId: 23, status: "open" });
-    expect(store.status).toBe("connecting");
-    pendingStart.resolve(23);
-    await starting;
-    expect(store.status).toBe("connected");
     expect(
       invokeMock.mock.calls.some(([command]) => command === "stop_sync"),
     ).toBe(false);

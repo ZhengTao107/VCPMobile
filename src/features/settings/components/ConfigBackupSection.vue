@@ -394,14 +394,6 @@ const selectAll = (e: Event) => {
       class="w-full bg-black/5 dark:bg-black/20 text-primary-text px-3 py-2.5 rounded-xl border border-black/10 dark:border-white/10 outline-none font-mono text-[11px] break-all resize-none"
       @focus="selectAll"
     ></textarea>
-
-    <input
-      type="file"
-      ref="fileInput"
-      class="hidden"
-      accept=".vcpcfg,application/json"
-      @change="onFileChange"
-    />
   </div>
 
   <VcpConfirm

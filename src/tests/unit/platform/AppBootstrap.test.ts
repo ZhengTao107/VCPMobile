@@ -380,7 +380,7 @@ describe('platform-aware bootstrap', () => {
     await lifecycle.bootstrap();
     expect(lifecycle.state).toBe('PERMISSIONS');
 
-    await lifecycle.continueFromPermissionGuide();
+    await lifecycle.skipPermissionGuide();
     expect(lifecycle.state).toBe('READY');
     expect(useNotificationStore().historyList.some((item) => item.id === 'startup_permission_skipped')).toBe(true);
 
