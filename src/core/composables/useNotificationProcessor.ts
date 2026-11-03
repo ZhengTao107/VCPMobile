@@ -244,6 +244,9 @@ export function useNotificationProcessor() {
       }
 
       if (vcpData.tool_name && vcpData.status) {
+        // 工具回执（成功/失败）只进通知中心，不弹浮动卡片：对齐桌面端开启「通知过滤」后的表现，
+        // 避免每次工具调用都弹卡遮挡界面；审批请求等需要处理的提醒走其他分支，不受影响。
+        historyOnly = true;
         const isDailyNote = String(vcpData.tool_name).toLowerCase() === 'dailynote';
         type = vcpData.status === 'error' 
           ? 'error' 

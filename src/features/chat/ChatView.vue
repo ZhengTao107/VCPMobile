@@ -25,13 +25,14 @@ import { useChatScroll } from "../../core/composables/useChatScroll";
 import { scrollToMessageById } from "../../core/utils/scrollToMessage";
 import { openPresentationMenu } from "./presentationMenu";
 
+/** embedded：嵌在 Canvas 标签内时隐藏自带顶栏与标签栏（会话仍取全局 chatSession）。 */
+const props = withDefaults(defineProps<{ embedded?: boolean }>(), { embedded: false });
 const emit = defineEmits<{
   (event: "content-settled", key: ConversationKey | null): void;
   (event: "content-pending", key: ConversationKey | null): void;
 }>();
 let contentGeneration = 0;
 let viewDisposed = false;
-
 const sessionStore = useChatSessionStore();
 const historyStore = useChatHistoryStore();
 const topicStore = useTopicStore();
@@ -241,7 +242,7 @@ onUnmounted(() => {
     :data-presentation-mode="chatPreferences.presentationMode" :data-voice-active="voiceCall.active || undefined"
     @touchmove="handleContainerTouchMove">
     <!-- 1. Header (强制保底高度 80px，确保刘海屏可见) -->
-    <header class="vcp-header-fixed shrink-0 flex items-center justify-between gap-3 px-4 border-b border-white/5">
+    <header v-if="!props.embedded" class="vcp-header-fixed shrink-0 flex items-center justify-between gap-3 px-4 border-b border-white/5">
       <div class="flex items-center gap-3 min-w-0 flex-1">
         <!-- 侧边栏按钮 (使用内联 SVG 确保 100% 可见) -->
         <button @click="voiceCall.active ? overlayStore.openVoiceStyleGuidance() : layoutStore.toggleLeftDrawer()"
@@ -339,7 +340,7 @@ onUnmounted(() => {
     </header>
 
     <!-- 1.5 已打开话题标签栏（仅多于 1 个标签时显示） -->
-    <OpenTabsBar />
+    <OpenTabsBar v-if="!props.embedded" />
 
     <div class="chat-conversation-surface flex-1 min-h-0 min-w-0 flex flex-col relative">
     <!-- 2. 消息展示区 (确保 flex-1 撑开) -->

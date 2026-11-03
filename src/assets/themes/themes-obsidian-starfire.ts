@@ -1,0 +1,88 @@
+export const meta = {
+  fileName: 'themes-obsidian-starfire.css',
+  name: '黑曜与星火',
+};
+
+export const variables = {
+  dark: {
+  "--chat-wallpaper-dark": "'relic_obsidian_dark.webp'",
+  "--primary-bg": "#0A0C10",
+  "--secondary-bg": "#12151D",
+  "--tertiary-bg": "#0A0C10",
+  "--accent-bg": "#1A1F2B",
+  "--border-color": "#2E3646",
+  "--input-bg": "#11141C",
+  "--panel-bg-dark": "rgba(18, 21, 29, 0.88)",
+  "--primary-text": "#E5E9F0",
+  "--secondary-text": "#8F9BA8",
+  "--highlight-text": "#FFB703",
+  "--text-on-accent": "#0A0C10",
+  "--placeholder-text": "#636E7B",
+  "--quoted-text": "#FB8500",
+  "--user-text": "#E5E9F0",
+  "--agent-text": "#E5E9F0",
+  "--user-bubble-bg": "rgba(125, 94, 17, 0.9)",
+  "--assistant-bubble-bg": "rgba(16, 19, 26, 0.88)",
+  "--button-bg": "#FFB703",
+  "--button-hover-bg": "#FFC526",
+  "--danger-color": "#E63946",
+  "--danger-hover-bg": "#F04F5C",
+  "--success-color": "#2A9D8F",
+  "--notification-bg": "rgba(18, 21, 29, 0.94)",
+  "--notification-header-bg": "rgba(26, 31, 43, 0.96)",
+  "--notification-border": "#2E3646",
+  "--tool-bubble-bg": "rgba(26, 31, 43, 0.65)",
+  "--tool-bubble-border": "rgba(255, 183, 3, 0.6)",
+  "--scrollbar-track": "rgba(10, 12, 16, 0.55)",
+  "--scrollbar-thumb": "rgba(255, 183, 3, 0.45)",
+  "--scrollbar-thumb-hover": "rgba(255, 183, 3, 0.75)",
+  "--shimmer-color-transparent": "rgba(255, 183, 3, 0.08)",
+  "--shimmer-color-highlight": "rgba(255, 183, 3, 0.45)",
+  "--panel-text-shadow": "0 1px 3px rgba(0, 0, 0, 0.75)",
+  "--panel-bg": "var(--panel-bg-dark)"
+},
+  light: {
+  "--chat-wallpaper-light": "'relic_ivory_light.webp'",
+  "--primary-bg": "#F8F6F0",
+  "--secondary-bg": "#FFFFFF",
+  "--tertiary-bg": "#F8F6F0",
+  "--accent-bg": "#EFECE4",
+  "--border-color": "#D8D2C4",
+  "--input-bg": "#FFFEFE",
+  "--panel-bg-light": "rgba(255, 255, 255, 0.88)",
+  "--primary-text": "#1E242B",
+  "--secondary-text": "#5A6572",
+  "--highlight-text": "#1D4ED8",
+  "--text-on-accent": "#FFFFFF",
+  "--placeholder-text": "#8A94A0",
+  "--quoted-text": "#B45309",
+  "--user-text": "#1E242B",
+  "--agent-text": "#1E242B",
+  "--user-bubble-bg": "rgba(119, 149, 232, 0.9)",
+  "--assistant-bubble-bg": "rgba(255, 255, 255, 0.88)",
+  "--button-bg": "#1D4ED8",
+  "--button-hover-bg": "#1E40AF",
+  "--danger-color": "#DC2626",
+  "--danger-hover-bg": "#B91C1C",
+  "--success-color": "#0D9488",
+  "--notification-bg": "rgba(255, 255, 255, 0.94)",
+  "--notification-header-bg": "rgba(239, 236, 228, 0.94)",
+  "--notification-border": "#D8D2C4",
+  "--tool-bubble-bg": "rgba(235, 242, 250, 0.75)",
+  "--tool-bubble-border": "rgba(29, 78, 216, 0.55)",
+  "--scrollbar-track": "rgba(216, 210, 196, 0.45)",
+  "--scrollbar-thumb": "rgba(29, 78, 216, 0.42)",
+  "--scrollbar-thumb-hover": "rgba(29, 78, 216, 0.72)",
+  "--shimmer-color-transparent": "rgba(29, 78, 216, 0.06)",
+  "--shimmer-color-highlight": "rgba(29, 78, 216, 0.35)",
+  "--panel-text-shadow": "0 1px 0 rgba(255, 255, 255, 0.6)",
+  "--panel-bg": "var(--panel-bg-light)"
+},
+};
+
+export const extraCss = `
+.tool-bubble {
+    border: 1px solid var(--tool-bubble-border);
+    background: var(--tool-bubble-bg);
+}
+`;

@@ -16,6 +16,7 @@ import {
   Bot,
   MessageSquareText,
   Mail,
+  PenLine,
 } from '@lucide/vue';
 import { useNotificationStore } from '../../core/stores/notification';
 import { useNotificationProcessor } from '../../core/composables/useNotificationProcessor';
@@ -24,6 +25,7 @@ import NotificationStatusBar from '../../features/notification/NotificationStatu
 import NotificationList from '../../features/notification/NotificationList.vue';
 import { useOverlayStore } from '../../core/stores/overlay';
 import { isAndroid } from '../../core/utils/platform';
+import { useRouter } from 'vue-router';
 
 const props = defineProps<{ isOpen: boolean }>();
 
@@ -34,6 +36,7 @@ const emit = defineEmits<{
 const store = useNotificationStore();
 const { processPayload } = useNotificationProcessor();
 const overlayStore = useOverlayStore();
+const router = useRouter();
 
 const openDistributedView = () => {
   overlayStore.openDistributed();
@@ -96,6 +99,50 @@ const moreTools = [
     label: 'VCP CLI',
     icon: SquareTerminal,
     open: () => overlayStore.openCliManifest(),
+  },
+  {
+    id: 'canvas',
+    label: 'Canvas',
+    icon: PenLine,
+    open: async () => {
+      const pendingModalBack = Boolean(
+        (window.history.state as { vcpModalId?: string } | null)?.vcpModalId,
+      );
+      const backSettled = pendingModalBack
+        ? new Promise<void>((resolve) => {
+            const timer = window.setTimeout(resolve, 400);
+            window.addEventListener(
+              'popstate',
+              () => {
+                window.clearTimeout(timer);
+                resolve();
+              },
+              { once: true },
+            );
+          })
+        : Promise.resolve();
+      emit('close');
+      await backSettled;
+      await new Promise<void>((resolve) => window.setTimeout(resolve, 0));
+      try {
+        const failure = await router.push('/canvas');
+        if (failure) {
+          store.addNotification({
+            type: 'error',
+            title: 'Canvas 打开失败',
+            message: `导航未完成：${String((failure as { message?: string }).message ?? failure)}`,
+            toastOnly: true,
+          });
+        }
+      } catch (error) {
+        store.addNotification({
+          type: 'error',
+          title: 'Canvas 打开失败',
+          message: error instanceof Error ? `${error.name}: ${error.message}` : String(error),
+          toastOnly: true,
+        });
+      }
+    },
   },
   {
     id: 'sync',

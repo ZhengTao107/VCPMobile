@@ -9,7 +9,8 @@ import { useOverlayStore } from "../../core/stores/overlay";
 import { useNotificationStore } from "../../core/stores/notification";
 import { allowChatMutation, chatMutationBlockReason } from "../chat/chatMutationPolicy";
 import type { OverlayActionItem } from "../../core/types/overlay";
-import { Edit3, Lock, LockOpen, CheckCircle, Trash2, Copy, Pin, PinOff } from "@lucide/vue";
+import { useOpenTabsStore } from "../../core/stores/openTabsStore";
+import { Edit3, Lock, LockOpen, CheckCircle, Trash2, Copy, Pin, PinOff, ExternalLink } from "@lucide/vue";
 
 const emit = defineEmits<{
   (e: "select-topic"): void;
@@ -20,6 +21,7 @@ const sessionStore = useChatSessionStore();
 const layoutStore = useLayoutStore();
 const overlayStore = useOverlayStore();
 const notificationStore = useNotificationStore();
+const openTabsStore = useOpenTabsStore();
 const router = useRouter();
 
 type TopicListRow =
@@ -88,6 +90,24 @@ const showTopicContextMenu = (topicId: string) => {
 
   const mutationScope = { ownerId: itemId, ownerType, topicId: topic.id };
   const menuItems: OverlayActionItem[] = [
+    {
+      label: "在新标签页打开",
+      icon: ExternalLink,
+      handler: async () => {
+        if (router.currentRoute.value.path !== "/chat") {
+          await router.push("/chat");
+        }
+        const opened = await openTabsStore.openInNewTab({
+          ownerId: itemId,
+          ownerType,
+          topicId: topic.id,
+          title: topic.name,
+        });
+        if (!opened) return;
+        layoutStore.setLeftDrawer(false);
+        emit("select-topic");
+      },
+    },
     {
       label: "修改标题",
       icon: Edit3,

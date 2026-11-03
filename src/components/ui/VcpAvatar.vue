@@ -18,6 +18,8 @@ const props = defineProps<{
   size?: string; // 如 'w-10 h-10'
   rounded?: string; // 如 'rounded-xl'
   dominantColor?: string | null;
+  fallbackText?: string; // 覆盖默认首字母占位
+  fallbackTextClass?: string; // 覆盖默认占位字号
 }>();
 
 const avatarStore = useAvatarStore();
@@ -56,6 +58,7 @@ const borderStyle = computed(() => {
 
 // 提取首字母用于 Fallback
 const initial = computed(() => {
+  if (props.fallbackText) return props.fallbackText;
   const name = resolvedFallbackName.value || resolvedId.value || "?";
   return name.trim().charAt(0).toUpperCase();
 });
@@ -136,7 +139,7 @@ const handleImgError = () => {
     <div 
       class="absolute inset-0 flex items-center justify-center text-white font-bold select-none"
       :style="{ backgroundColor: fallbackBg }"
-      :class="size?.includes('w-16') ? 'text-xl' : 'text-sm'"
+      :class="fallbackTextClass || (size?.includes('w-16') ? 'text-xl' : 'text-sm')"
     >
       {{ initial }}
     </div>

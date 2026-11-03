@@ -1,0 +1,88 @@
+export const meta = {
+  fileName: 'themes-paper-ink-clockwork.css',
+  name: '纸墨与机芯',
+};
+
+export const variables = {
+  dark: {
+  "--chat-wallpaper-dark": "'vcp_industrial_core_dark.webp'",
+  "--primary-bg": "#171A1D",
+  "--secondary-bg": "#20252A",
+  "--tertiary-bg": "#171A1D",
+  "--accent-bg": "#2A3035",
+  "--border-color": "#3B4449",
+  "--input-bg": "#1F2429",
+  "--panel-bg-dark": "rgba(32, 37, 42, 0.86)",
+  "--primary-text": "#F2F0E9",
+  "--secondary-text": "#A7AFB1",
+  "--highlight-text": "#F2A900",
+  "--text-on-accent": "#171A1D",
+  "--placeholder-text": "#788185",
+  "--quoted-text": "#76BFAE",
+  "--user-text": "#F2F0E9",
+  "--agent-text": "#F2F0E9",
+  "--user-bubble-bg": "rgba(137, 103, 21, 0.9)",
+  "--assistant-bubble-bg": "rgba(32, 37, 42, 0.78)",
+  "--button-bg": "#F2A900",
+  "--button-hover-bg": "#FFC247",
+  "--danger-color": "#E06C5F",
+  "--danger-hover-bg": "#F07B6E",
+  "--success-color": "#76BFAE",
+  "--notification-bg": "rgba(32, 37, 42, 0.92)",
+  "--notification-header-bg": "rgba(42, 48, 53, 0.94)",
+  "--notification-border": "#3B4449",
+  "--tool-bubble-bg": "rgba(36, 61, 57, 0.42)",
+  "--tool-bubble-border": "rgba(118, 191, 174, 0.66)",
+  "--scrollbar-track": "rgba(23, 26, 29, 0.55)",
+  "--scrollbar-thumb": "rgba(242, 169, 0, 0.52)",
+  "--scrollbar-thumb-hover": "rgba(242, 169, 0, 0.78)",
+  "--shimmer-color-transparent": "rgba(242, 169, 0, 0.08)",
+  "--shimmer-color-highlight": "rgba(242, 169, 0, 0.48)",
+  "--panel-text-shadow": "0 1px 3px rgba(0, 0, 0, 0.72)",
+  "--panel-bg": "var(--panel-bg-dark)"
+},
+  light: {
+  "--chat-wallpaper-light": "'vcp_editorial_ink_light.webp'",
+  "--primary-bg": "#F2EFE7",
+  "--secondary-bg": "#FCFAF4",
+  "--tertiary-bg": "#F2EFE7",
+  "--accent-bg": "#E7E1D5",
+  "--border-color": "#D2CBC0",
+  "--input-bg": "#FBF9F3",
+  "--panel-bg-light": "rgba(252, 250, 244, 0.88)",
+  "--primary-text": "#1B211F",
+  "--secondary-text": "#626A66",
+  "--highlight-text": "#B94832",
+  "--text-on-accent": "#FFFAF3",
+  "--placeholder-text": "#8A918D",
+  "--quoted-text": "#21675C",
+  "--user-text": "#1B211F",
+  "--agent-text": "#1B211F",
+  "--user-bubble-bg": "rgba(212, 143, 128, 0.9)",
+  "--assistant-bubble-bg": "rgba(252, 250, 244, 0.84)",
+  "--button-bg": "#B94832",
+  "--button-hover-bg": "#A43D2A",
+  "--danger-color": "#B94832",
+  "--danger-hover-bg": "#963622",
+  "--success-color": "#21675C",
+  "--notification-bg": "rgba(252, 250, 244, 0.94)",
+  "--notification-header-bg": "rgba(231, 225, 213, 0.94)",
+  "--notification-border": "#D2CBC0",
+  "--tool-bubble-bg": "rgba(217, 231, 225, 0.72)",
+  "--tool-bubble-border": "rgba(33, 103, 92, 0.58)",
+  "--scrollbar-track": "rgba(210, 203, 192, 0.48)",
+  "--scrollbar-thumb": "rgba(185, 72, 50, 0.50)",
+  "--scrollbar-thumb-hover": "rgba(185, 72, 50, 0.76)",
+  "--shimmer-color-transparent": "rgba(185, 72, 50, 0.06)",
+  "--shimmer-color-highlight": "rgba(185, 72, 50, 0.34)",
+  "--panel-text-shadow": "0 1px 0 rgba(255, 255, 255, 0.52)",
+  "--panel-bg": "var(--panel-bg-light)"
+},
+};
+
+export const extraCss = `
+.tool-bubble {
+    border: 1px solid var(--tool-bubble-border);
+    background: var(--tool-bubble-bg);
+}
+`;

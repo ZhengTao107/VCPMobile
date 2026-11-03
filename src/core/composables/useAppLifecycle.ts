@@ -5,6 +5,7 @@ import { useChatStreamStore } from '../stores/chatStreamStore';
 import { useRagObserverStore } from '../stores/ragObserver';
 import { requestAutoSync } from '../sync/autoSyncTrigger';
 import { useRemoteChangeHint } from '../sync/remoteChangeHint';
+import { useSettingsRemote } from '../sync/settingsRemote';
 import { isIOS } from '../utils/platform';
 import type { LifecycleSnapshotDto } from '../types/lifecycle';
 import { createVoiceHistorySync } from '../../features/chat/voice/voiceHistorySync';
@@ -78,12 +79,15 @@ export function useAppLifecycle() {
     });
 
   // 电脑端数据变化提示：仅前台时长轮询；切后台中止在途请求，回前台续订。
-  const disposeRemoteHint = useRemoteChangeHint(() => {
+  const isForeground = () => {
     if (documentHidden.value) return false;
     const phase = lifecycleStore.lifecycleSnapshot?.phase;
     if (isIOS && !phase) return false;
     return !phase || phase === 'active';
-  });
+  };
+  const disposeRemoteHint = useRemoteChangeHint(isForeground);
+  // 电脑端设置（用户名、明暗）：前台目标出现时拉取，本机变化防抖上推。
+  const disposeSettingsRemote = useSettingsRemote(isForeground);
 
   const handleVisibilityChange = () => {
     documentHidden.value = document.hidden;
@@ -133,6 +137,7 @@ export function useAppLifecycle() {
     disposed = true;
     disposeRemoteHint();
     voiceHistory.dispose();
+    disposeSettingsRemote();
     document.removeEventListener("visibilitychange", handleVisibilityChange);
     if (unlisten) {
       unlisten();

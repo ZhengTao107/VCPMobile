@@ -9,6 +9,7 @@ import { useOverlayStore } from "../../core/stores/overlay";
 import VcpAvatar from "../../components/ui/VcpAvatar.vue";
 import AvatarWaveSlot from "../../components/ui/AvatarWaveSlot.vue";
 import { useAgentOrderStore } from "./agentOrderStore";
+import GroupAvatar from "./GroupAvatar.vue";
 import { activeSwipeId, currentSwipeX, MAX_SWIPE } from "./swipeController";
 import type {
   AgentListItemDto,
@@ -368,15 +369,8 @@ const filteredCombinedItems = computed<AssistantListItem[]>(() => {
               class="vcp-sidebar-avatar-slot w-10 h-10 shrink-0 pointer-events-none"
               :active="streamStore.isOwnerGenerating(group.id, 'group')"
             >
-              <VcpAvatar
-                owner-type="group"
-                :owner-id="group.id"
-                :fallback-name="group.name"
-                size="w-10 h-10"
-                rounded="rounded-full"
-                class="pointer-events-none"
-                dominant-color="var(--highlight-text)"
-              />
+              <GroupAvatar :group-id="group.id" :group-name="group.name" :members="group.members"
+                size="w-10 h-10" dominant-color="var(--highlight-text)" class="pointer-events-none" />
             </AvatarWaveSlot>
             <div class="flex flex-col overflow-hidden flex-1 pointer-events-none">
               <span class="font-bold text-sm truncate text-primary-text">{{

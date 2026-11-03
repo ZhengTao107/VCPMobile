@@ -32,6 +32,31 @@ export const THEME_PREFERENCE_DEFAULTS: Readonly<ThemePreferences> = {
   mode: 'light',
 };
 
+export const LEGACY_THEME_MAP: Readonly<Record<string, string>> = {
+  'themes冰火魔歌.css': 'themes-ice-fire.css',
+  'themes瓷与锦.css': 'themes-porcelain-brocade.css',
+  'themes绯红天穹.css': 'themes-crimson-sky.css',
+  'themes黑白简约.css': 'themes-simple-bw.css',
+  'themes静谧森岭.css': 'themes-quiet-forest.css',
+  'themes卡提西亚.css': 'themes-cartethyia.css',
+  'themes霓虹咖啡.css': 'themes-neon-coffee.css',
+  'themes童趣梦境.css': 'themes-childhood-dream.css',
+  'themes星咏与狼嗥.css': 'themes-star-wolf.css',
+  'themes星渊雪境.css': 'themes-star-abyss.css',
+  'themes熊熊假日.css': 'themes-bear-holiday.css',
+  'themes雪境晨昏.css': 'themes-snow-morning.css',
+  'themes夜樱猫语.css': 'themes-night-sakura-cat.css',
+  'themesCodeIDE.css': 'themes-code-ide.css',
+  'themesEva.css': 'themes-eva.css',
+  'themes赤与白昼.css': 'themes-red-white-daylight.css',
+  'themes第一适格者.css': 'themes-first-children.css',
+  'themes黑曜与星火.css': 'themes-obsidian-starfire.css',
+  'themes极简Aero.css': 'themes-minimal-aero.css',
+  'themes酸性玄武.css': 'themes-acid-basalt.css',
+  'themes月影春信.css': 'themes-moon-spring.css',
+  'themes纸墨与机芯.css': 'themes-paper-ink-clockwork.css'
+};
+
 interface ThemeModule {
   meta: { fileName: string; name: string };
   variables: { dark: Record<string, string>; light: Record<string, string> };
@@ -48,7 +73,19 @@ for (const [path, mod] of Object.entries(themeModules)) {
 }
 
 export const normalizeThemeModuleKey = (value: unknown): string | null => {
-  return typeof value === 'string' && themeModulesByKey.has(value) ? value : null;
+  if (typeof value !== 'string') return null;
+  const input = value.trim();
+  if (!input || input.includes('/') || input.includes('\\') || input.includes('\0')) {
+    return null;
+  }
+
+  const legacyMapped = LEGACY_THEME_MAP[input] || input;
+  const key = legacyMapped.endsWith('.css')
+    ? `${legacyMapped.slice(0, -4)}.ts`
+    : legacyMapped;
+
+  if (!key.endsWith('.ts') || !themeModulesByKey.has(key)) return null;
+  return key;
 };
 
 export const normalizeThemeMode = (value: unknown): ThemeMode =>
