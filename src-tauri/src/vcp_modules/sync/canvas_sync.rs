@@ -75,7 +75,7 @@ struct MirrorState {
     base: BTreeMap<String, String>,
 }
 
-fn canvas_client() -> Result<&'static Client, String> {
+pub(super) fn canvas_client() -> Result<&'static Client, String> {
     static CLIENT: OnceLock<Result<Client, String>> = OnceLock::new();
     CLIENT
         .get_or_init(|| {
@@ -93,7 +93,7 @@ fn canvas_client() -> Result<&'static Client, String> {
 
 /// 与电脑端 parseScopedPath 同口径：canvas 根下单层文件名，拒绝分隔符、盘符/ADS 冒号、
 /// "."/".."、Windows 会裁掉的末尾点或空格；一期只收 .md/.txt。
-fn validate_name(name: &str) -> Result<(), String> {
+pub(super) fn validate_name(name: &str) -> Result<(), String> {
     let malformed = name.is_empty()
         || name.len() > MAX_NAME_BYTES
         || name == "."
@@ -144,7 +144,7 @@ fn require_token(token: &str) -> Result<&str, String> {
     }
 }
 
-fn describe_error(error: reqwest::Error) -> String {
+pub(super) fn describe_error(error: reqwest::Error) -> String {
     if error.is_timeout() {
         "TIMEOUT".to_owned()
     } else if error.is_connect() {
@@ -155,7 +155,7 @@ fn describe_error(error: reqwest::Error) -> String {
 }
 
 /// 读完响应体；超过 `limit` 返回 `None`（状态码由调用方保留）。
-async fn read_limited(
+pub(super) async fn read_limited(
     mut response: reqwest::Response,
     limit: usize,
 ) -> Result<Option<Vec<u8>>, String> {
@@ -200,7 +200,7 @@ async fn json_exchange(
 
 // ---------------------------------------------------------------- 本地镜像
 
-fn io_err(error: std::io::Error) -> String {
+pub(super) fn io_err(error: std::io::Error) -> String {
     if error.kind() == std::io::ErrorKind::NotFound {
         "NOT_FOUND".to_owned()
     } else {
@@ -217,7 +217,7 @@ fn file_path(root: &Path, name: &str) -> PathBuf {
 }
 
 /// 同目录临时文件 + rename，避免写到一半的正文被读到。
-fn atomic_write(target: &Path, bytes: &[u8]) -> Result<(), String> {
+pub(super) fn atomic_write(target: &Path, bytes: &[u8]) -> Result<(), String> {
     static SEQ: AtomicU64 = AtomicU64::new(0);
     let dir = target.parent().ok_or_else(|| "INVALID_PATH".to_owned())?;
     std::fs::create_dir_all(dir).map_err(io_err)?;
@@ -481,18 +481,18 @@ fn registry() -> MutexGuard<'static, HashMap<String, CancellationToken>> {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
-fn register(request_id: &str) -> CancellationToken {
+pub(super) fn register(request_id: &str) -> CancellationToken {
     registry()
         .entry(request_id.to_owned())
         .or_insert_with(CancellationToken::new)
         .clone()
 }
 
-fn unregister(request_id: &str) {
+pub(super) fn unregister(request_id: &str) {
     registry().remove(request_id);
 }
 
-fn cancel_request(request_id: &str) {
+pub(super) fn cancel_request(request_id: &str) {
     let mut map = registry();
     if !map.contains_key(request_id) && map.len() >= MAX_TOMBSTONES {
         map.retain(|_, token| !token.is_cancelled());
@@ -531,7 +531,7 @@ async fn wait_once(
 
 // ---------------------------------------------------------------- tauri 命令
 
-fn mirror_root(app: &tauri::AppHandle) -> Result<PathBuf, String> {
+pub(super) fn mirror_root(app: &tauri::AppHandle) -> Result<PathBuf, String> {
     Ok(crate::vcp_modules::infra::file_manager::get_support_root_dir(app)?.join(MIRROR_DIR))
 }
 

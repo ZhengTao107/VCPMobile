@@ -175,12 +175,28 @@ export function planSync(remote: readonly CanvasRemoteFile[], local: readonly Ca
   return actions;
 }
 
+/** 电脑端 itemType 只写 'agent'/'group'（canvasHandlers.js:2296）；兼容大小写与复数，其余按 agent。 */
+export function normalizeOwnerType(itemType: string | null | undefined): "agent" | "group" {
+  const value = String(itemType ?? "").trim().toLowerCase();
+  return value === "group" || value === "groups" ? "group" : "agent";
+}
+
 export function bindingToTab(binding: CanvasBinding): OpenTabRef {
   return {
     ownerId: binding.agentId,
-    ownerType: binding.itemType === "group" ? "group" : "agent",
+    ownerType: normalizeOwnerType(binding.itemType),
     topicId: binding.topicId,
   };
+}
+
+/** 与电脑端 Canvasmodules/canvas.js isArticleDocument 一致：md/txt/markdown 按 Markdown 预览。 */
+export const isArticleName = (name: string) => /\.(md|txt|markdown)$/i.test(name);
+
+/** [对话] 切换时限：超时或失败时显示原因与重试，不再停在“正在切换”。 */
+export const CHAT_SWITCH_TIMEOUT_MS = 3_000;
+export interface ChatSwitchState {
+  state: "idle" | "switching" | "failed";
+  reason: string | null;
 }
 
 const sameRef = (a: OpenTabRef | null, b: OpenTabRef | null) =>
@@ -192,7 +208,10 @@ export interface ChatSwitcherDeps {
   activate: (tab: OpenTabRef) => Promise<boolean>;
 }
 
-/** [对话] 激活绑定话题的标签（没开就新开）；回到 [文稿] 或退出时切回进入前的标签。 */
+/**
+ * [对话] 把全局会话切到绑定话题（不新开、不切换聊天标签）；回到 [文稿] 时切回进入前的会话。
+ * 切到其他聊天标签时调用 reset，丢弃记录，避免把用户新选的会话改回去。
+ */
 export function createChatSwitcher(deps: ChatSwitcherDeps) {
   let origin: OpenTabRef | null | undefined;
   const enter = async (target: OpenTabRef) => {
@@ -209,7 +228,10 @@ export function createChatSwitcher(deps: ChatSwitcherDeps) {
     if (!back || sameRef(back, deps.current())) return false;
     return deps.activate(back);
   };
-  return { enter, leave, entered: () => origin !== undefined };
+  const reset = () => {
+    origin = undefined;
+  };
+  return { enter, leave, reset, entered: () => origin !== undefined };
 }
 
 // ---------------------------------------------------------------- controller

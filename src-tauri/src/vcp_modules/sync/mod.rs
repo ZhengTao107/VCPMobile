@@ -1,5 +1,6 @@
 pub mod attachment_blob;
 pub mod canvas_sync;
+pub mod canvas_translate;
 pub mod open_tabs;
 pub mod settings_sync;
 pub mod sync_dto;

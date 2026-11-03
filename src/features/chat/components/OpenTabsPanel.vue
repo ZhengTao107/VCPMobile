@@ -4,11 +4,13 @@ import { invoke } from "@tauri-apps/api/core";
 import { ChevronDown, ChevronRight, History, Laptop, Monitor, Smartphone } from "lucide-vue-next";
 import { useModalHistory } from "../../../core/composables/useModalHistory";
 import {
+  canvasTabKey,
   openTabKey,
   useOpenTabsStore,
   type OpenTabRef,
   type RecentlyClosedEntry,
 } from "../../../core/stores/openTabsStore";
+import { useRouter } from "vue-router";
 import { useAssistantStore } from "../../../core/stores/assistant";
 import { useNotificationStore } from "../../../core/stores/notification";
 import {
@@ -26,6 +28,7 @@ const props = defineProps<{ modelValue: boolean; remote: OpenTabsRemoteApi }>();
 const emit = defineEmits<{ (e: "update:modelValue", value: boolean): void }>();
 
 const tabsStore = useOpenTabsStore();
+const router = useRouter();
 const assistantStore = useAssistantStore();
 const notificationStore = useNotificationStore();
 const { registerModal, unregisterModal } = useModalHistory();
@@ -164,14 +167,34 @@ const openHere = (target: OpenTabRef, title?: string | null) =>
     else toast("error", "无法打开", "本机没有找到这个话题");
   });
 
+const showCanvas = () => void router?.push("/canvas");
+
+const entryKey = (entry: RecentlyClosedEntry) =>
+  entry.kind === "batch" ? entry.id : entry.kind === "canvas" ? canvasTabKey(entry.path) : openTabKey(entry);
+
+const activateCanvas = (path: string) => {
+  if (tabsStore.activateCanvasTab(path)) showCanvas();
+  close();
+};
+
 const restoreEntry = (entry: RecentlyClosedEntry) =>
   runExclusive(async () => {
+    if (entry.kind === "canvas") {
+      if (tabsStore.restoreClosedCanvas(entry.path)) {
+        showCanvas();
+        close();
+      } else toast("error", "无法打开", "文稿路径无效");
+      return;
+    }
     if (entry.kind === "batch") {
       const result = await tabsStore.restoreClosedBatch(entry.id);
       if (result.skipped > 0) {
         toast("info", "恢复标签", `已恢复 ${result.opened}，跳过 ${result.skipped}（本机没有）`);
       }
-      if (result.activated) close();
+      if (result.activated) {
+        if (tabsStore.activeCanvasPath) showCanvas();
+        close();
+      }
       return;
     }
     if (await tabsStore.restoreClosed(entry)) close();
@@ -182,6 +205,14 @@ const restoreChild = (batchId: string, target: OpenTabRef) =>
   runExclusive(async () => {
     if (await tabsStore.restoreClosedBatchChild(batchId, target)) close();
     else toast("error", "无法打开", "本机没有找到这个话题");
+  });
+
+const restoreCanvasChild = (batchId: string, path: string) =>
+  runExclusive(async () => {
+    if (tabsStore.restoreClosedBatchCanvasChild(batchId, path)) {
+      showCanvas();
+      close();
+    } else toast("error", "无法打开", "文稿路径无效");
   });
 </script>
 
@@ -211,7 +242,12 @@ const restoreChild = (batchId: string, target: OpenTabRef) =>
               @click="tabsStore.activateTab(tab).then(close)">
               <span class="truncate">{{ labelOf(tab) }}</span>
             </button>
-            <p v-if="tabsStore.tabs.length === 0" class="panel-empty">没有打开的标签</p>
+            <button v-for="tab in tabsStore.canvasTabs" :key="canvasTabKey(tab.path)" type="button"
+              class="panel-row" :class="canvasTabKey(tab.path) === tabsStore.activeKey ? 'text-primary-text font-bold' : ''"
+              @click="activateCanvas(tab.path)">
+              <span class="truncate">Canvas · {{ tab.name }}</span>
+            </button>
+            <p v-if="tabsStore.tabs.length + tabsStore.canvasTabs.length === 0" class="panel-empty">没有打开的标签</p>
           </section>
 
           <section>
@@ -246,8 +282,7 @@ const restoreChild = (batchId: string, target: OpenTabRef) =>
 
           <section>
             <h3 class="panel-heading flex items-center gap-1"><History :size="14" /> 最近关闭</h3>
-            <template v-for="entry in tabsStore.recentlyClosed"
-              :key="entry.kind === 'batch' ? entry.id : openTabKey(entry)">
+            <template v-for="entry in tabsStore.recentlyClosed" :key="entryKey(entry)">
               <div v-if="entry.kind === 'batch'" class="mb-1">
                 <div class="panel-row">
                   <button type="button" class="flex items-center gap-2 min-w-0 flex-1 text-left"
@@ -262,8 +297,16 @@ const restoreChild = (batchId: string, target: OpenTabRef) =>
                     class="panel-row pl-8" :disabled="busy" @click="restoreChild(entry.id, tab)">
                     <span class="truncate">{{ labelOf(tab) }}</span>
                   </button>
+                  <button v-for="tab in entry.canvasTabs ?? []" :key="canvasTabKey(tab.path)" type="button"
+                    class="panel-row pl-8" :disabled="busy" @click="restoreCanvasChild(entry.id, tab.path)">
+                    <span class="truncate">Canvas · {{ tab.name }}</span>
+                  </button>
                 </template>
               </div>
+              <button v-else-if="entry.kind === 'canvas'" type="button" class="panel-row" :disabled="busy"
+                @click="restoreEntry(entry)">
+                <span class="truncate">Canvas · {{ entry.name }}</span>
+              </button>
               <button v-else type="button" class="panel-row" :disabled="busy" @click="restoreEntry(entry)">
                 <span class="truncate">{{ labelOf(entry) }}</span>
               </button>

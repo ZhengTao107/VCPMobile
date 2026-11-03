@@ -4,9 +4,17 @@ import { useRouter } from "vue-router";
 import { ArrowLeft, RefreshCw } from "lucide-vue-next";
 import CanvasDocPane from "./CanvasDocPane.vue";
 import CanvasChatPane from "./CanvasChatPane.vue";
-import { useCanvasStore, createChatSwitcher, bindingToTab } from "../../core/stores/canvasStore";
-import { useOpenTabsStore, openTabKey } from "../../core/stores/openTabsStore";
+import OpenTabsBar from "../chat/components/OpenTabsBar.vue";
+import {
+  useCanvasStore,
+  createChatSwitcher,
+  bindingToTab,
+  CHAT_SWITCH_TIMEOUT_MS,
+  type ChatSwitchState,
+} from "../../core/stores/canvasStore";
+import { useOpenTabsStore, openTabKey, canvasNameOf, type OpenTabRef } from "../../core/stores/openTabsStore";
 import { useChatSessionStore } from "../../core/stores/chatSessionStore";
+import { useAssistantStore } from "../../core/stores/assistant";
 
 type Segment = "doc" | "chat";
 
@@ -14,14 +22,24 @@ const router = useRouter();
 const canvas = useCanvasStore();
 const tabsStore = useOpenTabsStore();
 const sessionStore = useChatSessionStore();
+const assistantStore = useAssistantStore();
 
-const selected = ref<string | null>(null);
+/** 当前文稿由激活的 Canvas 标签决定；listMode 时只看列表，不关闭标签。 */
+const listMode = ref(false);
+const selected = computed(() =>
+  !listMode.value && tabsStore.activeCanvasPath ? canvasNameOf(tabsStore.activeCanvasPath) : null,
+);
 const segment = ref<Segment>("doc");
 
+/** [对话] 只把全局会话切到绑定话题，不新开、不切换聊天标签（Canvas 标签激活时 upsertCurrent 跳过）。 */
+const selectConversation = async (tab: OpenTabRef) => {
+  await sessionStore.selectTopicById(tab.ownerId, tab.ownerType, tab.topicId);
+  return true;
+};
 const switcher = createChatSwitcher({
   current: () => sessionStore.currentConversationKey,
-  open: (tab) => tabsStore.openInNewTab(tab),
-  activate: (tab) => tabsStore.activateTab(tab),
+  open: selectConversation,
+  activate: selectConversation,
 });
 
 const docs = computed(() => canvas.state.docs);
@@ -47,32 +65,117 @@ const statusText = computed(() => {
   }
 });
 
-const enterChat = async () => {
-  if (binding.value) await switcher.enter(bindingToTab(binding.value));
+const chatSwitch = ref<ChatSwitchState>({ state: "idle", reason: null });
+let switchTimer: ReturnType<typeof setTimeout> | null = null;
+const clearSwitchTimer = () => {
+  if (switchTimer) clearTimeout(switchTimer);
+  switchTimer = null;
 };
+
+const ownerKnown = (tab: OpenTabRef) =>
+  tab.ownerType === "group"
+    ? assistantStore.groups.some((g) => g.id === tab.ownerId)
+    : assistantStore.agents.some((a) => a.id === tab.ownerId);
+
+const failureReason = (tab: OpenTabRef, error: unknown) => {
+  if (!ownerKnown(tab)) {
+    return `手机上没有${tab.ownerType === "group" ? "群" : " Agent "}「${tab.ownerId}」，请先同步或改选话题`;
+  }
+  if (error) return `打开话题出错：${error instanceof Error ? error.message : String(error)}`;
+  return `无法打开话题「${tab.topicId}」`;
+};
+
+const enterChat = async () => {
+  if (!binding.value) return;
+  const target = bindingToTab(binding.value);
+  clearSwitchTimer();
+  chatSwitch.value = { state: "switching", reason: null };
+  switchTimer = setTimeout(() => {
+    switchTimer = null;
+    if (segment.value === "chat" && !chatActive.value && chatSwitch.value.state === "switching") {
+      chatSwitch.value = {
+        state: "failed",
+        reason: `${CHAT_SWITCH_TIMEOUT_MS / 1000} 秒内没有切到对应话题`,
+      };
+    }
+  }, CHAT_SWITCH_TIMEOUT_MS);
+  let opened = false;
+  let error: unknown = null;
+  try {
+    opened = await switcher.enter(target);
+  } catch (e) {
+    error = e;
+  }
+  if (segment.value !== "chat") return;
+  if (opened && chatActive.value) {
+    clearSwitchTimer();
+    chatSwitch.value = { state: "idle", reason: null };
+  } else if (!opened) {
+    clearSwitchTimer();
+    chatSwitch.value = { state: "failed", reason: failureReason(target, error) };
+  }
+};
+
+// 切换成功（含超时后迟到的激活）即清除失败状态。
+watch(chatActive, (active) => {
+  if (!active) return;
+  clearSwitchTimer();
+  chatSwitch.value = { state: "idle", reason: null };
+});
 
 const setSegment = async (next: Segment) => {
   if (segment.value === next) return;
   segment.value = next;
-  if (next === "chat") await enterChat();
-  else await switcher.leave();
+  if (next === "chat") {
+    await enterChat();
+  } else {
+    clearSwitchTimer();
+    chatSwitch.value = { state: "idle", reason: null };
+    await switcher.leave();
+  }
 };
 
-// 在[对话]里新建立绑定后立即切过去。
+// 在[对话]里新建立或改选绑定后立即切过去。
 watch(binding, (value, old) => {
-  if (segment.value === "chat" && value && !old) void enterChat();
+  const changed = !!value && (!old || openTabKey(bindingToTab(value)) !== openTabKey(bindingToTab(old)));
+  if (segment.value === "chat" && changed) void enterChat();
 });
 
 const openDoc = (name: string) => {
-  selected.value = name;
+  listMode.value = false;
   segment.value = "doc";
+  tabsStore.openCanvasTab(name);
 };
 
-const closeDoc = async () => {
-  await switcher.leave();
-  selected.value = null;
-  segment.value = "doc";
+/** 返回：文稿 → 列表（标签保留）；列表 → 离开 Canvas 回聊天。 */
+const goBack = async () => {
+  if (current.value) {
+    clearSwitchTimer();
+    await switcher.leave();
+    segment.value = "doc";
+    listMode.value = true;
+    return;
+  }
+  await tabsStore.leaveCanvas();
+  void router?.push("/chat");
 };
+
+// 标签切换：换到另一个 Canvas 标签时回 [文稿] 并恢复进入前会话；切到聊天标签（含关闭当前 Canvas 标签后回退）时回 /chat。
+watch(
+  () => tabsStore.activeCanvasPath,
+  async (path, old) => {
+    clearSwitchTimer();
+    chatSwitch.value = { state: "idle", reason: null };
+    segment.value = "doc";
+    if (path) {
+      listMode.value = false;
+      if (old) await switcher.leave();
+      return;
+    }
+    switcher.reset();
+    if (old) void router?.push("/chat");
+  },
+);
 
 const bind = (value: { agentId: string; topicId: string; itemType: string | null }) =>
   selected.value ? canvas.bind(selected.value, value) : Promise.resolve();
@@ -97,19 +200,20 @@ const formatTime = (ms: number) => (ms ? new Date(ms).toLocaleString() : "");
 
 onMounted(() => void canvas.start());
 onBeforeUnmount(() => {
+  clearSwitchTimer();
   canvas.stop();
-  void switcher.leave();
+  switcher.reset();
 });
 </script>
 
 <template>
   <div class="canvas-view flex flex-col h-full w-full min-w-0 bg-[var(--primary-bg)]">
-    <header class="flex items-center gap-2 px-3 py-2 border-b border-black/5 dark:border-white/10">
+    <header class="canvas-header shrink-0 flex items-center gap-2 px-3 border-b border-black/5 dark:border-white/10">
       <button
         type="button"
         class="w-9 h-9 rounded-full flex items-center justify-center text-[var(--primary-text)]"
         :aria-label="current ? '返回文稿列表' : '返回聊天'"
-        @click="current ? closeDoc() : router.push('/chat')"
+        @click="goBack"
       >
         <ArrowLeft :size="18" />
       </button>
@@ -141,6 +245,7 @@ onBeforeUnmount(() => {
         <RefreshCw :size="16" :class="{ 'animate-spin': canvas.state.status === 'syncing' }" />
       </button>
     </header>
+    <OpenTabsBar />
 
     <p v-if="statusText" class="px-3 py-1.5 text-[11px] opacity-70 text-[var(--primary-text)] bg-[var(--secondary-bg)]">
       {{ statusText }}
@@ -179,8 +284,19 @@ onBeforeUnmount(() => {
         :name="current.name"
         :binding="binding"
         :active="chatActive"
+        :switch-state="chatSwitch"
         :bind="bind"
+        :retry="enterChat"
       />
     </div>
   </div>
 </template>
+
+<style scoped>
+/* 同 ChatView .vcp-header-fixed：避开刘海/状态栏。 */
+.canvas-header {
+  padding-top: calc(var(--vcp-safe-top, 24px));
+  padding-bottom: 8px;
+  background-color: var(--vcp-panel-bg-97, var(--secondary-bg));
+}
+</style>

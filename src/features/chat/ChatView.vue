@@ -22,6 +22,8 @@ import { useKeyboardInsets } from "../../core/composables/useKeyboardInsets";
 import { useChatScroll } from "../../core/composables/useChatScroll";
 import { openPresentationMenu } from "./presentationMenu";
 
+/** embedded：嵌在 Canvas 标签内时隐藏自带顶栏与标签栏（会话仍取全局 chatSession）。 */
+const props = withDefaults(defineProps<{ embedded?: boolean }>(), { embedded: false });
 const sessionStore = useChatSessionStore();
 const historyStore = useChatHistoryStore();
 const topicStore = useTopicStore();
@@ -223,7 +225,7 @@ onUnmounted(() => {
   <div ref="chatViewContainerRef" class="chat-view-container flex flex-col h-full w-full min-w-0 relative bg-transparent overflow-hidden"
     :data-presentation-mode="themeStore.presentationMode" @touchmove="handleContainerTouchMove">
     <!-- 1. Header (强制保底高度 80px，确保刘海屏可见) -->
-    <header class="vcp-header-fixed shrink-0 flex items-center justify-between gap-3 px-4 border-b border-white/5">
+    <header v-if="!props.embedded" class="vcp-header-fixed shrink-0 flex items-center justify-between gap-3 px-4 border-b border-white/5">
       <div class="flex items-center gap-3 min-w-0 flex-1">
         <!-- 侧边栏按钮 (使用内联 SVG 确保 100% 可见) -->
         <button @click="layoutStore.toggleLeftDrawer()"
@@ -313,7 +315,7 @@ onUnmounted(() => {
     </header>
 
     <!-- 1.5 已打开话题标签栏（仅多于 1 个标签时显示） -->
-    <OpenTabsBar />
+    <OpenTabsBar v-if="!props.embedded" />
 
     <!-- 2. 消息展示区 (确保 flex-1 撑开) -->
     <div ref="messageListRef" class="flex-1 overflow-y-auto relative no-rubber-band">
