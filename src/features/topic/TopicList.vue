@@ -10,7 +10,7 @@ import { useNotificationStore } from "../../core/stores/notification";
 import { allowChatMutation, chatMutationBlockReason } from "../chat/chatMutationPolicy";
 import type { OverlayActionItem } from "../../core/types/overlay";
 import { useOpenTabsStore } from "../../core/stores/openTabsStore";
-import { Edit3, Lock, LockOpen, CheckCircle, Trash2, Copy, Pin, PinOff, ExternalLink } from "@lucide/vue";
+import { Edit3, Lock, LockOpen, CheckCircle, Trash2, Copy, Pin, PinOff, ExternalLink, GitBranch } from "@lucide/vue";
 
 const emit = defineEmits<{
   (e: "select-topic"): void;
@@ -106,6 +106,17 @@ const showTopicContextMenu = (topicId: string) => {
         if (!opened) return;
         layoutStore.setLeftDrawer(false);
         emit("select-topic");
+      },
+    },
+    {
+      label: "查看子话题",
+      icon: GitBranch,
+      handler: async () => {
+        layoutStore.setLeftDrawer(false);
+        await router.push({
+          path: "/sidechat",
+          query: { parentTopicId: topic.id, title: topic.name },
+        });
       },
     },
     {
