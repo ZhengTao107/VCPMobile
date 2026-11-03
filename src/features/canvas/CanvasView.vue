@@ -4,9 +4,16 @@ import { useRouter } from "vue-router";
 import { ArrowLeft, RefreshCw } from "lucide-vue-next";
 import CanvasDocPane from "./CanvasDocPane.vue";
 import CanvasChatPane from "./CanvasChatPane.vue";
-import { useCanvasStore, createChatSwitcher, bindingToTab } from "../../core/stores/canvasStore";
-import { useOpenTabsStore, openTabKey } from "../../core/stores/openTabsStore";
+import {
+  useCanvasStore,
+  createChatSwitcher,
+  bindingToTab,
+  CHAT_SWITCH_TIMEOUT_MS,
+  type ChatSwitchState,
+} from "../../core/stores/canvasStore";
+import { useOpenTabsStore, openTabKey, type OpenTabRef } from "../../core/stores/openTabsStore";
 import { useChatSessionStore } from "../../core/stores/chatSessionStore";
+import { useAssistantStore } from "../../core/stores/assistant";
 
 type Segment = "doc" | "chat";
 
@@ -14,6 +21,7 @@ const router = useRouter();
 const canvas = useCanvasStore();
 const tabsStore = useOpenTabsStore();
 const sessionStore = useChatSessionStore();
+const assistantStore = useAssistantStore();
 
 const selected = ref<string | null>(null);
 const segment = ref<Segment>("doc");
@@ -47,20 +55,80 @@ const statusText = computed(() => {
   }
 });
 
-const enterChat = async () => {
-  if (binding.value) await switcher.enter(bindingToTab(binding.value));
+const chatSwitch = ref<ChatSwitchState>({ state: "idle", reason: null });
+let switchTimer: ReturnType<typeof setTimeout> | null = null;
+const clearSwitchTimer = () => {
+  if (switchTimer) clearTimeout(switchTimer);
+  switchTimer = null;
 };
+
+const ownerKnown = (tab: OpenTabRef) =>
+  tab.ownerType === "group"
+    ? assistantStore.groups.some((g) => g.id === tab.ownerId)
+    : assistantStore.agents.some((a) => a.id === tab.ownerId);
+
+const failureReason = (tab: OpenTabRef, error: unknown) => {
+  if (error) return `打开话题出错：${error instanceof Error ? error.message : String(error)}`;
+  if (!ownerKnown(tab)) {
+    return `手机上没有${tab.ownerType === "group" ? "群" : " Agent "}「${tab.ownerId}」，请先同步或改选话题`;
+  }
+  return `无法打开话题「${tab.topicId}」`;
+};
+
+const enterChat = async () => {
+  if (!binding.value) return;
+  const target = bindingToTab(binding.value);
+  clearSwitchTimer();
+  chatSwitch.value = { state: "switching", reason: null };
+  switchTimer = setTimeout(() => {
+    switchTimer = null;
+    if (segment.value === "chat" && !chatActive.value && chatSwitch.value.state === "switching") {
+      chatSwitch.value = {
+        state: "failed",
+        reason: `${CHAT_SWITCH_TIMEOUT_MS / 1000} 秒内没有切到对应话题`,
+      };
+    }
+  }, CHAT_SWITCH_TIMEOUT_MS);
+  let opened = false;
+  let error: unknown = null;
+  try {
+    opened = await switcher.enter(target);
+  } catch (e) {
+    error = e;
+  }
+  if (segment.value !== "chat") return;
+  if (opened && chatActive.value) {
+    clearSwitchTimer();
+    chatSwitch.value = { state: "idle", reason: null };
+  } else if (!opened) {
+    clearSwitchTimer();
+    chatSwitch.value = { state: "failed", reason: failureReason(target, error) };
+  }
+};
+
+// 切换成功（含超时后迟到的激活）即清除失败状态。
+watch(chatActive, (active) => {
+  if (!active) return;
+  clearSwitchTimer();
+  chatSwitch.value = { state: "idle", reason: null };
+});
 
 const setSegment = async (next: Segment) => {
   if (segment.value === next) return;
   segment.value = next;
-  if (next === "chat") await enterChat();
-  else await switcher.leave();
+  if (next === "chat") {
+    await enterChat();
+  } else {
+    clearSwitchTimer();
+    chatSwitch.value = { state: "idle", reason: null };
+    await switcher.leave();
+  }
 };
 
-// 在[对话]里新建立绑定后立即切过去。
+// 在[对话]里新建立或改选绑定后立即切过去。
 watch(binding, (value, old) => {
-  if (segment.value === "chat" && value && !old) void enterChat();
+  const changed = !!value && (!old || openTabKey(bindingToTab(value)) !== openTabKey(bindingToTab(old)));
+  if (segment.value === "chat" && changed) void enterChat();
 });
 
 const openDoc = (name: string) => {
@@ -97,6 +165,7 @@ const formatTime = (ms: number) => (ms ? new Date(ms).toLocaleString() : "");
 
 onMounted(() => void canvas.start());
 onBeforeUnmount(() => {
+  clearSwitchTimer();
   canvas.stop();
   void switcher.leave();
 });
@@ -179,7 +248,9 @@ onBeforeUnmount(() => {
         :name="current.name"
         :binding="binding"
         :active="chatActive"
+        :switch-state="chatSwitch"
         :bind="bind"
+        :retry="enterChat"
       />
     </div>
   </div>
