@@ -3,7 +3,7 @@
  * - modules/services/canvasTranslation.js（分段、占位符保护/还原、复用、批次打包与解析、纠错轮）
  * - modules/services/canvasPmidFormat.js（PMID 引用归一）
  * - modules/services/canvasTranslationTransport.js（JSON/SSE 响应解析与可重试判断）
- * 与电脑端的差异：段 key 用 JSON 串而非 sha256（手机缓存独立、不与电脑端互通）；
+ * 与电脑端的差异：段 key 先取 JSON 串，再在 translateDocumentContent 里异步取 sha256（与电脑端逐字节一致，ptp4g#40）；
  * 并发默认 4（电脑端注释：SP 实测 12 路触发 429、4 路没有）；表格单元格分支未移植（电脑端表格整体保持原样，从不生成）。
  */
 
@@ -221,6 +221,12 @@ export function reconstructTranslatedContent(
 
 export const getSegmentTranslationKey = (segment: TranslationSegment) =>
   JSON.stringify({ source: segment.source, kind: segment.kind, protectedValues: segment.protectedValues });
+
+/** UTF-8 sha256 十六进制；与电脑端 crypto.createHash('sha256') 一致。 */
+export async function sha256Hex(text: string): Promise<string> {
+  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(String(text ?? "")));
+  return Array.from(new Uint8Array(digest), (b) => b.toString(16).padStart(2, "0")).join("");
+}
 
 // ---------------------------------------------------------------- 译文校验
 
@@ -446,7 +452,7 @@ export async function translateDocumentContent(content: string, options: Transla
   const translated = new Map<string, string>();
   const pending = new Map<string, TranslationSegment>();
   for (const segment of segments) {
-    segment.key = getSegmentTranslationKey(segment);
+    segment.key = await sha256Hex(getSegmentTranslationKey(segment));
     const cached = reusable.get(segment.key);
     const staleEcho = isEchoReply(segment, cached, targetLanguage) && !echoAcceptable(segment, targetLanguage, true);
     if (!staleEcho && isValidTranslation(segment, cached)) translated.set(segment.key, cached);

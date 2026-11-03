@@ -3,6 +3,7 @@ import { computed, onBeforeUnmount, ref, watch } from "vue";
 import { renderSafeMarkdown } from "../../core/utils/safeMarkdown";
 import { isArticleName, type CanvasLocalEntry } from "../../core/stores/canvasStore";
 import { useSettingsStore } from "../../core/stores/settings";
+import { hintTargetFromSettings } from "../../core/sync/remoteChangeHint";
 import {
   describeTranslationError,
   loadCanvasTranslation,
@@ -18,6 +19,7 @@ const props = defineProps<{
 }>();
 
 const settingsStore = useSettingsStore();
+const canvasTarget = () => hintTargetFromSettings(settingsStore.settings, true);
 const content = ref("");
 const draft = ref("");
 const editing = ref(false);
@@ -79,7 +81,13 @@ watch(
     translateError.value = null;
     view.value = "source";
     try {
-      const record = await loadCanvasTranslation(name);
+      const { model, targetLanguage } = translationSettings(settingsStore.settings);
+      const record = await loadCanvasTranslation(name, undefined, {
+        sourceSha: props.doc.sha256,
+        model,
+        targetLanguage,
+        target: canvasTarget(),
+      });
       if (props.doc.name === name) translation.value = record;
     } catch {
       translation.value = null;
@@ -105,6 +113,7 @@ const translate = async () => {
       name,
       content: content.value,
       sourceSha: props.doc.sha256,
+      target: canvasTarget(),
       model,
       targetLanguage,
       previous: translation.value,

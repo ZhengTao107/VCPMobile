@@ -8,6 +8,8 @@ import {
   type SegmentTranslation,
   type TranslateBatchRequest,
 } from "../../core/utils/canvasTranslation";
+import { loadSharedTranslation, saveSharedTranslation, type SharedLookup } from "./canvasSharedTranslation";
+import type { HintTarget } from "../../core/sync/remoteChangeHint";
 
 /** 电脑端 modules/services/canvasTranslationFallback.js:3-4。 */
 export const CANVAS_TRANSLATION_MODEL = "gemini-3.8-flash-tiered";
@@ -103,7 +105,15 @@ export const describeTranslationError = (error: unknown) => toTranslationError(e
 
 let requestSeq = 0;
 
-export async function loadCanvasTranslation(name: string, call: Call = invoke) {
+export async function loadCanvasTranslation(name: string, call: Call = invoke, shared?: SharedLookup) {
+  if (shared) {
+    try {
+      const hit = await loadSharedTranslation(name, shared, call);
+      if (hit) return hit;
+    } catch (error) {
+      console.warn("[CanvasTranslation] shared cache lookup failed:", error);
+    }
+  }
   return parseTranslationRecord(await call<string | null>("canvas_translation_load", { name }));
 }
 
@@ -117,6 +127,8 @@ export interface RunTranslationOptions {
   signal?: AbortSignal;
   onProgress?: (progress: { done: number; total: number }) => void;
   call?: Call;
+  /** 有同步目标时把新译文推给电脑，供三端共用。 */
+  target?: HintTarget | null;
 }
 
 /** 翻译一篇文稿并写入 .translations/<文件名>.json；未改动的段复用 previous。 */
@@ -162,5 +174,10 @@ export async function runCanvasTranslation(options: RunTranslationOptions): Prom
     segmentTranslations: result.segmentTranslations,
   };
   await call("canvas_translation_save", { name: options.name, record: JSON.stringify(record) });
+  try {
+    await saveSharedTranslation(record, options.target, call);
+  } catch (error) {
+    console.warn("[CanvasTranslation] shared cache save/push failed:", error);
+  }
   return record;
 }
