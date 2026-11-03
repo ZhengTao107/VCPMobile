@@ -131,6 +131,10 @@ macro_rules! app_command_handler {
             canvas_translate_cancel, canvas_translate_request, canvas_translation_load,
             canvas_translation_save,
         };
+        use crate::vcp_modules::sync::canvas_shared_translation::{
+            canvas_shared_translation_load, canvas_shared_translation_pull,
+            canvas_shared_translation_push, canvas_shared_translation_save,
+        };
         use crate::vcp_modules::sync::canvas_sync::{
             canvas_bindings_get, canvas_bindings_put, canvas_local_list, canvas_local_read,
             canvas_local_save_conflict, canvas_local_write, canvas_manifest, canvas_pull,
@@ -444,6 +448,10 @@ macro_rules! app_command_handler {
                 canvas_translate_cancel,
                 canvas_translation_load,
                 canvas_translation_save,
+                canvas_shared_translation_load,
+                canvas_shared_translation_save,
+                canvas_shared_translation_pull,
+                canvas_shared_translation_push,
                 // ── 分布式（distributed；reconcile 寄居 lifecycle_manager）──
                 distributed::execute_distributed_tool,
                 distributed::get_distributed_status,
