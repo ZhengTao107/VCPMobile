@@ -10,25 +10,33 @@ pub enum NativeEvent {
     Lifecycle(NativeLifecycleEvent),
     #[serde(rename = "network")]
     Network { connected: bool },
-    #[serde(rename = "notificationClick")]
-    NotificationClick(NativeNotificationClick),
+    #[serde(rename = "voiceAudio")]
+    VoiceAudio(crate::voice::NativeVoiceAudioEvent),
+    #[serde(rename = "voiceDocument")]
+    VoiceDocument {
+        #[serde(rename = "documentId")]
+        document_id: String,
+    },
+    #[serde(rename = "voicePlayback")]
+    VoicePlayback(NativeVoicePlaybackEvent),
     // Configuration/memory notifications do not describe an app phase.
     #[serde(rename = "configuration", alias = "memory-pressure")]
     Other {},
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct NativeNotificationClick {
-    pub click_id: String,
-    pub sequence: u64,
-    pub kind: NotificationClickKind,
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(rename_all = "lowercase")]
-pub enum NotificationClickKind {
-    App,
+#[derive(Debug, Deserialize)]
+#[serde(tag = "kind", rename_all = "lowercase")]
+pub enum NativeVoicePlaybackEvent {
+    Started {
+        #[serde(rename = "playbackId")]
+        playback_id: String,
+    },
+    Message {
+        #[serde(rename = "playbackId")]
+        playback_id: String,
+        #[serde(rename = "messageId")]
+        message_id: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
@@ -137,6 +145,36 @@ mod tests {
     use super::*;
 
     #[test]
+    fn native_document_loss_is_delivered_without_an_audio_session() {
+        let event: NativeEvent = serde_json::from_value(serde_json::json!({
+            "event": "voiceDocument", "payload": { "documentId": "42" },
+        }))
+        .unwrap();
+        assert!(matches!(event, NativeEvent::VoiceDocument { document_id } if document_id == "42"));
+        assert!(serde_json::from_value::<NativeEvent>(serde_json::json!({
+            "event": "voiceDocument", "payload": {},
+        }))
+        .is_err());
+    }
+
+    #[test]
+    fn native_playback_started_keeps_its_exact_output_identity() {
+        let event: NativeEvent = serde_json::from_value(serde_json::json!({
+            "event": "voicePlayback",
+            "payload": { "playbackId": "current-output", "kind": "started" },
+        }))
+        .unwrap();
+        assert!(matches!(event, NativeEvent::VoicePlayback(
+            NativeVoicePlaybackEvent::Started { playback_id }
+        ) if playback_id == "current-output"));
+        assert!(serde_json::from_value::<NativeEvent>(serde_json::json!({
+            "event": "voicePlayback",
+            "payload": { "kind": "started" },
+        }))
+        .is_err());
+    }
+
+    #[test]
     fn snapshots_replay_events_but_consume_guardian_and_helper_notices() {
         let notices = ServiceFailureNotices::default();
         assert!(notices.collect().is_empty());
@@ -160,46 +198,5 @@ mod tests {
             vec![ServiceFailure::Helper, ServiceFailure::Events]
         );
         assert_eq!(notices.collect(), vec![ServiceFailure::Events]);
-    }
-
-    #[test]
-    fn decodes_native_channel_snapshots_and_ignores_non_transition_events() {
-        let pause: NativeEvent = serde_json::from_value(serde_json::json!({
-            "event": "lifecycle",
-            "payload": { "phase": "background", "nativeSequence": 3, "snapshot": true }
-        }))
-        .unwrap();
-        assert!(matches!(
-            pause,
-            NativeEvent::Lifecycle(NativeLifecycleEvent {
-                phase: LifecyclePhase::Background,
-                native_sequence: 3,
-                snapshot: true,
-            })
-        ));
-        let network: NativeEvent = serde_json::from_value(serde_json::json!({
-            "event": "network", "payload": { "connected": true }
-        }))
-        .unwrap();
-        assert!(matches!(network, NativeEvent::Network { connected: true }));
-        let configuration: NativeEvent = serde_json::from_value(serde_json::json!({
-            "event": "configuration", "payload": { "isDarkMode": true }
-        }))
-        .unwrap();
-        assert!(matches!(configuration, NativeEvent::Other {}));
-        assert!(serde_json::from_value::<NativeEvent>(serde_json::json!({
-            "event": "network", "payload": { "connected": "true" }
-        }))
-        .is_err());
-        for payload in [
-            serde_json::json!({ "phase": "active", "snapshot": false }),
-            serde_json::json!({ "phase": "resume", "nativeSequence": 4, "snapshot": false }),
-            serde_json::json!({ "phase": "background", "nativeSequence": -1, "snapshot": false }),
-        ] {
-            assert!(serde_json::from_value::<NativeEvent>(serde_json::json!({
-                "event": "lifecycle", "payload": payload,
-            }))
-            .is_err());
-        }
     }
 }

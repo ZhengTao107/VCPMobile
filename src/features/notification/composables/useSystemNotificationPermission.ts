@@ -14,6 +14,7 @@ export function useSystemNotificationPermission() {
   const lifecycle = useAppLifecycleStore();
   const permission = shallowRef<NotificationPermission | null>(null);
   const busy = ref(false);
+  const acting = ref(false);
   const openingSettings = ref(false);
   const error = ref('');
   let pending: Promise<void> | null = null;
@@ -22,10 +23,11 @@ export function useSystemNotificationPermission() {
   let refreshAfterPending = false;
 
   const allowed = computed(() => permission.value !== null && isNotificationAuthorized(permission.value));
+  const actionBusy = computed(() => openingSettings.value || (busy.value && (acting.value || permission.value === null)));
   const description = computed(() => {
     if (error.value) return error.value;
     switch (permission.value?.authorization) {
-      case 'notDetermined': return '可选择开启系统通知；不启用也能正常聊天。';
+      case 'notDetermined': return '请允许通知，以便接收后台回复完成提醒。';
       case 'denied': return '系统通知已关闭，可前往系统设置开启。';
       case 'authorized': return '已允许通知，显示方式由系统设置决定。';
       case 'provisional': return '已允许安静通知，提醒方式可在系统设置调整。';
@@ -35,7 +37,7 @@ export function useSystemNotificationPermission() {
     }
   });
   const actionLabel = computed(() => {
-    if (busy.value || openingSettings.value) return '处理中…';
+    if (actionBusy.value) return '处理中…';
     if (error.value || !permission.value || permission.value.authorization === 'unknown') return '重新读取';
     return permission.value.authorization === 'notDetermined' ? '开启通知' : '系统设置';
   });
@@ -50,9 +52,10 @@ export function useSystemNotificationPermission() {
       if (!disposed) permission.value = result;
     }).catch(cause => {
       console.warn('[NotificationPermission] Native observation failed:', cause);
-      if (!disposed) error.value = isRequest
-        ? '通知授权未完成，可重试或稍后在系统设置调整。聊天不受影响。'
-        : '暂时无法读取系统通知设置，请重试。聊天不受影响。';
+      if (!disposed) {
+        permission.value = null;
+        error.value = isRequest ? '通知授权未完成，请重新读取。' : '暂时无法读取系统通知设置，请重试。';
+      }
     }).finally(() => {
       pending = null;
       if (!disposed) busy.value = false;
@@ -87,12 +90,17 @@ export function useSystemNotificationPermission() {
 
   const act = async () => {
     if (disposed || busy.value || openingSettings.value) return;
-    if (error.value || !permission.value || permission.value.authorization === 'unknown') {
-      await refresh();
-    } else if (permission.value.authorization === 'notDetermined') {
-      await request();
-    } else {
-      await openSettings();
+    acting.value = true;
+    try {
+      if (error.value || !permission.value || permission.value.authorization === 'unknown') {
+        await refresh();
+      } else if (permission.value.authorization === 'notDetermined') {
+        await request();
+      } else {
+        await openSettings();
+      }
+    } finally {
+      acting.value = false;
     }
   };
 
@@ -112,5 +120,5 @@ export function useSystemNotificationPermission() {
     document.removeEventListener('visibilitychange', onVisible);
   });
 
-  return { permission, allowed, busy, openingSettings, error, description, actionLabel, refresh, act };
+  return { permission, allowed, busy, actionBusy, openingSettings, error, description, actionLabel, refresh, act };
 }

@@ -65,6 +65,18 @@ beforeEach(() => {
   localStorage.clear();
   clearInvokeMocks();
   mockInvoke("get_unread_counts", () => ({}));
+  let revision = 0;
+  const empty = { target: { kind: "welcome" }, focusRevision: 0, windowRevision: 0, anchorId: null };
+  mockInvoke("connect_chat_view", () => ({ documentId: 1, focus: empty }));
+  mockInvoke("register_chat_navigation_intent", () => ({ focus: empty }));
+  mockInvoke("request_chat_navigation", (args) => ({
+    status: "accepted",
+    focus: { target: args?.target, focusRevision: ++revision, windowRevision: revision, anchorId: args?.anchorId ?? null },
+  }));
+  mockInvoke("restore_chat_view", (args) => ({
+    status: "accepted",
+    focus: { target: args?.hint, focusRevision: ++revision, windowRevision: revision, anchorId: null },
+  }));
 });
 
 describe("open tabs store", () => {
@@ -179,7 +191,6 @@ describe("open tabs store", () => {
 
     const second = setup();
     expect(second.ids()).toEqual(["a/t1", "b/t2"]);
-    expect(second.tabs.activeKey).toBe(keyOf("b", "t2"));
     expect(second.tabs.activeTabKey).toBe(keyOf("b", "t2"));
   });
 
@@ -198,6 +209,7 @@ describe("open tabs store", () => {
     }));
 
     const { tabs, select, ids } = setup();
+    await select("a", "t2");
     expect(ids()).toEqual(["a/t1", "a/t2", "a/t3"]);
     expect(tabs.activeTabKey).toBe(keyOf("a", "t2"));
 

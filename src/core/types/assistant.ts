@@ -1,3 +1,5 @@
+import type { VoiceTtsMode } from "../config/generated/config";
+
 export type OwnerType = "agent" | "group";
 
 export interface TopicDto {
@@ -24,8 +26,17 @@ export interface AgentConfigDto {
   maxOutputTokens: number;
   streamOutput: boolean;
   useTemperature: boolean;
+  voice: AgentVoiceConfigDto;
   avatarCalculatedColor: string | null;
   topics: TopicDto[];
+}
+
+export interface AgentVoiceConfigDto {
+  enabled: boolean;
+  mode: VoiceTtsMode;
+  voice: string;
+  cloneSampleId: string;
+  stream: boolean;
 }
 
 export interface AgentListItemDto {
@@ -35,7 +46,42 @@ export interface AgentListItemDto {
   avatarCalculatedColor: string | null;
 }
 
-export interface GroupConfigDto {
+export type GroupMode = "sequential" | "naturerandom" | "invite_only" | "jev";
+
+export interface JevModeSettings {
+  navigatorPrompt: string;
+  speakerThreshold: number;
+  continueThreshold: number;
+  stopThreshold: number;
+  maxSpeakersPerRound: number;
+  maxAutonomousRounds: number;
+  historyWindow: number;
+  continueDebounceMs: number;
+  fallbackPolicy: "stop" | "top_speaker";
+  memberStyles: Record<string, string>;
+}
+
+export interface GroupModeSettings {
+  sequential: { speakerOrder: string[] };
+  jev: JevModeSettings;
+}
+
+export interface GroupLocalSettings {
+  chatMode: GroupMode;
+  modeSettings: GroupModeSettings;
+  enableContextMessageWindow: boolean;
+  contextMessageWindowSize: number;
+}
+
+/** 备份按字段恢复；数组和 memberStyles 映射若出现则整体替换。 */
+export type GroupLocalSettingsPatch = Partial<Omit<GroupLocalSettings, "modeSettings">> & {
+  modeSettings?: {
+    sequential?: Partial<GroupModeSettings["sequential"]>;
+    jev?: Partial<JevModeSettings>;
+  };
+};
+
+export interface GroupConfigDto extends GroupLocalSettings {
   id: string;
   name: string;
   avatarCalculatedColor: string | null;

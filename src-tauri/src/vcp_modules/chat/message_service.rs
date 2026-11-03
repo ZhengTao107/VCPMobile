@@ -14,6 +14,14 @@ use sqlx::Row;
 use tauri::ipc::Channel;
 use tauri::{AppHandle, Manager};
 
+pub(super) const ROW_SELECT: &str =
+    "SELECT m.msg_id, m.role, COALESCE(m.name, a.name) as name, m.agent_id, m.content, m.timestamp, m.updated_at, m.is_group_message, m.group_id, m.finish_reason, r.render_content, r.content_hash AS cache_content_hash, r.renderer_schema_version, m.content_hash
+     FROM messages m
+     LEFT JOIN render_cache r
+       ON m.owner_type = r.owner_type AND m.owner_id = r.owner_id
+      AND m.topic_id = r.topic_id AND m.msg_id = r.msg_id
+     LEFT JOIN agents a ON a.owner_type = 'agent' AND m.agent_id = a.agent_id";
+
 // =================================================================
 // vcp_modules/message_service.rs - 消息业务逻辑中心 (含附件对齐)
 // =================================================================
@@ -23,6 +31,79 @@ use tauri::{AppHandle, Manager};
 pub struct MessageWriteResultDto {
     pub blocks: Vec<ContentBlock>,
     pub topic_updated_at: i64,
+}
+
+fn project_shell_agent(
+    row: sqlx::sqlite::SqliteRow,
+) -> Result<crate::vcp_modules::agent_types::AgentConfig, String> {
+    use crate::vcp_modules::agent_types::AgentConfig;
+    let name = match row.try_get::<Option<String>, _>("name") {
+        Ok(Some(name)) => name,
+        Ok(None) | Err(sqlx::Error::ColumnDecode { .. }) => AgentConfig::default().name,
+        Err(error) => return Err(error.to_string()),
+    };
+    let avatar_calculated_color = match row.try_get("dominant_color") {
+        Ok(color) => color,
+        Err(sqlx::Error::ColumnDecode { .. }) => None,
+        Err(error) => return Err(error.to_string()),
+    };
+    // Only identity and presentation fields are consumed by precompute_shell;
+    // these placeholders are never saved or used as an Agent configuration.
+    Ok(AgentConfig {
+        id: row.try_get("agent_id").map_err(|error| error.to_string())?,
+        name,
+        avatar_calculated_color,
+        system_prompt: String::new(),
+        mobile_system_prompt: String::new(),
+        model: String::new(),
+        temperature: 0.0,
+        context_token_limit: 0,
+        max_output_tokens: 0,
+        stream_output: false,
+        use_temperature: false,
+        voice: Default::default(),
+        topics: vec![],
+    })
+}
+
+async fn project_history_attachment(
+    app: &AppHandle<impl tauri::Runtime>,
+    db: &DbState,
+    row: &sqlx::sqlite::SqliteRow,
+    include_extracted_text: bool,
+) -> Attachment {
+    let mut attachment = Attachment {
+        r#type: row.get("mime_type"),
+        src: row.get("src"),
+        name: row.get("display_name"),
+        size: row.get::<i64, _>("size") as u64,
+        hash: Some(row.get("hash")),
+        status: Some(row.get("status")),
+        attachment_order: Some(row.get("attachment_order")),
+        internal_path: row.get("internal_path"),
+        extracted_text: row.get("extracted_text"),
+        image_frames: row
+            .get::<Option<String>, _>("image_frames")
+            .and_then(|frames| serde_json::from_str(&frames).ok()),
+        thumbnail_path: row.get("thumbnail_path"),
+        created_at: Some(row.get::<i64, _>("created_at") as u64),
+    };
+    crate::vcp_modules::file_manager::refresh_attachment_paths(app, &mut attachment).await;
+    if include_extracted_text
+        && attachment.extracted_text.is_none()
+        && attachment.status.as_deref() == Some("ready")
+    {
+        if let Some(hash) = attachment.hash.as_deref() {
+            attachment.extracted_text = crate::vcp_modules::file_manager::ensure_extracted_text(
+                db,
+                hash,
+                &attachment.internal_path,
+                &attachment.r#type,
+            )
+            .await;
+        }
+    }
+    attachment
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -68,39 +149,17 @@ pub async fn load_chat_history_internal(
         );
     }
 
-    let query_str = if limit.is_some() && before_timestamp.is_some() {
-        "SELECT m.msg_id, m.role, COALESCE(m.name, a.name) as name, m.agent_id, m.content, m.timestamp, m.is_group_message, m.group_id, m.finish_reason, r.render_content, r.content_hash AS cache_content_hash, r.renderer_schema_version, m.content_hash
-         FROM messages m
-         LEFT JOIN render_cache r
-           ON m.owner_type = r.owner_type AND m.owner_id = r.owner_id
-          AND m.topic_id = r.topic_id AND m.msg_id = r.msg_id
-         LEFT JOIN agents a ON a.owner_type = 'agent' AND m.agent_id = a.agent_id
-         WHERE m.owner_type = ? AND m.owner_id = ? AND m.topic_id = ? AND m.deleted_at IS NULL
-           AND (m.timestamp < ? OR (m.timestamp = ? AND m.msg_id < ?))
-         ORDER BY m.timestamp DESC, m.msg_id DESC
-         LIMIT ?"
-    } else if limit.is_some() {
-        "SELECT m.msg_id, m.role, COALESCE(m.name, a.name) as name, m.agent_id, m.content, m.timestamp, m.is_group_message, m.group_id, m.finish_reason, r.render_content, r.content_hash AS cache_content_hash, r.renderer_schema_version, m.content_hash
-         FROM messages m
-         LEFT JOIN render_cache r
-           ON m.owner_type = r.owner_type AND m.owner_id = r.owner_id
-          AND m.topic_id = r.topic_id AND m.msg_id = r.msg_id
-         LEFT JOIN agents a ON a.owner_type = 'agent' AND m.agent_id = a.agent_id
-         WHERE m.owner_type = ? AND m.owner_id = ? AND m.topic_id = ? AND m.deleted_at IS NULL
-         ORDER BY m.timestamp DESC, m.msg_id DESC
-         LIMIT ?"
-    } else {
-        "SELECT m.msg_id, m.role, COALESCE(m.name, a.name) as name, m.agent_id, m.content, m.timestamp, m.is_group_message, m.group_id, m.finish_reason, r.render_content, r.content_hash AS cache_content_hash, r.renderer_schema_version, m.content_hash
-         FROM messages m
-         LEFT JOIN render_cache r
-           ON m.owner_type = r.owner_type AND m.owner_id = r.owner_id
-          AND m.topic_id = r.topic_id AND m.msg_id = r.msg_id
-         LEFT JOIN agents a ON a.owner_type = 'agent' AND m.agent_id = a.agent_id
-         WHERE m.owner_type = ? AND m.owner_id = ? AND m.topic_id = ? AND m.deleted_at IS NULL
-         ORDER BY m.timestamp DESC, m.msg_id DESC"
-    };
-
-    let mut q = sqlx::query(query_str)
+    let mut query = format!(
+        "{ROW_SELECT} WHERE m.owner_type = ? AND m.owner_id = ? AND m.topic_id = ? AND m.deleted_at IS NULL"
+    );
+    if limit.is_some() && before_timestamp.is_some() {
+        query.push_str(" AND (m.timestamp < ? OR (m.timestamp = ? AND m.msg_id < ?))");
+    }
+    query.push_str(" ORDER BY m.timestamp DESC, m.msg_id DESC");
+    if limit.is_some() {
+        query.push_str(" LIMIT ?");
+    }
+    let mut q = sqlx::query(sqlx::AssertSqlSafe(query))
         .bind(&key.owner_type)
         .bind(&key.owner_id)
         .bind(&key.topic_id);
@@ -141,26 +200,36 @@ async fn convert_history_rows(
     include_content: bool,
     include_extracted_text: bool,
 ) -> Result<Vec<ChatMessage>, String> {
-    let db_state = app_handle.state::<DbState>();
-    // 收集所有 msg_id，用于批量查询附件
-    let mut msg_ids = Vec::new();
-    for row in &rows {
-        use sqlx::Row;
-        let msg_id: String = row.get("msg_id");
-        msg_ids.push(msg_id);
-    }
+    let ids: Vec<&str> = rows.iter().map(|row| row.get("msg_id")).collect();
+    let attachments = history_attachment_rows(pool, key, &ids, include_extracted_text).await?;
+    project_history_rows(
+        app_handle,
+        pool,
+        key,
+        rows,
+        attachments,
+        include_content,
+        include_extracted_text,
+    )
+    .await
+}
 
-    // 批量查询所有附件（利用 message_attachments 索引表）
-    let mut att_map: std::collections::HashMap<String, Vec<Attachment>> =
-        std::collections::HashMap::new();
-    if !msg_ids.is_empty() {
-        let placeholders = msg_ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
-        let extracted_text_column = if include_extracted_text {
-            "a.extracted_text"
-        } else {
-            "NULL"
-        };
-        let att_query = format!(
+pub(super) async fn history_attachment_rows<'e>(
+    executor: impl sqlx::SqliteExecutor<'e>,
+    key: &TopicKey,
+    msg_ids: &[&str],
+    include_extracted_text: bool,
+) -> Result<Vec<sqlx::sqlite::SqliteRow>, String> {
+    if msg_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let placeholders = msg_ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+    let extracted_text_column = if include_extracted_text {
+        "a.extracted_text"
+    } else {
+        "NULL"
+    };
+    let att_query = format!(
             "SELECT a.hash, a.mime_type, a.size, a.internal_path, {} as extracted_text, a.image_frames, a.thumbnail_path, a.created_at,
                     ma.msg_id, ma.attachment_order, ma.display_name, ma.src, ma.status
              FROM message_attachments ma
@@ -170,57 +239,40 @@ async fn convert_history_rows(
              ORDER BY ma.msg_id, ma.attachment_order ASC",
             extracted_text_column, placeholders
         );
-        let mut q = sqlx::query(sqlx::AssertSqlSafe(att_query))
-            .bind(&key.owner_type)
-            .bind(&key.owner_id)
-            .bind(&key.topic_id);
-        for id in &msg_ids {
-            q = q.bind(id);
-        }
-        let att_rows = q.fetch_all(pool).await.map_err(|e| e.to_string())?;
+    let mut q = sqlx::query(sqlx::AssertSqlSafe(att_query))
+        .bind(&key.owner_type)
+        .bind(&key.owner_id)
+        .bind(&key.topic_id);
+    for &id in msg_ids {
+        q = q.bind(id.to_owned());
+    }
+    q.fetch_all(executor).await.map_err(|e| e.to_string())
+}
 
-        for ar in att_rows {
-            let msg_id: String = ar.get("msg_id");
-            let hash: String = ar.get("hash");
-            let mime_type: String = ar.get("mime_type");
-            let internal_path: String = ar.get("internal_path");
-            let display_name: String = ar.get("display_name");
-            let size_i64: i64 = ar.get("size");
-            let created_at_i64: i64 = ar.get("created_at");
-            let mut extracted_text: Option<String> = ar.get("extracted_text");
-
-            // ⚡ 极度优雅的消息-附件解耦调用：将物理文件判定、异步持久化完全委托给 file_manager
-            if include_extracted_text && extracted_text.is_none() {
-                extracted_text = crate::vcp_modules::infra::file_manager::ensure_extracted_text(
-                    &db_state,
-                    &hash,
-                    &internal_path,
-                    &mime_type,
-                )
-                .await;
-            }
-
-            att_map.entry(msg_id).or_default().push(Attachment {
-                r#type: mime_type,
-                src: ar.get("src"),
-                name: display_name,
-                size: size_i64 as u64,
-                hash: Some(hash),
-                status: Some(ar.get("status")),
-                attachment_order: Some(ar.get("attachment_order")),
-                internal_path,
-                extracted_text,
-                image_frames: ar
-                    .get::<Option<String>, _>("image_frames")
-                    .and_then(|s| serde_json::from_str(&s).ok()),
-                thumbnail_path: ar.get("thumbnail_path"),
-                created_at: Some(created_at_i64 as u64),
-            });
-        }
+pub(super) async fn project_history_rows(
+    app_handle: &AppHandle<impl tauri::Runtime>,
+    pool: &sqlx::SqlitePool,
+    key: &TopicKey,
+    rows: Vec<sqlx::sqlite::SqliteRow>,
+    attachment_rows: Vec<sqlx::sqlite::SqliteRow>,
+    include_content: bool,
+    include_extracted_text: bool,
+) -> Result<Vec<ChatMessage>, String> {
+    if rows.is_empty() {
+        return Ok(Vec::new());
+    }
+    let db_state = app_handle.state::<DbState>();
+    let mut att_map: std::collections::HashMap<String, Vec<Attachment>> =
+        std::collections::HashMap::new();
+    for ar in attachment_rows {
+        let msg_id: String = ar.get("msg_id");
+        let attachment =
+            project_history_attachment(app_handle, &db_state, &ar, include_extracted_text).await;
+        att_map.entry(msg_id).or_default().push(attachment);
     }
 
     // 预计算外壳属性所需的全局数据（避免调用 get_agents 触发昂贵的多余 topics 联表查询）
-    let agents = match sqlx::query(
+    let agents = sqlx::query(
         "SELECT a.agent_id, a.name, av.dominant_color
          FROM agents a
          LEFT JOIN avatars av ON av.owner_id = a.agent_id AND av.owner_type = 'agent' AND av.deleted_at IS NULL
@@ -228,46 +280,25 @@ async fn convert_history_rows(
     )
     .fetch_all(pool)
     .await
-    {
-        Ok(rows) => rows
-            .into_iter()
-            .map(|row| {
-                use sqlx::Row;
-                crate::vcp_modules::agent_types::AgentConfig {
-                    id: row.get("agent_id"),
-                    name: row.get("name"),
-                    avatar_calculated_color: row.get("dominant_color"),
-                    system_prompt: String::new(),
-                    mobile_system_prompt: String::new(),
-                    model: String::new(),
-                    temperature: 0.0,
-                    context_token_limit: 0,
-                    max_output_tokens: 0,
-                    stream_output: false,
-                    use_temperature: false,
-                    topics: vec![],
-                }
-            })
-            .collect::<Vec<_>>(),
-        Err(_) => Vec::new(),
-    };
+    .map_err(|error| error.to_string())?
+    .into_iter().map(project_shell_agent).collect::<Result<Vec<_>, _>>()?;
 
     let settings =
-        crate::vcp_modules::settings_manager::read_settings(app_handle.clone(), app_handle.state())
-            .await
-            .ok();
-    let user_name = settings
-        .map(|s| s.user_name)
-        .unwrap_or_else(|| "User".to_string());
+        crate::vcp_modules::settings_manager::read_config(app_handle.clone(), app_handle.state())
+            .await?;
+    let user_name = settings.identity.user_name.clone();
 
-    let user_avatar_color: Option<String> = sqlx::query_scalar(
+    let user_avatar_color: Option<String> = match sqlx::query_scalar::<_, Option<String>>(
         "SELECT dominant_color FROM avatars
          WHERE owner_type = 'user' AND owner_id = 'user_avatar' AND deleted_at IS NULL",
     )
     .fetch_optional(pool)
     .await
-    .ok()
-    .flatten();
+    {
+        Ok(color) => color.flatten(),
+        Err(sqlx::Error::ColumnDecode { .. }) => None,
+        Err(error) => return Err(error.to_string()),
+    };
 
     let mut history = Vec::new();
     for row in rows {
@@ -338,7 +369,7 @@ async fn convert_history_rows(
             name,
             content,
             timestamp: timestamp as u64,
-            updated_at: None,
+            updated_at: u64::try_from(row.get::<i64, _>("updated_at")).ok(),
             is_thinking,
             agent_id: row.get("agent_id"),
             group_id: row.get("group_id"),
@@ -410,14 +441,6 @@ pub async fn load_chat_history_around_internal(
         return Ok(Vec::new());
     };
 
-    const ROW_SELECT: &str =
-        "SELECT m.msg_id, m.role, COALESCE(m.name, a.name) as name, m.agent_id, m.content, m.timestamp, m.is_group_message, m.group_id, m.finish_reason, r.render_content, r.content_hash AS cache_content_hash, r.renderer_schema_version, m.content_hash
-         FROM messages m
-         LEFT JOIN render_cache r
-           ON m.owner_type = r.owner_type AND m.owner_id = r.owner_id
-          AND m.topic_id = r.topic_id AND m.msg_id = r.msg_id
-         LEFT JOIN agents a ON a.owner_type = 'agent' AND m.agent_id = a.agent_id";
-
     let mut rows: Vec<sqlx::sqlite::SqliteRow> = Vec::new();
 
     // 前向窗口（早于锚点，含锚点本身）
@@ -473,10 +496,152 @@ pub async fn load_chat_history_around_internal(
     convert_history_rows(app_handle, pool, &key, rows, false, false).await
 }
 
+/// Plain committed text for decision requests. The SQL byte preflight excludes
+/// oversized older messages before their strings cross into Rust. It retains a
+/// contiguous newest suffix; callers account for JSON escaping within the same
+/// budget before constructing the final request. No attachment/cache IO occurs.
+pub(crate) async fn load_chat_plain_text_history_for_context(
+    pool: &sqlx::SqlitePool,
+    key: &TopicKey,
+    limit: usize,
+    byte_budget: usize,
+) -> Result<Vec<ChatMessage>, String> {
+    let limit = i64::try_from(limit).map_err(|error| error.to_string())?;
+    let byte_budget = i64::try_from(byte_budget).map_err(|error| error.to_string())?;
+    let rows = sqlx::query(
+        "WITH candidates AS MATERIALIZED (
+            SELECT m.rowid AS message_rowid, m.timestamp, m.msg_id,
+                   length(CAST(m.msg_id AS BLOB)) + length(CAST(m.role AS BLOB))
+                   + length(CAST(COALESCE(m.name, a.name, CASE WHEN m.role = 'user' THEN '用户' ELSE 'AI' END) AS BLOB))
+                   + COALESCE(length(CAST(m.agent_id AS BLOB)), 0)
+                   + length(CAST(m.content AS BLOB)) AS raw_bytes
+            FROM messages m
+            LEFT JOIN agents a ON a.owner_type = 'agent' AND m.agent_id = a.agent_id
+            WHERE m.owner_type = ? AND m.owner_id = ? AND m.topic_id = ? AND m.deleted_at IS NULL
+              AND NOT EXISTS (
+                SELECT 1 FROM active_generations ag
+                WHERE ag.owner_type = m.owner_type AND ag.owner_id = m.owner_id
+                  AND ag.topic_id = m.topic_id AND ag.msg_id = m.msg_id
+              )
+            ORDER BY m.timestamp DESC, m.msg_id DESC LIMIT ?
+         ), budgeted AS (
+            SELECT message_rowid,
+                   SUM(raw_bytes) OVER (
+                     ORDER BY timestamp DESC, msg_id DESC ROWS UNBOUNDED PRECEDING
+                   ) AS used_bytes
+            FROM candidates
+         )
+         SELECT m.msg_id, m.role, COALESCE(m.name, a.name) AS name,
+                m.agent_id, m.content, m.timestamp
+         FROM budgeted b
+         JOIN messages m ON m.rowid = b.message_rowid
+         LEFT JOIN agents a ON a.owner_type = 'agent' AND m.agent_id = a.agent_id
+         WHERE b.used_bytes <= ?
+         ORDER BY m.timestamp ASC, m.msg_id ASC",
+    )
+    .bind(&key.owner_type)
+    .bind(&key.owner_id)
+    .bind(&key.topic_id)
+    .bind(limit)
+    .bind(byte_budget)
+    .fetch_all(pool)
+    .await
+    .map_err(|error| error.to_string())?;
+    rows.into_iter()
+        .map(|row| {
+            Ok(ChatMessage {
+                id: row.try_get("msg_id").map_err(|error| error.to_string())?,
+                role: row.try_get("role").map_err(|error| error.to_string())?,
+                name: row.try_get("name").map_err(|error| error.to_string())?,
+                agent_id: row.try_get("agent_id").map_err(|error| error.to_string())?,
+                content: row.try_get("content").map_err(|error| error.to_string())?,
+                timestamp: u64::try_from(
+                    row.try_get::<i64, _>("timestamp")
+                        .map_err(|error| error.to_string())?,
+                )
+                .map_err(|error| error.to_string())?,
+                ..Default::default()
+            })
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod plain_text_history_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn text_budget_keeps_a_complete_contiguous_suffix_without_attachment_tables() {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        // Intentionally no attachments or render_cache tables: this projection
+        // must depend only on committed message text and speaker identity.
+        sqlx::raw_sql(
+            "CREATE TABLE messages (
+                owner_type TEXT, owner_id TEXT, topic_id TEXT, msg_id TEXT,
+                role TEXT, name TEXT, agent_id TEXT, content TEXT, timestamp INTEGER, deleted_at INTEGER
+             );
+             CREATE TABLE agents (owner_type TEXT, agent_id TEXT, name TEXT);
+             CREATE TABLE active_generations (owner_type TEXT, owner_id TEXT, topic_id TEXT, msg_id TEXT);
+             INSERT INTO agents VALUES ('agent', 'a', '成员');
+             INSERT INTO active_generations VALUES ('group','g','t','active');",
+        ).execute(&pool).await.unwrap();
+        for (id, text, timestamp, deleted) in [
+            ("old", "older".into(), 1, None),
+            ("large", "中".repeat(100), 2, None),
+            ("new-a", "甲".into(), 3, None),
+            ("new-z", "乙".into(), 3, None),
+            ("active", "unfinished".into(), 4, None),
+            ("deleted", "deleted".into(), 5, Some(9)),
+        ] {
+            sqlx::query(
+                "INSERT INTO messages VALUES ('group','g','t',?,'assistant',NULL,'a',?,?,?)",
+            )
+            .bind(id)
+            .bind(text)
+            .bind(timestamp)
+            .bind(deleted)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        let key = TopicKey::new("group", "g", "t");
+        let history = load_chat_plain_text_history_for_context(&pool, &key, 200, 70)
+            .await
+            .unwrap();
+        assert_eq!(
+            history
+                .iter()
+                .map(|message| message.id.as_str())
+                .collect::<Vec<_>>(),
+            ["new-a", "new-z"]
+        );
+        assert_eq!(history[0].content, "甲");
+        assert_eq!(history[0].name.as_deref(), Some("成员"));
+        assert!(history
+            .iter()
+            .all(|message| message.attachments.is_none() && message.blocks.is_none()));
+        let limited = load_chat_plain_text_history_for_context(&pool, &key, 1, 70)
+            .await
+            .unwrap();
+        assert_eq!(limited.len(), 1);
+        assert_eq!(limited[0].id, "new-z");
+        assert!(
+            load_chat_plain_text_history_for_context(&pool, &key, 200, 1)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+}
+
 /// 为 Agent 和 Group 组装大模型上下文提供专用的轻量历史查询。
 /// 只查询消息纯文本和附件（在需要时提取文本），完全跳过 render_content 反序列化和 UI shell 预计算。
 pub async fn load_chat_text_history_for_context(
-    app_handle: &AppHandle,
+    app_handle: &AppHandle<impl tauri::Runtime>,
     key: &TopicKey,
     limit: Option<usize>,
     offset: Option<usize>,
@@ -560,40 +725,10 @@ pub async fn load_chat_text_history_for_context(
 
         for ar in att_rows {
             let msg_id: String = ar.get("msg_id");
-            let hash: String = ar.get("hash");
-            let mime_type: String = ar.get("mime_type");
-            let internal_path: String = ar.get("internal_path");
-            let display_name: String = ar.get("display_name");
-            let size_i64: i64 = ar.get("size");
-            let created_at_i64: i64 = ar.get("created_at");
-            let mut extracted_text: Option<String> = ar.get("extracted_text");
-
-            if include_extracted_text && extracted_text.is_none() {
-                extracted_text = crate::vcp_modules::infra::file_manager::ensure_extracted_text(
-                    &db_state,
-                    &hash,
-                    &internal_path,
-                    &mime_type,
-                )
-                .await;
-            }
-
-            att_map.entry(msg_id).or_default().push(Attachment {
-                r#type: mime_type,
-                src: ar.get("src"),
-                name: display_name,
-                size: size_i64 as u64,
-                hash: Some(hash),
-                status: Some(ar.get("status")),
-                attachment_order: Some(ar.get("attachment_order")),
-                internal_path,
-                extracted_text,
-                image_frames: ar
-                    .get::<Option<String>, _>("image_frames")
-                    .and_then(|s| serde_json::from_str(&s).ok()),
-                thumbnail_path: ar.get("thumbnail_path"),
-                created_at: Some(created_at_i64 as u64),
-            });
+            let attachment =
+                project_history_attachment(app_handle, &db_state, &ar, include_extracted_text)
+                    .await;
+            att_map.entry(msg_id).or_default().push(attachment);
         }
     }
 
@@ -641,7 +776,7 @@ pub async fn load_chat_text_history_for_context(
 }
 
 /// 以 Mobile 本地 CAS 为唯一文件真理源，禁止消息写入隐式下载桌面附件。
-async fn normalize_attachments_from_local_cas<R: tauri::Runtime>(
+pub(crate) async fn normalize_attachments_from_local_cas<R: tauri::Runtime>(
     app: &AppHandle<R>,
     pool: &sqlx::SqlitePool,
     message: &mut ChatMessage,
@@ -822,9 +957,38 @@ pub async fn append_single_message<R: tauri::Runtime>(
     })
 }
 
+/// Editing a sent message and discarding its following history are one commit.
+/// Attachment validation and compilation happen before any history is changed.
+pub async fn edit_resend_message<R: tauri::Runtime>(
+    app_handle: &AppHandle<R>,
+    db_state: &DbState,
+    key: &TopicKey,
+    mut message: ChatMessage,
+) -> Result<(MessageWriteResultDto, MessageDeletionResult), String> {
+    normalize_attachments_from_local_cas(app_handle, &db_state.pool, &mut message).await?;
+    let (blocks, render_bytes) =
+        compile_and_serialize_render_async(message.content.clone()).await?;
+    let mut tx = db_state.write_transaction("message.edit_resend").await?;
+    let mut deletion = truncate_history_after_message_in_tx(&mut tx, key, &message.id).await?;
+    let activity =
+        MessageRepository::upsert_message(&mut tx, &message, key, &render_bytes, false).await?;
+    if let Some(activity) = activity {
+        deletion.msg_count = activity.msg_count;
+        deletion.topic_updated_at = activity.updated_at;
+    }
+    tx.commit().await.map_err(|error| error.to_string())?;
+    Ok((
+        MessageWriteResultDto {
+            blocks,
+            topic_updated_at: deletion.topic_updated_at,
+        },
+        deletion,
+    ))
+}
+
 #[tauri::command]
-pub async fn fetch_raw_message_content(
-    app_handle: tauri::AppHandle,
+pub async fn fetch_raw_message_content<R: tauri::Runtime>(
+    app_handle: tauri::AppHandle<R>,
     owner_id: String,
     owner_type: String,
     topic_id: String,
@@ -836,7 +1000,8 @@ pub async fn fetch_raw_message_content(
 
     let row = sqlx::query(
         "SELECT content FROM messages
-         WHERE owner_type = ? AND owner_id = ? AND topic_id = ? AND msg_id = ?",
+         WHERE owner_type = ? AND owner_id = ? AND topic_id = ? AND msg_id = ?
+           AND deleted_at IS NULL",
     )
     .bind(&key.topic.owner_type)
     .bind(&key.topic.owner_id)
@@ -1240,6 +1405,16 @@ pub async fn truncate_history_after_message(
     anchor_message_id: &str,
 ) -> Result<MessageDeletionResult, String> {
     let mut tx = db_state.write_transaction("message.truncate").await?;
+    let result = truncate_history_after_message_in_tx(&mut tx, key, anchor_message_id).await?;
+    tx.commit().await.map_err(|e| e.to_string())?;
+    Ok(result)
+}
+
+async fn truncate_history_after_message_in_tx(
+    tx: &mut sqlx::SqliteConnection,
+    key: &TopicKey,
+    anchor_message_id: &str,
+) -> Result<MessageDeletionResult, String> {
     let anchor_timestamp: i64 = sqlx::query_scalar(
         "SELECT timestamp FROM messages
          WHERE owner_type = ? AND owner_id = ? AND topic_id = ? AND msg_id = ?
@@ -1380,8 +1555,7 @@ pub async fn truncate_history_after_message(
         ));
     }
     // FTS 由 after_messages_logical_delete 触发器在同一事务中清理。
-    let activity = HashAggregator::bubble_from_topic(&mut tx, key).await?;
-    tx.commit().await.map_err(|e| e.to_string())?;
+    let activity = HashAggregator::bubble_from_topic(tx, key).await?;
     Ok(MessageDeletionResult {
         deleted_ids,
         active_ids,
@@ -1406,8 +1580,36 @@ async fn decode_valid_render_cache(
     serde_json::to_value(blocks).ok()
 }
 
+/// The durable message identity returned to request owners. A removed message
+/// has no result and must never be reintroduced into a later group context.
+#[derive(Debug)]
+pub(crate) struct FinalizedStreamMessage {
+    pub(crate) content: String,
+    pub(crate) finish_reason: String,
+    pub(crate) timestamp: u64,
+    pub(crate) topic_updated_at: Option<i64>,
+    /// A late error must not count an existing terminal as a new speaker completion.
+    pub(crate) newly_committed: bool,
+}
+
+#[derive(Debug)]
+enum StreamCommit {
+    Committed(Vec<ContentBlock>, u64, i64, Option<String>),
+    AlreadyFinalized(FinalizedStreamMessage),
+    Removed,
+}
+
+/// A transport result that still needs its durable transaction. RequestOutput
+/// owns the same allocation during a retry; live partials are not cached here.
+#[derive(Clone)]
+pub(crate) struct PendingStreamTerminal {
+    content: String,
+    finish_reason: String,
+    agent_id: Option<String>,
+}
+
 #[allow(clippy::too_many_arguments)]
-pub async fn finalize_stream_message<R: tauri::Runtime>(
+pub(crate) async fn finalize_stream_message<R: tauri::Runtime>(
     app_handle: AppHandle<R>,
     pool: &sqlx::Pool<sqlx::Sqlite>,
     message_key: &MessageKey,
@@ -1416,71 +1618,110 @@ pub async fn finalize_stream_message<R: tauri::Runtime>(
     finish_reason: Option<String>,
     stream_channel: Option<Channel<crate::vcp_modules::vcp_client::StreamEvent>>,
     agent_id: Option<String>,
-) -> Result<String, String> {
+) -> Result<Option<FinalizedStreamMessage>, String> {
+    let terminal = std::sync::Arc::new(PendingStreamTerminal {
+        content: full_content,
+        finish_reason: if is_aborted {
+            "cancelled_by_user".to_string()
+        } else {
+            finish_reason.unwrap_or_else(|| "completed".to_string())
+        },
+        agent_id,
+    });
+    crate::vcp_modules::vcp_client::retain_request_terminal(
+        &app_handle,
+        message_key,
+        terminal.clone(),
+    );
     finalize_stream_message_inner(
         app_handle,
         pool,
         message_key,
-        full_content,
-        is_aborted,
-        finish_reason,
+        terminal,
         stream_channel,
-        agent_id,
+        false,
     )
     .await
 }
 
+/// A completed helper file is recovered history even when SQLite has not yet
+/// accepted its terminal transaction. Preserve that origin on the normal end event.
 #[allow(clippy::too_many_arguments)]
-async fn finalize_stream_message_inner<R: tauri::Runtime>(
+pub(crate) async fn finalize_recovered_stream_message<R: tauri::Runtime>(
     app_handle: AppHandle<R>,
     pool: &sqlx::Pool<sqlx::Sqlite>,
     message_key: &MessageKey,
     full_content: String,
-    is_aborted: bool,
-    finish_reason: Option<String>,
-    stream_channel: Option<Channel<crate::vcp_modules::vcp_client::StreamEvent>>,
+    finish_reason: String,
+    stream_channel: Channel<crate::vcp_modules::vcp_client::StreamEvent>,
     agent_id: Option<String>,
-) -> Result<String, String> {
+) -> Result<Option<FinalizedStreamMessage>, String> {
+    finalize_stream_message_inner(
+        app_handle,
+        pool,
+        message_key,
+        std::sync::Arc::new(PendingStreamTerminal {
+            content: full_content,
+            finish_reason,
+            agent_id,
+        }),
+        Some(stream_channel),
+        true,
+    )
+    .await
+}
+
+pub(crate) async fn retry_stream_terminal<R: tauri::Runtime>(
+    app_handle: AppHandle<R>,
+    pool: &sqlx::Pool<sqlx::Sqlite>,
+    message_key: &MessageKey,
+    terminal: std::sync::Arc<PendingStreamTerminal>,
+    stream_channel: Option<Channel<crate::vcp_modules::vcp_client::StreamEvent>>,
+) -> Result<Option<FinalizedStreamMessage>, String> {
+    finalize_stream_message_inner(
+        app_handle,
+        pool,
+        message_key,
+        terminal,
+        stream_channel,
+        true,
+    )
+    .await
+}
+
+async fn finalize_stream_message_inner<R: tauri::Runtime>(
+    app_handle: AppHandle<R>,
+    _pool: &sqlx::Pool<sqlx::Sqlite>,
+    message_key: &MessageKey,
+    terminal: std::sync::Arc<PendingStreamTerminal>,
+    stream_channel: Option<Channel<crate::vcp_modules::vcp_client::StreamEvent>>,
+    replayed: bool,
+) -> Result<Option<FinalizedStreamMessage>, String> {
     let owner_id = message_key.topic.owner_id.as_str();
     let owner_type = message_key.topic.owner_type.as_str();
     let topic_id = message_key.topic.topic_id.as_str();
     let message_id = message_key.msg_id.as_str();
     let final_ts = crate::vcp_modules::infra::utils::now_millis() as u64;
 
-    let mut final_content = full_content;
-    if is_aborted {
-        final_content.push_str("\n\n> VCP流式错误: 请求已中止");
-    }
+    let final_content = &terminal.content;
 
     let is_group = owner_type == "group";
 
     let final_agent_id = if is_group {
-        agent_id
+        terminal.agent_id.clone()
     } else {
         Some(owner_id.to_string())
     };
 
-    let mut agent_name = None;
-    if let Some(ref aid) = final_agent_id {
-        if let Ok(Some(row)) =
-            sqlx::query("SELECT name FROM agents WHERE owner_type = 'agent' AND agent_id = ?")
-                .bind(aid)
-                .fetch_optional(pool)
-                .await
-        {
-            use sqlx::Row;
-            agent_name = Some(row.get::<String, _>("name"));
-        }
-    }
-
-    let terminal_reason = finish_reason.unwrap_or_else(|| "completed".to_string());
-    let context = if owner_id.is_empty() || topic_id.is_empty() {
+    let terminal_reason = &terminal.finish_reason;
+    let mut context = if owner_id.is_empty() || topic_id.is_empty() {
         None
     } else if is_group {
         Some(serde_json::json!({
             "ownerId": owner_id,
             "ownerType": owner_type,
             "groupId": owner_id,
+            "agentId": final_agent_id,
             "topicId": topic_id,
             "isGroupMessage": true,
         }))
@@ -1492,62 +1733,90 @@ async fn finalize_stream_message_inner<R: tauri::Runtime>(
             "topicId": topic_id,
         }))
     };
-    let (end_blocks, end_timestamp, topic_updated_at) =
-        if owner_id.is_empty() || topic_id.is_empty() {
-            (None, final_ts, None)
-        } else {
-            let db_state = app_handle.state::<DbState>();
-            match commit_stream_message(
-                &db_state,
-                message_key,
-                &final_content,
-                final_ts,
-                &terminal_reason,
-                final_agent_id.as_deref(),
-                agent_name.as_deref(),
-            )
-            .await
-            {
-                Ok((blocks, start_timestamp, updated_at)) => {
-                    (Some(blocks), start_timestamp, Some(updated_at))
-                }
-                Err(error) => {
-                    // A deletion or a competing durable commit may have won
-                    // while this stream was draining. Such a result has no
-                    // recovery owner; a real database failure still retains it.
-                    let pending = sqlx::query_scalar::<_, bool>(
-                        "SELECT EXISTS(SELECT 1 FROM active_generations
-                         WHERE owner_type = ? AND owner_id = ? AND topic_id = ? AND msg_id = ?)",
-                    )
-                    .bind(owner_type)
-                    .bind(owner_id)
-                    .bind(topic_id)
-                    .bind(message_id)
-                    .fetch_one(pool)
-                    .await;
-                    if matches!(pending, Ok(false)) {
-                        crate::vcp_modules::vcp_client::discard_request_helper(
-                            &app_handle,
-                            message_key,
-                        )
-                        .await;
-                    }
-                    let mut event = crate::vcp_modules::vcp_client::StreamEvent::error(
-                        message_id.to_string(),
-                        context.clone(),
-                        format!("终态保存失败: {}", error),
-                    );
-                    event.content = Some(final_content.clone());
-                    crate::vcp_modules::vcp_client::deliver_request_event(
+    if replayed {
+        if let Some(context) = context.as_mut() {
+            context["replayed"] = serde_json::json!(true);
+        }
+    }
+    let (end_blocks, end_timestamp, topic_updated_at) = if owner_id.is_empty()
+        || topic_id.is_empty()
+    {
+        (None, final_ts, None)
+    } else {
+        let db_state = app_handle.state::<DbState>();
+        match commit_stream_message(
+            &db_state,
+            message_key,
+            final_content,
+            final_ts,
+            terminal_reason,
+        )
+        .await
+        {
+            Ok(StreamCommit::Committed(blocks, start_timestamp, updated_at, _agent_name)) => {
+                #[cfg(target_os = "ios")]
+                if !replayed && !matches!(terminal_reason.as_str(), "error" | "cancelled_by_user") {
+                    // The transaction won the terminal transition, so this reply exists
+                    // in the exact history window referenced by its notification.
+                    tauri_plugin_vcp_mobile::system::notify_committed_reply(
                         &app_handle,
-                        message_key,
-                        stream_channel.clone(),
-                        event,
+                        owner_type,
+                        owner_id,
+                        topic_id,
+                        message_id,
+                        _agent_name.as_deref().unwrap_or("智能体"),
                     );
-                    return Err(error);
                 }
+                (Some(blocks), start_timestamp, Some(updated_at))
             }
-        };
+            Ok(StreamCommit::AlreadyFinalized(message)) => {
+                crate::vcp_modules::vcp_client::release_committed_helper(&app_handle, message_key)
+                    .await;
+                // A different durable writer may have settled the row while
+                // this consumer was attached. Replay that result through the
+                // same output owner; its closed flag suppresses duplicates.
+                let mut context = context;
+                if let Some(context) = context.as_mut() {
+                    context["replayed"] = serde_json::json!(true);
+                }
+                crate::vcp_modules::vcp_client::deliver_request_event(
+                    &app_handle,
+                    message_key,
+                    stream_channel,
+                    crate::vcp_modules::vcp_client::StreamEvent::end(
+                        message_id.to_string(),
+                        context,
+                        Some(message.finish_reason.clone()),
+                        Some(message.content.clone()),
+                        None,
+                        Some(message.timestamp),
+                        message.topic_updated_at,
+                    ),
+                );
+                return Ok(Some(message));
+            }
+            Ok(StreamCommit::Removed) => {
+                crate::vcp_modules::vcp_client::discard_request_helper(&app_handle, message_key)
+                    .await;
+                return Ok(None);
+            }
+            Err(error) => {
+                let mut event = crate::vcp_modules::vcp_client::StreamEvent::error(
+                    message_id.to_string(),
+                    context.clone(),
+                    format!("终态保存失败: {}", error),
+                );
+                event.content = Some(final_content.clone());
+                crate::vcp_modules::vcp_client::deliver_request_event(
+                    &app_handle,
+                    message_key,
+                    stream_channel.clone(),
+                    event,
+                );
+                return Err(error);
+            }
+        }
+    };
 
     crate::vcp_modules::vcp_client::release_committed_helper(&app_handle, message_key).await;
 
@@ -1555,7 +1824,7 @@ async fn finalize_stream_message_inner<R: tauri::Runtime>(
         let event = crate::vcp_modules::vcp_client::StreamEvent::end(
             message_id.to_string(),
             context,
-            Some(terminal_reason),
+            Some(terminal_reason.clone()),
             Some(final_content.clone()),
             end_blocks,
             Some(end_timestamp),
@@ -1569,19 +1838,23 @@ async fn finalize_stream_message_inner<R: tauri::Runtime>(
         );
     }
 
-    Ok(final_content)
+    let terminal = std::sync::Arc::unwrap_or_clone(terminal);
+    Ok(Some(FinalizedStreamMessage {
+        content: terminal.content,
+        finish_reason: terminal.finish_reason,
+        timestamp: end_timestamp,
+        topic_updated_at,
+        newly_committed: true,
+    }))
 }
 
-#[allow(clippy::too_many_arguments)]
 async fn commit_stream_message(
     db_state: &DbState,
     message_key: &MessageKey,
     final_content: &str,
     final_ts: u64,
     finish_reason: &str,
-    agent_id: Option<&str>,
-    agent_name: Option<&str>,
-) -> Result<(Vec<ContentBlock>, u64, i64), String> {
+) -> Result<StreamCommit, String> {
     let key = &message_key.topic;
     let owner_id = key.owner_id.as_str();
     let owner_type = key.owner_type.as_str();
@@ -1594,13 +1867,14 @@ async fn commit_stream_message(
         .write_transaction("message.stream.finalize")
         .await?;
 
-    let start_timestamp: i64 = sqlx::query_scalar(
-        "SELECT m.timestamp FROM messages m
-         JOIN active_generations ag
+    let row = sqlx::query(
+        "SELECT m.timestamp, m.content, m.name, m.agent_id, m.finish_reason, m.deleted_at,
+                ag.msg_id IS NOT NULL AS pending
+         FROM messages m
+         LEFT JOIN active_generations ag
            ON ag.owner_type = m.owner_type AND ag.owner_id = m.owner_id
           AND ag.topic_id = m.topic_id AND ag.msg_id = m.msg_id
-         WHERE m.owner_type = ? AND m.owner_id = ? AND m.topic_id = ? AND m.msg_id = ?
-           AND m.finish_reason IS NULL AND m.deleted_at IS NULL",
+         WHERE m.owner_type = ? AND m.owner_id = ? AND m.topic_id = ? AND m.msg_id = ?",
     )
     .bind(&key.owner_type)
     .bind(&key.owner_id)
@@ -1608,22 +1882,41 @@ async fn commit_stream_message(
     .bind(message_id)
     .fetch_optional(&mut *tx)
     .await
-    .map_err(|e| e.to_string())?
-    .ok_or_else(|| {
-        format!(
-            "Generation {} is not pending for {} {} topic {}",
-            message_id, owner_type, owner_id, topic_id
-        )
-    })?;
+    .map_err(|e| e.to_string())?;
+    let Some(row) = row else {
+        return Ok(StreamCommit::Removed);
+    };
+    if row.get::<Option<i64>, _>("deleted_at").is_some() {
+        return Ok(StreamCommit::Removed);
+    }
+    let start_timestamp: i64 = row.get("timestamp");
+    let message_name: Option<String> = row.get("name");
+    let message_agent_id: Option<String> = row.get("agent_id");
     let fingerprint_timestamp = u64::try_from(start_timestamp)
         .map_err(|_| format!("Message {message_id} has a negative timestamp"))?;
+    if let Some(reason) = row.get::<Option<String>, _>("finish_reason") {
+        let activity = HashAggregator::load_topic_activity(&mut tx, key).await?;
+        return Ok(StreamCommit::AlreadyFinalized(FinalizedStreamMessage {
+            content: row.get("content"),
+            finish_reason: reason,
+            timestamp: fingerprint_timestamp,
+            topic_updated_at: Some(activity.updated_at),
+            newly_committed: false,
+        }));
+    }
+    if !row.get::<bool, _>("pending") {
+        return Err(format!(
+            "Generation {} is not pending for {} {} topic {}",
+            message_id, owner_type, owner_id, topic_id
+        ));
+    }
     let content_hash = HashAggregator::compute_message_fingerprint(
         message_id,
         "assistant",
-        agent_name,
+        message_name.as_deref(),
         final_content,
         fingerprint_timestamp,
-        agent_id,
+        message_agent_id.as_deref(),
         &[],
     );
 
@@ -1727,7 +2020,12 @@ async fn commit_stream_message(
 
     let activity = HashAggregator::bubble_from_topic(&mut tx, key).await?;
     tx.commit().await.map_err(|e| e.to_string())?;
-    Ok((blocks, start_timestamp as u64, activity.updated_at))
+    Ok(StreamCommit::Committed(
+        blocks,
+        start_timestamp as u64,
+        activity.updated_at,
+        message_name,
+    ))
 }
 
 #[tauri::command]
@@ -1866,6 +2164,43 @@ mod stream_lifecycle_tests {
     use super::*;
     use sqlx::sqlite::SqlitePoolOptions;
 
+    #[tokio::test]
+    async fn shell_presentation_defaults_bad_values_without_fabricating_identity() {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        let broken =
+            sqlx::query("SELECT 'agent' AS agent_id,x'ff' AS name,x'ff' AS dominant_color")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        let agent = project_shell_agent(broken).unwrap();
+        assert_eq!(agent.id, "agent");
+        assert_eq!(
+            agent.name,
+            crate::vcp_modules::agent_types::AgentConfig::default().name
+        );
+        assert_eq!(agent.avatar_calculated_color, None);
+        let empty = sqlx::query("SELECT 'agent' AS agent_id,'' AS name,NULL AS dominant_color")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(project_shell_agent(empty).unwrap().name, "");
+        let identity =
+            sqlx::query("SELECT x'ff' AS agent_id,'Keep' AS name,NULL AS dominant_color")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert!(project_shell_agent(identity).is_err());
+        let missing_column = sqlx::query("SELECT 'agent' AS agent_id,NULL AS dominant_color")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert!(project_shell_agent(missing_column).is_err());
+    }
+
     fn topic_key() -> TopicKey {
         TopicKey::new("agent", "agent-1", "topic-1")
     }
@@ -1884,6 +2219,12 @@ mod stream_lifecycle_tests {
             .execute(&pool)
             .await
             .expect("baseline schema");
+        sqlx::raw_sql(include_str!(
+            "../../../migrations/0102_stream_stop_intent.sql"
+        ))
+        .execute(&pool)
+        .await
+        .expect("stream stop intent schema");
         sqlx::query(
             "INSERT INTO agents (owner_type, agent_id, name, model, updated_at)
              VALUES ('agent', 'agent-1', 'Agent', 'test', 1)",
@@ -1899,6 +2240,85 @@ mod stream_lifecycle_tests {
         .await
         .expect("topic fixture");
         pool
+    }
+
+    #[tokio::test]
+    async fn edit_resend_rolls_back_truncation_when_the_message_write_fails() {
+        let pool = test_pool().await;
+        let app = tauri::test::mock_app();
+        app.manage(DbState::new(pool.clone(), std::path::PathBuf::new()));
+        let anchor = ChatMessage {
+            id: "anchor".into(),
+            role: "user".into(),
+            content: "original".into(),
+            timestamp: 1,
+            ..Default::default()
+        };
+        let following = ChatMessage {
+            id: "following".into(),
+            role: "assistant".into(),
+            content: "following reply".into(),
+            timestamp: 2,
+            ..Default::default()
+        };
+        for message in [anchor.clone(), following] {
+            append_single_message(
+                app.handle().clone(),
+                &pool,
+                "agent-1",
+                "agent",
+                "topic-1".into(),
+                message,
+            )
+            .await
+            .expect("seed history");
+        }
+        sqlx::raw_sql(
+            "CREATE TRIGGER reject_edited_body BEFORE UPDATE OF content ON messages
+             WHEN NEW.msg_id = 'anchor' AND NEW.content = 'edited'
+             BEGIN SELECT RAISE(ABORT, 'injected write failure'); END;",
+        )
+        .execute(&pool)
+        .await
+        .expect("inject write failure");
+        let edited = ChatMessage {
+            content: "edited".into(),
+            ..anchor
+        };
+        let db = app.state::<DbState>();
+        let error = edit_resend_message(app.handle(), &db, &topic_key(), edited.clone())
+            .await
+            .err()
+            .expect("the edit must fail after attempted truncation");
+        assert!(error.contains("injected write failure"));
+        let rows: Vec<(String, String, Option<i64>)> =
+            sqlx::query_as("SELECT msg_id, content, deleted_at FROM messages ORDER BY timestamp")
+                .fetch_all(&pool)
+                .await
+                .expect("history after rollback");
+        assert_eq!(
+            rows,
+            vec![
+                ("anchor".into(), "original".into(), None),
+                ("following".into(), "following reply".into(), None),
+            ]
+        );
+        sqlx::query("DROP TRIGGER reject_edited_body")
+            .execute(&pool)
+            .await
+            .expect("remove injected failure");
+        let (persisted, deletion) = edit_resend_message(app.handle(), &db, &topic_key(), edited)
+            .await
+            .expect("retry edit");
+        assert!(!persisted.blocks.is_empty());
+        assert_eq!(deletion.deleted_ids, vec!["following"]);
+        assert_eq!(deletion.msg_count, 1);
+        let visible: Vec<(String, String)> =
+            sqlx::query_as("SELECT msg_id, content FROM messages WHERE deleted_at IS NULL")
+                .fetch_all(&pool)
+                .await
+                .expect("committed history");
+        assert_eq!(visible, vec![("anchor".into(), "edited".into())]);
     }
 
     #[tokio::test]
@@ -2120,19 +2540,21 @@ mod stream_lifecycle_tests {
         .await
         .expect("skeleton identity");
 
-        let (_, terminal_timestamp, terminal_topic_updated_at) = commit_stream_message(
-            &db_state,
-            &key,
-            "terminal body",
-            2,
-            "completed",
-            Some("agent-1"),
-            Some("Agent"),
-        )
-        .await
-        .expect("finalize generation");
+        let committed = commit_stream_message(&db_state, &key, "terminal body", 2, "completed")
+            .await
+            .expect("finalize generation");
+        let StreamCommit::Committed(
+            _,
+            terminal_timestamp,
+            terminal_topic_updated_at,
+            committed_name,
+        ) = committed
+        else {
+            panic!("pending generation must commit");
+        };
         assert_eq!(terminal_timestamp, skeleton.0 as u64);
         assert_eq!(terminal_topic_updated_at, 2);
+        assert_eq!(committed_name.as_deref(), Some("Agent"));
         let topic_updated_after_finalize: i64 =
             sqlx::query_scalar("SELECT updated_at FROM topics WHERE topic_id = 'topic-1'")
                 .fetch_one(&pool)
@@ -2159,17 +2581,43 @@ mod stream_lifecycle_tests {
         .await
         .expect("active count");
         assert_eq!(active, 0);
-        assert!(commit_stream_message(
-            &db_state,
+        let repeated = commit_stream_message(&db_state, &key, "late body", 3, "completed")
+            .await
+            .expect("late finalization is idempotent");
+        let StreamCommit::AlreadyFinalized(message) = repeated else {
+            panic!("late finalization must return the durable message");
+        };
+        assert_eq!(message.content, "terminal body");
+        assert_eq!(message.finish_reason, "completed");
+        assert_eq!(message.timestamp, skeleton.0 as u64);
+        assert_eq!(message.topic_updated_at, Some(terminal_topic_updated_at));
+
+        let app = tauri::test::mock_app();
+        app.manage(db_state);
+        let (events, mut received) = tokio::sync::mpsc::unbounded_channel();
+        let channel = Channel::new(move |body| {
+            let _ = events.send(body.deserialize::<serde_json::Value>()?);
+            Ok(())
+        });
+        finalize_stream_message(
+            app.handle().clone(),
+            &pool,
             &key,
-            "late body",
-            3,
-            "completed",
-            Some("agent-1"),
-            Some("Agent"),
+            "late partial".to_string(),
+            true,
+            None,
+            Some(channel),
+            Some("agent-1".to_string()),
         )
         .await
-        .is_err());
+        .expect("late consumer receives the durable result");
+        let event = received.try_recv().expect("durable end event");
+        assert_eq!(event["type"], "end");
+        assert_eq!(event["context"]["replayed"], true);
+        assert_eq!(event["content"], "terminal body");
+        assert_eq!(event["finishReason"], "completed");
+        assert_eq!(event["timestamp"], skeleton.0);
+        assert!(received.try_recv().is_err());
     }
 
     #[tokio::test]
@@ -2181,7 +2629,7 @@ mod stream_lifecycle_tests {
             .await
             .expect("tombstone topic");
 
-        let error = begin_stream_message(
+        begin_stream_message(
             &db_state,
             &message_key("message-after-delete"),
             Some("agent-1"),
@@ -2189,7 +2637,6 @@ mod stream_lifecycle_tests {
         )
         .await
         .expect_err("atomic skeleton insert must observe the tombstone");
-        assert!(error.contains("live agent"));
         let message_count: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM messages WHERE msg_id = 'message-after-delete'",
         )
@@ -2219,17 +2666,11 @@ mod stream_lifecycle_tests {
             .await
             .expect("remove cache fixture");
 
-        assert!(commit_stream_message(
-            &db_state,
-            &key,
-            "must roll back",
-            2,
-            "completed",
-            Some("agent-1"),
-            Some("Agent"),
-        )
-        .await
-        .is_err());
+        assert!(
+            commit_stream_message(&db_state, &key, "must roll back", 2, "completed",)
+                .await
+                .is_err()
+        );
 
         let finish_reason: Option<String> =
             sqlx::query_scalar("SELECT finish_reason FROM messages WHERE msg_id = 'message-2'")
@@ -2247,7 +2688,7 @@ mod stream_lifecycle_tests {
     }
 
     #[tokio::test]
-    async fn tombstoned_generation_rejects_late_finalization() {
+    async fn tombstoned_generation_discards_late_finalization() {
         let pool = test_pool().await;
         let db_state = DbState::new(pool.clone(), std::path::PathBuf::new());
         let key = message_key("message-deleted");
@@ -2263,17 +2704,28 @@ mod stream_lifecycle_tests {
         )
         .await
         .expect("delete generation");
-        assert!(commit_stream_message(
-            &db_state,
+        let app = tauri::test::mock_app();
+        app.manage(db_state);
+        let events = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let event_count = events.clone();
+        let channel = Channel::new(move |_| {
+            event_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Ok(())
+        });
+        let late = finalize_stream_message(
+            app.handle().clone(),
+            &pool,
             &key,
-            "late terminal body",
-            999,
-            "completed",
-            Some("agent-1"),
-            Some("Agent"),
+            "late terminal body".to_string(),
+            false,
+            Some("completed".to_string()),
+            Some(channel),
+            Some("agent-1".to_string()),
         )
         .await
-        .is_err());
+        .expect("deleted generation is settled without an error");
+        assert!(late.is_none());
+        assert_eq!(events.load(std::sync::atomic::Ordering::Relaxed), 0);
 
         let deleted_at: Option<i64> =
             sqlx::query_scalar("SELECT deleted_at FROM messages WHERE msg_id = 'message-deleted'")
@@ -2288,6 +2740,115 @@ mod stream_lifecycle_tests {
         .await
         .expect("active count");
         assert_eq!(active, 0);
+    }
+
+    #[tokio::test]
+    async fn stopped_generation_preserves_body_and_persists_cancelled_reason() {
+        let pool = test_pool().await;
+        let db_state = DbState::new(pool.clone(), std::path::PathBuf::new());
+        let key = message_key("message-stopped");
+        begin_stream_message(&db_state, &key, Some("agent-1"), Some("Agent"))
+            .await
+            .expect("begin generation");
+        let app = tauri::test::mock_app();
+        app.manage(db_state);
+
+        let message = finalize_stream_message(
+            app.handle().clone(),
+            &pool,
+            &key,
+            "partial reply".to_string(),
+            true,
+            None,
+            None,
+            Some("agent-1".to_string()),
+        )
+        .await
+        .expect("commit stopped generation")
+        .expect("stopped message remains visible");
+        assert_eq!(message.content, "partial reply");
+        assert_eq!(message.finish_reason, "cancelled_by_user");
+        let persisted: (String, String) = sqlx::query_as(
+            "SELECT content, finish_reason FROM messages WHERE msg_id = 'message-stopped'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("durable stopped message");
+        assert_eq!(
+            persisted,
+            ("partial reply".to_string(), "cancelled_by_user".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn live_unfinished_message_without_generation_remains_an_error() {
+        let pool = test_pool().await;
+        let db_state = DbState::new(pool.clone(), std::path::PathBuf::new());
+        let key = message_key("message-unowned");
+        begin_stream_message(&db_state, &key, Some("agent-1"), Some("Agent"))
+            .await
+            .expect("begin generation");
+        sqlx::query("DELETE FROM active_generations WHERE msg_id = 'message-unowned'")
+            .execute(&pool)
+            .await
+            .expect("simulate inconsistent pending state");
+        assert!(
+            commit_stream_message(&db_state, &key, "unowned body", 999, "completed",)
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn jev_cache_recompilation_replaces_old_tool_projection_without_editing_message() {
+        let pool = test_pool().await;
+        let db_state = DbState::new(pool.clone(), std::path::PathBuf::new());
+        let key = message_key("jev-cache");
+        begin_stream_message(&db_state, &key, Some("agent-1"), Some("Agent"))
+            .await
+            .expect("begin generation");
+        let raw = "<<<[TOOL_REQUEST]>>>\nJEV:「始」使用 'B站获取'「末」\n<<<[END_TOOL_REQUEST]>>>";
+        let hash = crate::vcp_modules::sync_hash::HashAggregator::compute_content_hash(raw);
+        sqlx::query("UPDATE messages SET content = ?, content_hash = ? WHERE msg_id = 'jev-cache'")
+            .bind(raw)
+            .bind(&hash)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let old_blocks = vec![ContentBlock::tool_use(
+            "Processing...".to_string(),
+            "\nJEV:「始」使用 'B站获取'「末」\n".to_string(),
+            true,
+        )];
+        let old_cache = serialize_render_async(old_blocks).await.unwrap();
+        assert!(
+            decode_valid_render_cache(Some(old_cache), Some(hash.clone()), Some(2), &hash)
+                .await
+                .is_none()
+        );
+
+        let (_, new_cache) = compile_and_serialize_render_async(raw.to_string())
+            .await
+            .unwrap();
+        assert!(write_render_cache_cas(&db_state, &key, &hash, &new_cache)
+            .await
+            .unwrap());
+        let row = sqlx::query("SELECT m.content, m.content_hash, r.render_content, r.renderer_schema_version \
+            FROM messages m JOIN render_cache r USING (owner_type, owner_id, topic_id, msg_id) WHERE m.msg_id = 'jev-cache'")
+            .fetch_one(&pool).await.unwrap();
+        assert_eq!(row.get::<String, _>("content"), raw);
+        assert_eq!(row.get::<String, _>("content_hash"), hash);
+        let decoded = decode_valid_render_cache(
+            Some(row.get("render_content")),
+            Some(hash.clone()),
+            Some(row.get("renderer_schema_version")),
+            &hash,
+        )
+        .await
+        .unwrap();
+        assert_eq!(decoded[0]["type"], "jev-tool-use");
+        assert_eq!(decoded[0]["tool_name"], "B站获取");
+        assert_eq!(decoded[0]["content"], "\nJEV:「始」使用 'B站获取'「末」\n");
     }
 
     #[tokio::test]
@@ -2357,5 +2918,74 @@ mod stream_lifecycle_tests {
         )
         .await
         .is_none());
+    }
+
+    #[tokio::test]
+    async fn finalizing_after_agent_rename_preserves_message_name_and_fingerprint() {
+        let pool = test_pool().await;
+        let db_state = DbState::new(pool.clone(), std::path::PathBuf::new());
+        let key = message_key("message-rename");
+
+        // 1. 开始生成流：存入初始旧名 "OldAgent"
+        begin_stream_message(&db_state, &key, Some("agent-1"), Some("OldAgent"))
+            .await
+            .expect("begin generation");
+
+        // 2. 模拟生成期间助手被改名：在 agents 表中更新或插入新名字 "NewAgent"
+        sqlx::query(
+            "INSERT INTO agents (owner_type, agent_id, name, model, updated_at) \
+             VALUES ('agent', 'agent-1', 'NewAgent', 'test-model', 1) \
+             ON CONFLICT(owner_type, agent_id) DO UPDATE SET name = 'NewAgent'",
+        )
+        .execute(&pool)
+        .await
+        .expect("update agent name to NewAgent");
+
+        // 3. 终态结算
+        let app = tauri::test::mock_app();
+        app.manage(db_state.clone());
+        let finalized = finalize_stream_message(
+            app.handle().clone(),
+            &pool,
+            &key,
+            "Final content".to_string(),
+            false,
+            Some("completed".to_string()),
+            None,
+            Some("agent-1".to_string()),
+        )
+        .await
+        .expect("finalize stream message");
+
+        assert!(finalized.is_some());
+
+        // 4. 验证数据库中持久化的消息记录：name 保持为流开始时的 "OldAgent"
+        let (name, hash, content, timestamp, agent_id): (
+            Option<String>,
+            String,
+            String,
+            i64,
+            Option<String>,
+        ) = sqlx::query_as(
+            "SELECT name, content_hash, content, timestamp, agent_id \
+             FROM messages WHERE msg_id = 'message-rename'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("fetch finalized message");
+
+        assert_eq!(name.as_deref(), Some("OldAgent"));
+
+        // 5. 核心断言：content_hash 必须与消息自身 name ("OldAgent") 完全自洽，消除指纹漂移
+        let expected_hash = HashAggregator::compute_message_fingerprint(
+            "message-rename",
+            "assistant",
+            Some("OldAgent"),
+            &content,
+            timestamp as u64,
+            agent_id.as_deref(),
+            &[],
+        );
+        assert_eq!(hash, expected_hash);
     }
 }

@@ -1,4 +1,5 @@
 <script setup lang="ts">
+defineOptions({ inheritAttrs: false });
 import { LAYER_PAGE_BASE } from '../../core/constants/layers';
 
 interface Props {
@@ -9,13 +10,20 @@ interface Props {
 const props = withDefaults(defineProps<Props>(), {
   zIndex: LAYER_PAGE_BASE,
 });
+
+const emit = defineEmits<{
+  'before-leave': [element: Element];
+  'after-leave': [element: Element];
+}>();
 </script>
 
 <template>
-  <Transition name="slide-page" appear>
+  <Transition name="slide-page" appear
+    @before-leave="emit('before-leave', $event)" @after-leave="emit('after-leave', $event)">
     <div
       v-show="props.isOpen"
-      class="vcp-safe-inline fixed inset-0 pointer-events-auto bg-[var(--primary-bg)]"
+      v-bind="$attrs"
+      class="vcp-viewport-surface vcp-safe-inline fixed inset-0 pointer-events-auto bg-[var(--primary-bg)]"
       :style="{ zIndex: props.zIndex }"
     >
       <slot />

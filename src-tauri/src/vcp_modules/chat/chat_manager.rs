@@ -214,8 +214,10 @@ pub async fn patch_single_message(
     topic_id: String,
     message: ChatMessage,
 ) -> Result<message_service::MessageWriteResultDto, String> {
-    message_service::patch_single_message(
-        app_handle,
+    let key = TopicKey::new(&owner_type, &owner_id, &topic_id);
+    let edited_message_id = message.id.clone();
+    let result = message_service::patch_single_message(
+        app_handle.clone(),
         &db_state.pool,
         &owner_id,
         &owner_type,
@@ -223,7 +225,22 @@ pub async fn patch_single_message(
         message,
         false,
     )
+    .await?;
+    // The committed identity also covers narration admitted during rendering.
+    if let Err(error) = crate::vcp_modules::chat::voice_service::stop_bubble_for_messages(
+        &app_handle,
+        &key,
+        std::slice::from_ref(&edited_message_id),
+    )
     .await
+    {
+        log::warn!("[ChatManager] Message edit committed; narration cleanup failed: {error}");
+    }
+    if let Some(turns) = app_handle.try_state::<crate::vcp_modules::vcp_client::ActiveGroupTurns>()
+    {
+        turns.notify_history_changed(&key);
+    }
+    Ok(result)
 }
 
 #[tauri::command]
@@ -237,6 +254,22 @@ pub async fn delete_messages(
 ) -> Result<TopicActivityDto, String> {
     let key = TopicKey::new(owner_type, owner_id, &topic_id);
     let result = message_service::delete_messages(&db_state, &key, msg_ids, None).await?;
+    if let Err(error) = crate::vcp_modules::chat::voice_service::stop_bubble_for_messages(
+        &app_handle,
+        &key,
+        &result.deleted_ids,
+    )
+    .await
+    {
+        log::warn!("[ChatManager] Deleted messages committed; narration cleanup failed: {error}");
+    }
+    if !result.deleted_ids.is_empty() {
+        if let Some(turns) =
+            app_handle.try_state::<crate::vcp_modules::vcp_client::ActiveGroupTurns>()
+        {
+            turns.notify_history_changed(&key);
+        }
+    }
     for msg_id in &result.active_ids {
         crate::vcp_modules::vcp_client::discard_deleted_generation(
             &app_handle,
@@ -266,6 +299,33 @@ pub fn notify_message_deletions<R: tauri::Runtime>(
     }
 }
 
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EditResendResultDto {
+    #[serde(flatten)]
+    persisted: message_service::MessageWriteResultDto,
+    msg_count: i32,
+}
+
+#[tauri::command]
+pub async fn edit_resend_message(
+    app_handle: tauri::AppHandle,
+    db_state: tauri::State<'_, crate::vcp_modules::db_manager::DbState>,
+    owner_id: String,
+    owner_type: String,
+    topic_id: String,
+    message: ChatMessage,
+) -> Result<EditResendResultDto, String> {
+    let key = TopicKey::new(owner_type, owner_id, topic_id);
+    let (persisted, deletion) =
+        message_service::edit_resend_message(&app_handle, &db_state, &key, message).await?;
+    finish_history_truncation(&app_handle, &key, &deletion).await;
+    Ok(EditResendResultDto {
+        persisted,
+        msg_count: deletion.msg_count,
+    })
+}
+
 #[tauri::command]
 pub async fn truncate_history_after_message(
     app_handle: tauri::AppHandle,
@@ -279,18 +339,42 @@ pub async fn truncate_history_after_message(
     let deletion =
         message_service::truncate_history_after_message(&db_state, &key, &anchor_message_id)
             .await?;
-    for msg_id in &deletion.active_ids {
-        crate::vcp_modules::vcp_client::discard_deleted_generation(
-            &app_handle,
-            &MessageKey::new(key.clone(), msg_id),
-        )
-        .await;
-    }
-    notify_message_deletions(&app_handle, &key, &deletion);
+    finish_history_truncation(&app_handle, &key, &deletion).await;
     Ok(TopicActivityDto {
         msg_count: deletion.msg_count,
         updated_at: deletion.topic_updated_at,
     })
+}
+
+async fn finish_history_truncation(
+    app_handle: &tauri::AppHandle,
+    key: &TopicKey,
+    deletion: &message_service::MessageDeletionResult,
+) {
+    if let Err(error) = crate::vcp_modules::chat::voice_service::stop_bubble_for_messages(
+        app_handle,
+        key,
+        &deletion.deleted_ids,
+    )
+    .await
+    {
+        log::warn!("[ChatManager] History truncation committed; narration cleanup failed: {error}");
+    }
+    if !deletion.deleted_ids.is_empty() {
+        if let Some(turns) =
+            app_handle.try_state::<crate::vcp_modules::vcp_client::ActiveGroupTurns>()
+        {
+            turns.cancel(key);
+        }
+    }
+    for msg_id in &deletion.active_ids {
+        crate::vcp_modules::vcp_client::discard_deleted_generation(
+            app_handle,
+            &MessageKey::new(key.clone(), msg_id),
+        )
+        .await;
+    }
+    notify_message_deletions(app_handle, key, deletion);
 }
 
 // --- 增量同步逻辑 (Delta Sync) (Moved to sync_manager.rs) ---

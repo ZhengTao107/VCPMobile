@@ -1,6 +1,5 @@
 import { describe, expect, it } from "vitest";
 import {
-  CONFIG_PROFILE_FIELDS,
   CONFIG_STRING_FIELDS,
   CONFIG_STRING_PREFIX,
   buildConfigString,
@@ -9,7 +8,7 @@ import {
   parseConfigString,
   toSettingsPatch,
 } from "../../../core/config/configImport";
-import { CONNECTION_PROFILE_FIELDS, type ConnectionProfile } from "../../../core/stores/settings";
+import { CONNECTION_PROFILE_FIELDS, CONNECTION_PROFILE_PATHS, type ConnectionProfile } from "../../../core/config/connectionProfiles";
 
 const full = {
   vcpServerUrl: "https://vcp.example.com",
@@ -115,7 +114,7 @@ describe("部分字段只覆盖部分", () => {
     );
     expect(result).toEqual({ ok: true, config: { syncToken: "tok-1234", label: "L" } });
     if (result.ok) {
-      expect(toSettingsPatch(result.config)).toEqual({ syncToken: "tok-1234" });
+      expect(toSettingsPatch(result.config)).toEqual({ "sync.token": "tok-1234" });
     }
   });
 
@@ -123,14 +122,14 @@ describe("部分字段只覆盖部分", () => {
     const result = parseConfigString(encode({ v: 1, syncHttpUrl: full.syncHttpUrl, vcpApiKey: "" }));
     expect(result.ok).toBe(true);
     if (result.ok) {
-      expect(Object.keys(toSettingsPatch(result.config))).toEqual(["syncHttpUrl"]);
+      expect(Object.keys(toSettingsPatch(result.config))).toEqual(["sync.httpUrl"]);
     }
   });
 
   it("patch 字段全部属于白名单", () => {
     const result = parseConfigString(encode({ v: 1, ...full }));
     if (!result.ok) throw new Error(result.error);
-    expect(Object.keys(toSettingsPatch(result.config)).sort()).toEqual([...CONFIG_STRING_FIELDS].sort());
+    expect(Object.keys(toSettingsPatch(result.config)).sort()).toEqual(CONFIG_STRING_FIELDS.map((f) => CONNECTION_PROFILE_PATHS[f]).sort());
   });
 });
 
@@ -193,8 +192,8 @@ describe("连接档案", () => {
     expect(stripIds(result.config.connectionProfiles)).toEqual(stripIds([home, company]));
     for (const profile of result.config.connectionProfiles!) expect(profile.id).toMatch(/\S/);
     const patch = toSettingsPatch(result.config);
-    expect(stripIds(patch.connectionProfiles)).toEqual(stripIds([home, company]));
-    expect(patch.connectionProfiles).not.toBe(result.config.connectionProfiles);
+    expect(stripIds(JSON.parse(patch["server.connectionProfiles"]))).toEqual(stripIds([home, company]));
+    expect(typeof patch["server.connectionProfiles"]).toBe("string");
   });
 
   it("导出只带名称与非空字段，不带 id", () => {
@@ -209,7 +208,7 @@ describe("连接档案", () => {
     expect(result.ok).toBe(true);
     if (!result.ok) return;
     expect(stripIds(result.config.connectionProfiles)).toEqual(stripIds([asProfile(localProfile), asProfile(serverProfile)]));
-    expect(Object.keys(toSettingsPatch(result.config))).toEqual([...CONFIG_PROFILE_FIELDS]);
+    expect(Object.keys(toSettingsPatch(result.config))).toEqual(["server.connectionProfiles"]);
   });
 
   it.each([
@@ -298,7 +297,7 @@ describe("连接档案", () => {
     expect(buildConfigString(full)).toBe(encode({ v: 1, ...full }));
     expect(buildConfigString(full, undefined, { profiles: "all" })).toBe(encode({ v: 1, ...full }));
     const result = parseConfigString(encode({ v: 1, ...full }));
-    if (result.ok) expect(toSettingsPatch(result.config)).not.toHaveProperty("connectionProfiles");
+    if (result.ok) expect(toSettingsPatch(result.config)).not.toHaveProperty("server.connectionProfiles");
   });
 
   it("maskPreview 每个档案一行、Key 只露后 4 位", () => {

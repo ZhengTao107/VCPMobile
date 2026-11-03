@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import { useRouter } from "vue-router";
-import { ArrowLeft, RefreshCw } from "lucide-vue-next";
+import { ArrowLeft, RefreshCw } from "@lucide/vue";
 import CanvasDocPane from "./CanvasDocPane.vue";
 import CanvasChatPane from "./CanvasChatPane.vue";
 import OpenTabsBar from "../chat/components/OpenTabsBar.vue";
@@ -33,8 +33,8 @@ const segment = ref<Segment>("doc");
 
 /** [对话] 只把全局会话切到绑定话题，不新开、不切换聊天标签（Canvas 标签激活时 upsertCurrent 跳过）。 */
 const selectConversation = async (tab: OpenTabRef) => {
-  await sessionStore.selectTopicById(tab.ownerId, tab.ownerType, tab.topicId);
-  return true;
+  const status = await sessionStore.selectTopicById(tab.ownerId, tab.ownerType, tab.topicId);
+  return status === "accepted";
 };
 const switcher = createChatSwitcher({
   current: () => sessionStore.currentConversationKey,

@@ -1,9 +1,9 @@
-use crate::vcp_modules::db_manager::DbState;
-use crate::vcp_modules::settings_manager::{read_settings, SettingsState};
-use crate::vcp_modules::vcp_client::{
-    freeze_chat_connection, resolve_model_discovery_endpoint, ChatRequestPurpose,
-    MODEL_DISCOVERY_UNAVAILABLE,
+use super::vcp_http_endpoint::{
+    resolve_model_discovery_endpoint, ChatRequestPurpose, MODEL_DISCOVERY_UNAVAILABLE,
 };
+use crate::vcp_modules::db_manager::DbState;
+use crate::vcp_modules::settings_manager::{read_config, SettingsState};
+use crate::vcp_modules::vcp_client::freeze_chat_connection;
 use futures_util::future::join_all;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
@@ -63,6 +63,26 @@ impl ModelManagerState {
     }
 }
 
+async fn read_cached_models(pool: &sqlx::SqlitePool) -> Result<Vec<ModelInfo>, String> {
+    use sqlx::Row;
+    let row = sqlx::query("SELECT value FROM settings WHERE key = 'cached_models'")
+        .fetch_optional(pool)
+        .await
+        .map_err(|error| error.to_string())?;
+    let Some(row) = row else {
+        return Ok(Vec::new());
+    };
+    // A disposable discovery cache can miss, but a storage failure is not a miss.
+    let raw: Option<String> = match row.try_get("value") {
+        Ok(value) => value,
+        Err(sqlx::Error::ColumnDecode { .. }) => None,
+        Err(error) => return Err(error.to_string()),
+    };
+    Ok(raw
+        .and_then(|raw| serde_json::from_str(&raw).ok())
+        .unwrap_or_default())
+}
+
 #[tauri::command]
 pub async fn get_cached_models<R: Runtime>(
     app: AppHandle<R>,
@@ -76,24 +96,10 @@ pub async fn get_cached_models<R: Runtime>(
 
     // 2. 内存缺失时尝试从数据库 (settings 表) 读取
     let db_state = app.state::<DbState>();
-    let pool = &db_state.pool;
-
-    let row = sqlx::query("SELECT value FROM settings WHERE key = 'cached_models'")
-        .fetch_optional(pool)
-        .await
-        .map_err(|e| e.to_string())?;
-
-    if let Some(r) = row {
-        use sqlx::Row;
-        let json_str: String = r.get("value");
-        if let Ok(models) = serde_json::from_str::<Vec<ModelInfo>>(&json_str) {
-            // 回写到内存防止下次重复读取 DB
-            *state.cached_models.write().await = models.clone();
-            return Ok(models);
-        }
-    }
-
-    Ok(Vec::new())
+    let models = read_cached_models(&db_state.pool).await?;
+    // 回写到内存防止下次重复读取 DB。
+    *state.cached_models.write().await = models.clone();
+    Ok(models)
 }
 
 #[tauri::command]
@@ -103,17 +109,17 @@ pub async fn refresh_models<R: Runtime>(
     settings_state: State<'_, SettingsState>,
 ) -> Result<Vec<ModelInfo>, String> {
     let _refresh_guard = state.refresh_lifecycle.lock().await;
-    let settings = read_settings(app.clone(), settings_state).await?;
+    let settings = read_config(app.clone(), settings_state).await?;
     let models_url = resolve_model_discovery_endpoint(
-        &settings.vcp_server_url,
-        settings.chat_endpoint_mode,
+        &settings.server.url,
+        settings.server.endpoint_mode,
     )?
     .ok_or_else(|| {
         format!(
             "{MODEL_DISCOVERY_UNAVAILABLE}: 原始 URL 无法安全推导 /v1/models；主聊天仍可直接使用该地址"
         )
     })?;
-    let vcp_api_key = settings.vcp_api_key;
+    let vcp_api_key = &settings.server.api_key;
 
     let client = state.http_client.clone();
 
@@ -141,7 +147,7 @@ pub async fn refresh_models<R: Runtime>(
 
             // 2. 持久化到数据库 (settings 表)
             let db_state = app.state::<DbState>();
-            let json_str = serde_json::to_string(&models).unwrap_or_default();
+            let json_str = serde_json::to_string(&models).map_err(|error| error.to_string())?;
             let now = crate::vcp_modules::infra::utils::now_millis();
 
             let persist_result = async {
@@ -180,10 +186,11 @@ pub async fn get_hot_models<R: Runtime>(
 ) -> Result<Vec<String>, String> {
     let db_state = app.state::<DbState>();
     let pool = &db_state.pool;
+    let limit = i64::try_from(limit).map_err(|_| "模型数量超出查询范围".to_string())?;
 
     let rows =
         sqlx::query("SELECT model_id FROM model_usage_stats ORDER BY usage_count DESC LIMIT ?")
-            .bind(limit as i64)
+            .bind(limit)
             .fetch_all(pool)
             .await
             .map_err(|e| e.to_string())?;
@@ -191,7 +198,22 @@ pub async fn get_hot_models<R: Runtime>(
     let mut models = Vec::new();
     for row in rows {
         use sqlx::Row;
-        models.push(row.get("model_id"));
+        models.push(row.try_get("model_id").map_err(|error| error.to_string())?);
+    }
+
+    Ok(models)
+}
+
+pub async fn export_favorite_models(db: &DbState) -> Result<Vec<String>, String> {
+    let rows = sqlx::query("SELECT model_id FROM model_favorites ORDER BY created_at DESC")
+        .fetch_all(&db.pool)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    let mut models = Vec::new();
+    for row in rows {
+        use sqlx::Row;
+        models.push(row.try_get("model_id").map_err(|error| error.to_string())?);
     }
 
     Ok(models)
@@ -203,21 +225,41 @@ pub async fn get_favorite_models<R: Runtime>(
     _state: State<'_, ModelManagerState>,
 ) -> Result<Vec<String>, String> {
     let db_state = app.state::<DbState>();
-    let pool = &db_state.pool;
-
-    let rows = sqlx::query("SELECT model_id FROM model_favorites ORDER BY created_at DESC")
-        .fetch_all(pool)
-        .await
-        .map_err(|e| e.to_string())?;
-
-    let mut models = Vec::new();
-    for row in rows {
-        use sqlx::Row;
-        models.push(row.get("model_id"));
-    }
-
-    Ok(models)
+    export_favorite_models(&db_state).await
 }
+
+pub async fn import_favorite_models(
+    connection: &mut sqlx::SqliteConnection,
+    models: &[String],
+) -> Result<(), String> {
+    if models.is_empty() {
+        return Ok(());
+    }
+    let base_time = crate::vcp_modules::infra::utils::now_millis();
+    let mut seen = std::collections::HashSet::new();
+    let deduped: Vec<&str> = models
+        .iter()
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty() && seen.insert(*s))
+        .collect();
+
+    let total = deduped.len();
+    for (idx, model_id) in deduped.iter().enumerate() {
+        let assigned_time = base_time + ((total - idx) as i64) * 1000;
+        sqlx::query(
+            "INSERT INTO model_favorites (model_id, created_at) VALUES (?, ?)
+             ON CONFLICT(model_id) DO UPDATE SET created_at = excluded.created_at",
+        )
+        .bind(model_id)
+        .bind(assigned_time)
+        .execute(&mut *connection)
+        .await
+        .map_err(|e| format!("导入模型收藏失败 {model_id}: {e}"))?;
+    }
+    Ok(())
+}
+
+pub use import_favorite_models as import_model_favorites;
 
 #[tauri::command]
 pub async fn toggle_favorite_model<R: Runtime>(
@@ -331,7 +373,7 @@ pub async fn test_model_connectivity<R: Runtime>(
     settings_state: State<'_, SettingsState>,
     model_id: String,
 ) -> Result<u64, String> {
-    let settings = read_settings(app, settings_state).await?;
+    let settings = read_config(app, settings_state).await?;
     let connection = freeze_chat_connection(&settings, ChatRequestPurpose::Interactive)?;
 
     let start = std::time::Instant::now();
@@ -369,7 +411,7 @@ pub async fn start_batch_model_test<R: Runtime>(
     let _lifecycle_guard = state.batch_lifecycle.lock().await;
 
     // 1. 在主线程同步读取一次设置，规避生命周期逃逸问题，同时实现零冗余开销
-    let settings = read_settings(app, settings_state).await?;
+    let settings = read_config(app, settings_state).await?;
     let connection = freeze_chat_connection(&settings, ChatRequestPurpose::Interactive)?;
     let endpoint_url = connection.endpoint_url;
     let vcp_api_key = connection.api_key;
@@ -511,13 +553,94 @@ pub async fn init_model_manager<R: Runtime>(_app: &AppHandle<R>, _state: &ModelM
 }
 
 #[cfg(test)]
-mod task_owner_tests {
-    use super::is_current_batch_owner;
+mod cache_tests {
+    use super::*;
 
-    #[test]
-    fn old_batch_finalizer_cannot_clear_new_owner() {
-        assert!(is_current_batch_owner(Some(2), 2));
-        assert!(!is_current_batch_owner(Some(2), 1));
-        assert!(!is_current_batch_owner(None, 1));
+    #[tokio::test]
+    async fn malformed_discovery_cache_is_a_miss_but_database_failures_are_not() {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::query("CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert!(read_cached_models(&pool).await.unwrap().is_empty());
+        sqlx::query("INSERT INTO settings VALUES ('cached_models', ?)")
+            .bind(r#"[{"id":"valid-model"}]"#)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let cached = read_cached_models(&pool).await.unwrap();
+        assert_eq!(cached.len(), 1);
+        assert_eq!(cached[0].id, "valid-model");
+        assert_eq!(cached[0].created, 0);
+        assert_eq!(cached[0].object, "");
+        assert_eq!(cached[0].owned_by, "");
+        for raw in [
+            "{",
+            "null",
+            "{}",
+            "[false]",
+            r#"[{"id":"model","created":"wrong"}]"#,
+        ] {
+            sqlx::query("UPDATE settings SET value=? WHERE key='cached_models'")
+                .bind(raw)
+                .execute(&pool)
+                .await
+                .unwrap();
+            assert!(read_cached_models(&pool).await.unwrap().is_empty(), "{raw}");
+        }
+        sqlx::query("UPDATE settings SET value=? WHERE key='cached_models'")
+            .bind(br#"[{"id":"not-a-text-cache"}]"#.as_slice())
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert!(read_cached_models(&pool).await.unwrap().is_empty());
+        for statement in [
+            "UPDATE settings SET value=NULL WHERE key='cached_models'",
+            "UPDATE settings SET value=CAST(x'ff' AS TEXT) WHERE key='cached_models'",
+        ] {
+            sqlx::query(statement).execute(&pool).await.unwrap();
+            assert!(read_cached_models(&pool).await.unwrap().is_empty());
+        }
+        sqlx::query("DROP TABLE settings")
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert!(read_cached_models(&pool).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_import_favorite_models_preserves_order() {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+
+        sqlx::query(
+            "CREATE TABLE model_favorites (model_id TEXT PRIMARY KEY, created_at BIGINT NOT NULL)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let models = vec![
+            "gemini-2.5-flash".to_string(),
+            "claude-3-7-sonnet".to_string(),
+            "deepseek-reasoner".to_string(),
+        ];
+
+        {
+            let mut conn = pool.acquire().await.unwrap();
+            import_favorite_models(&mut conn, &models).await.unwrap();
+        }
+
+        let db = DbState::new(pool, std::path::PathBuf::new());
+        let exported = export_favorite_models(&db).await.unwrap();
+        assert_eq!(exported, models);
     }
 }

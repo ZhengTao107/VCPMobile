@@ -12,6 +12,7 @@ const props = defineProps<{
 const emit = defineEmits(['cancel', 'confirm']);
 
 const cropper = ref<any>(null);
+const surfaceRef = ref<HTMLElement | null>(null);
 const isConfirming = ref(false);
 const notificationStore = useNotificationStore();
 const { registerModal, unregisterModal } = useModalHistory();
@@ -75,6 +76,8 @@ const toCircularPng = (source: Blob): Promise<Blob> => new Promise((resolve, rej
 
       canvas.toBlob((blob) => {
         cleanup();
+        canvas.width = 0;
+        canvas.height = 0;
         if (blob) resolve(blob);
         else reject(new Error('生成圆形头像失败'));
       }, 'image/png', 1);
@@ -202,7 +205,7 @@ watch(() => props.img, (newImg) => {
 
 onMounted(() => {
   modalRegistered = true;
-  registerModal(MODAL_ID, handleCancel);
+  registerModal(MODAL_ID, handleCancel, () => surfaceRef.value, undefined, () => !isConfirming.value);
 });
 
 onBeforeUnmount(() => {
@@ -217,7 +220,8 @@ onBeforeUnmount(() => {
 
 <template>
   <Teleport to="#vcp-feature-overlays">
-    <div class="avatar-cropper-overlay vcp-safe-inline fixed inset-0 z-viewer flex flex-col bg-black text-white animate-in fade-in duration-300 pointer-events-auto">
+    <div ref="surfaceRef" role="dialog" aria-modal="true" aria-label="裁剪头像"
+      class="avatar-cropper-overlay vcp-viewport-surface vcp-safe-inline fixed inset-0 z-viewer flex flex-col bg-black text-white animate-in fade-in duration-300 pointer-events-auto">
       <header class="p-4 flex items-center justify-between border-b border-white/10 shrink-0 pt-[calc(var(--vcp-safe-top,24px)+10px)]">
         <button :disabled="isConfirming" @click="handleCancel" class="px-4 py-2 text-sm font-bold text-white/60 active:scale-95 transition-all disabled:opacity-30">
           取消

@@ -1,15 +1,22 @@
 pub mod ast_diff;
 pub mod aurora_pipeline;
+pub(crate) mod chat_focus;
 pub mod chat_manager;
+pub(crate) mod chat_navigation;
+pub(crate) mod chat_window;
 pub mod content_parser;
-pub mod context_metrics;
 pub mod context_assembler;
 pub mod context_injection;
+pub mod context_metrics;
 pub mod context_sanitizer;
 pub mod emoticon_manager;
+#[cfg(any(target_os = "ios", test))]
+pub(crate) mod ios_reply_task;
 pub mod message_service;
 pub mod pre_renderer;
 pub mod stream_block_parser;
 pub mod topic_service;
 pub mod topic_summary_service;
 pub mod topic_types;
+pub mod voice_service;
+pub(crate) mod voice_submission;

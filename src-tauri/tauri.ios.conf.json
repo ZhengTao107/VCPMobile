@@ -2,8 +2,13 @@
   "$schema": "https://schema.tauri.app/config/2",
   "bundle": {
     "iOS": {
+      "template": "src-tauri/gen/apple/project.yml.hbs",
       "minimumSystemVersion": "26.0",
-      "frameworks": ["Network", "UserNotifications", "CoreMotion", "CoreLocation"]
+      "frameworks": [
+        "Network", "UserNotifications", "BackgroundTasks", "CoreMotion", "CoreLocation",
+        "PhotosUI", "Photos", "ImageIO", "CoreGraphics", "AVFoundation",
+        "QuickLook", "UniformTypeIdentifiers", "CryptoKit"
+      ]
     }
   }
 }

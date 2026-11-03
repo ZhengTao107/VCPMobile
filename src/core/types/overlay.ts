@@ -1,6 +1,7 @@
 export interface OverlayActionItem {
+  id?: string;
   label: string;
-  icon?: any; // lucide-vue-next component
+  icon?: any; // @lucide/vue component
   danger?: boolean;
   disabled?: boolean;
   selected?: boolean;
@@ -17,6 +18,8 @@ export interface PromptConfig {
   title: string;
   initialValue: string;
   placeholder: string;
+  inputMode?: 'text' | 'numeric';
+  validate?: (value: string) => string | null;
   onConfirm: (val: string) => void;
 }
 

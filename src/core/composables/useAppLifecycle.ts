@@ -2,36 +2,44 @@ import { onMounted, onUnmounted, ref, watch } from 'vue';
 import { listen, type UnlistenFn } from '@tauri-apps/api/event';
 import { useAppLifecycleStore } from '../stores/appLifecycle';
 import { useChatStreamStore } from '../stores/chatStreamStore';
+import { useRagObserverStore } from '../stores/ragObserver';
 import { requestAutoSync } from '../sync/autoSyncTrigger';
 import { useRemoteChangeHint } from '../sync/remoteChangeHint';
 import { useSettingsRemote } from '../sync/settingsRemote';
 import { isIOS } from '../utils/platform';
 import type { LifecycleSnapshotDto } from '../types/lifecycle';
+import { createVoiceHistorySync } from '../../features/chat/voice/voiceHistorySync';
 
 export function useAppLifecycle() {
   const lifecycleStore = useAppLifecycleStore();
   const streamStore = useChatStreamStore();
+  const infoStore = useRagObserverStore();
+  const voiceHistory = createVoiceHistorySync();
   let unlisten: UnlistenFn | null = null;
   let unlistenNetwork: UnlistenFn | null = null;
   let recoveryPromise: Promise<void> | null = null;
   let disposed = false;
-  const documentHidden = ref(typeof document !== 'undefined' && document.hidden);
+  const documentHidden = ref(document.hidden);
+  const activeEpoch = ref<number | null>(null);
+  const visibleEpoch = ref(0);
 
   const reconcileInterruptedStreams = (source: string) => {
     if (disposed || lifecycleStore.state !== 'READY' || documentHidden.value) return;
-    const phase = lifecycleStore.lifecycleSnapshot?.phase;
-    // iOS must receive its first native snapshot before starting foreground recovery.
-    if (isIOS && !phase) return;
-    if (phase && phase !== 'active') return;
+    if (lifecycleStore.lifecycleSnapshot?.phase !== 'active') return;
     if (recoveryPromise) return recoveryPromise;
     console.log(`[useAppLifecycle] ${source}. Triggering stream recovery.`);
-    recoveryPromise = streamStore.checkAndRecoverInterruptedStreams()
-      .catch(err => {
-        console.error(`[useAppLifecycle] Failed to recover streams (${source}):`, err);
-      })
-      .finally(() => {
-        recoveryPromise = null;
-      });
+    recoveryPromise = Promise.allSettled([
+      streamStore.checkAndRecoverInterruptedStreams(),
+      voiceHistory.reconcile(),
+    ]).then(results => {
+      for (const result of results) {
+        if (result.status === 'rejected') {
+          console.error(`[useAppLifecycle] Recovery failed (${source}):`, result.reason);
+        }
+      }
+    }).finally(() => {
+      recoveryPromise = null;
+    });
     return recoveryPromise;
   };
 
@@ -51,15 +59,24 @@ export function useAppLifecycle() {
     document.documentElement.classList.toggle('vcp-paused-animations', paused);
   }, { immediate: true });
 
-  watch(() => lifecycleStore.lifecycleSnapshot?.phase, (phase, previous) => {
-    if (phase === 'active' && previous !== 'active') {
-      lifecycleStore.hydrateSystemStatus().catch((err) => {
-        console.error("[useAppLifecycle] Failed to hydrate system status:", err);
-      });
-      void Promise.resolve(reconcileInterruptedStreams('App foreground'))
-        .then(() => requestAutoSync('App foreground'));
-    }
-  });
+  // Native transitions and visibility can arrive together after JS thaws.
+  // Only delivered wake signals start a read; applying its snapshot cannot start another.
+  watch([() => lifecycleStore.lifecycleSnapshot?.phase, activeEpoch, visibleEpoch],
+    ([phase, epoch, visible], [previousPhase, previousEpoch, previousVisible]) => {
+      if (disposed || documentHidden.value) return;
+      const woke = visible !== previousVisible || (phase === 'active' && epoch !== previousEpoch
+        && lifecycleStore.lifecycleSnapshot?.transitionEpoch === epoch);
+      if (woke) {
+        void lifecycleStore.hydrateSystemStatus();
+        void infoStore.refresh();
+      }
+      // A snapshot read on visibility may be the first authoritative active phase.
+      if (woke || (phase === 'active' && phase !== previousPhase)) {
+        // fork ptp4g#4：中断流调和后触发自动同步（防抖与开关由 autoSyncTrigger 负责）。
+        void Promise.resolve(reconcileInterruptedStreams('App foreground'))
+          .then(() => requestAutoSync('App foreground'));
+      }
+    });
 
   // 电脑端数据变化提示：仅前台时长轮询；切后台中止在途请求，回前台续订。
   const isForeground = () => {
@@ -73,28 +90,19 @@ export function useAppLifecycle() {
   const disposeSettingsRemote = useSettingsRemote(isForeground);
 
   const handleVisibilityChange = () => {
-    if (typeof document !== 'undefined') {
-      documentHidden.value = document.hidden;
-      if (!documentHidden.value) void reconcileInterruptedStreams('Document visible');
-    }
-  };
-
-  const handleOnline = () => {
-    void Promise.resolve(reconcileInterruptedStreams("Device online"))
-      .then(() => requestAutoSync("Device online"));
+    documentHidden.value = document.hidden;
+    if (!documentHidden.value) visibleEpoch.value++;
   };
 
   onMounted(async () => {
-    if (typeof window !== 'undefined') {
-      document.addEventListener("visibilitychange", handleVisibilityChange);
-      window.addEventListener("online", handleOnline);
-    }
+    document.addEventListener("visibilitychange", handleVisibilityChange);
 
-    // iOS NWPath observations feed the same recovery owner as browser online.
+    // Android and iOS native callbacks are the sole network recovery signal.
     // A satisfied path is a retry hint, not proof that the configured server is reachable.
     void listen<{ connected: boolean }>('vcp-network-changed', (event) => {
       if (event.payload.connected === true) {
-        void reconcileInterruptedStreams('Native network online');
+        void Promise.resolve(reconcileInterruptedStreams('Native network online'))
+          .then(() => requestAutoSync('Native network online'));
       }
     }).then((stopListening) => {
       if (disposed) stopListening();
@@ -105,7 +113,13 @@ export function useAppLifecycle() {
 
     try {
       const stopListening = await listen<LifecycleSnapshotDto>('vcp-lifecycle-changed', (event) => {
-        if (!disposed) lifecycleStore.applyLifecycleSnapshot(event.payload);
+        if (disposed) return;
+        lifecycleStore.applyLifecycleSnapshot(event.payload);
+        const current = lifecycleStore.lifecycleSnapshot;
+        if (current?.phase === 'active' && current.transitionEpoch === event.payload.transitionEpoch
+          && event.payload.phase === 'active') {
+          activeEpoch.value = current.transitionEpoch;
+        }
       });
       if (disposed) {
         stopListening();
@@ -122,11 +136,9 @@ export function useAppLifecycle() {
   onUnmounted(() => {
     disposed = true;
     disposeRemoteHint();
+    voiceHistory.dispose();
     disposeSettingsRemote();
-    if (typeof window !== 'undefined') {
-      document.removeEventListener("visibilitychange", handleVisibilityChange);
-      window.removeEventListener("online", handleOnline);
-    }
+    document.removeEventListener("visibilitychange", handleVisibilityChange);
     if (unlisten) {
       unlisten();
     }

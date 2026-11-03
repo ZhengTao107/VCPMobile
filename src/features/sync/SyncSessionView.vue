@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed, ref, watch, nextTick } from 'vue';
-import { X, Play, RotateCcw, Copy, Check, ChevronDown, Square } from 'lucide-vue-next';
+import { X, Play, RotateCcw, Copy, Check, ChevronDown, Square } from '@lucide/vue';
 import SlidePage from '../../components/ui/SlidePage.vue';
 import SyncLogBrowserCore from '../../features/settings/components/SyncLogBrowserCore.vue';
 import { useSyncSessionStore } from '../../core/stores/syncSession';
@@ -35,6 +35,18 @@ const progressPercent = computed(() => {
   if (store.status === 'completed' || store.status === 'completed_with_warnings') return 100;
   if (store.progressData.total <= 0) return 0;
   return Math.min(100, Math.round((store.progressData.completed / store.progressData.total) * 100));
+});
+
+const averageTransferSpeed = computed(() => {
+  const transfer = store.transfer;
+  if (!transfer || transfer.activeDurationMs <= 0) return '—';
+  const bytes = transfer.uploadedBytes + transfer.downloadedBytes;
+  if (bytes <= 0) return '—';
+  const bytesPerSecond = bytes / (transfer.activeDurationMs / 1000);
+  if (!Number.isFinite(bytesPerSecond)) return '—';
+  if (bytesPerSecond >= 1_000_000) return `${(bytesPerSecond / 1_000_000).toFixed(2)} MB/s`;
+  if (bytesPerSecond >= 1_000) return `${(bytesPerSecond / 1_000).toFixed(2)} KB/s`;
+  return `${Math.round(bytesPerSecond)} B/s`;
 });
 
 const phaseLabel = computed(() => {
@@ -192,7 +204,7 @@ const copyBuildCommand = async () => {
 };
 
 const prerenderEnabled = computed(() =>
-  settingsStore.settings?.syncPrerenderEnabled ?? false
+  settingsStore.settings?.sync.prerenderEnabled ?? false
 );
 
 const handlePrerenderToggle = async (val: boolean) => {
@@ -203,13 +215,17 @@ const handlePrerenderToggle = async (val: boolean) => {
     });
     if (!ok) return;
   }
-  settingsStore.updateSettings({ syncPrerenderEnabled: val });
+  try {
+    await settingsStore.updateFields({ 'sync.prerenderEnabled': val });
+  } catch {
+    notificationStore.addNotification({ type: 'error', title: '预渲染设置未保存', message: '配置已变化或保存失败，请重试。', toastOnly: true });
+  }
 };
 </script>
 
 <template>
   <SlidePage :is-open="store.isOpen" :z-index="props.zIndex">
-    <div class="vcp-safe-inline fixed inset-0 flex flex-col bg-[#0a0f14] text-white overflow-hidden"
+    <div class="vcp-viewport-surface vcp-safe-inline fixed inset-0 flex flex-col bg-[#0a0f14] text-white overflow-hidden"
          :class="{ 'pointer-events-none': !store.isOpen }">
 
       <!-- 顶部栏 -->
@@ -340,20 +356,26 @@ const handlePrerenderToggle = async (val: boolean) => {
                   :style="{ width: progressPercent + '%' }"
                 ></div>
               </div>
-              <div class="flex justify-between text-[10px] mt-1 opacity-50">
-                <span>{{ phaseLabel }}</span>
-                <span v-if="store.progressData.total > 0">
-                  {{ store.progressData.completed }}/{{ store.progressData.total }} · {{ progressPercent }}%
-                </span>
-              </div>
-
-              <div
-                v-if="store.desktopInfo"
-                class="mt-2 flex items-center gap-2 font-mono text-[9px] text-white/35"
-              >
-                <span>桌面后端 {{ store.desktopInfo.backendMode === 'cds' ? 'CDS' : 'Legacy' }}</span>
-                <span>·</span>
-                <span>同步插件 v{{ store.desktopInfo.packageVersion }}</span>
+              <div class="mt-1 flex items-start gap-3">
+                <div class="min-w-0 flex-1">
+                  <div class="flex flex-wrap justify-between gap-x-2 gap-y-0.5 text-[10px] text-white/50">
+                    <span>{{ phaseLabel }}</span>
+                    <span v-if="store.progressData.total > 0" class="font-mono">
+                      {{ store.progressData.completed }}/{{ store.progressData.total }} · {{ progressPercent }}%
+                    </span>
+                  </div>
+                  <div
+                    v-if="store.desktopInfo"
+                    class="mt-2 flex flex-wrap items-baseline gap-x-2 gap-y-0.5 font-mono text-[9px] text-white/35"
+                  >
+                    <span>桌面后端 {{ store.desktopInfo.backendMode === 'cds' ? 'CDS' : 'Legacy' }}</span>
+                    <span class="min-w-0 break-words">· 同步插件 v{{ store.desktopInfo.packageVersion }}</span>
+                  </div>
+                </div>
+                <div class="w-28 shrink-0 text-right" role="group" aria-label="平均同步速度">
+                  <div class="text-[10px] text-white/40">平均同步速度</div>
+                  <div class="mt-1 font-mono text-xs tabular-nums text-white/75">{{ averageTransferSpeed }}</div>
+                </div>
               </div>
 
               <!-- 统计条：messages 阶段起随进度事件实时跳动；终态即使全零也展示 -->

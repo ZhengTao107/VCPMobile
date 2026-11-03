@@ -5,6 +5,19 @@ plugins {
     id("org.jetbrains.kotlin.android")
 }
 
+// Unpack the small custom AAR into this library's own inputs. AGP does not allow
+// a direct local AAR dependency when packaging a library AAR.
+val sileroRuntimeDirectory = layout.buildDirectory.dir("generated/silero-runtime")
+val prepareSileroRuntime by tasks.registering(Sync::class) {
+    from(zipTree(file("../../../runtime-assets/voice/android/onnxruntime-silero-1.24.2.aar"))) {
+        include("classes.jar", "jni/arm64-v8a/*.so")
+    }
+    into(sileroRuntimeDirectory)
+}
+val sileroRuntimeClasses = files(sileroRuntimeDirectory.map { it.file("classes.jar") })
+    .builtBy(prepareSileroRuntime)
+tasks.named("preBuild").configure { dependsOn(prepareSileroRuntime) }
+
 android {
     namespace = "com.vcp.mobile"
     compileSdk = 36
@@ -12,6 +25,8 @@ android {
 
     defaultConfig {
         minSdk = 26
+        // JNI calls into Java by class/member name, including result/value constructors.
+        consumerProguardFiles("../../../runtime-assets/voice/android/silero-consumer-rules.pro")
         ndk {
             abiFilters += "arm64-v8a"
         }
@@ -36,7 +51,9 @@ android {
     sourceSets {
         getByName("main") {
             jniLibs.srcDirs("src/main/jniLibs")
+            jniLibs.srcDir(sileroRuntimeDirectory.map { it.dir("jni") })
             assets.srcDirs("../../../runtime-assets/vcp-cli/android-assets")
+            assets.srcDirs("../../../runtime-assets/voice/assets")
         }
     }
 
@@ -58,15 +75,22 @@ kotlin {
 }
 
 dependencies {
+    // CPU-only ORT built for Silero's exact operators/types. No Maven full-runtime fallback.
+    implementation(sileroRuntimeClasses)
     implementation(project(":tauri-android"))
+    // Photo Picker contracts; aligned with the host app's Activity dependency.
+    implementation("androidx.activity:activity:1.10.1")
     implementation("androidx.appcompat:appcompat:1.6.1")
     implementation("androidx.core:core-ktx:1.12.0")
     implementation("androidx.lifecycle:lifecycle-common:2.7.0")
     implementation("androidx.lifecycle:lifecycle-process:2.7.0")
     implementation("com.github.topjohnwu.libsu:core:5.0.3")
-    implementation("androidx.media3:media3-transformer:1.3.1")
-    implementation("androidx.media3:media3-effect:1.3.1")
-    implementation("androidx.media3:media3-common:1.3.1")
+    // Attachment audio uses this version's Transformer + PCM/mixing/Sonic processors.
+    // Keep the modules aligned; video thumbnails still use MediaMetadataRetriever.
+    val media3Version = "1.3.1"
+    implementation("androidx.media3:media3-transformer:$media3Version")
+    implementation("androidx.media3:media3-effect:$media3Version")
+    implementation("androidx.media3:media3-common:$media3Version")
     
     // 原生轻量级推送监听器所需的 SSE 长连接支持
     implementation("com.squareup.okhttp3:okhttp:4.12.0")

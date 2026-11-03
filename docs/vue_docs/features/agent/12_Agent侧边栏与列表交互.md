@@ -39,7 +39,7 @@ date: 2026-08-13
 | `src/features/agent/SidebarTabs.vue` | 28 | 标签切换器：Agent/Topic 两态切换按钮组 |
 | `src/features/agent/SidebarSearch.vue` | 29 | 搜索输入框：v-model 双向绑定、动态占位符 |
 | `src/features/agent/AgentsCreator.vue` | 107 | 底部创建区：Agent / Group 新建按钮与 Prompt 弹窗流程 |
-| `src/core/composables/useSidebarSwipe.ts` | 73 | 全局滑动手势：侧边栏从屏幕边缘滑出/滑入的触控识别 |
+| `src/core/composables/useSidebarSwipe.ts` | — | 全局松手打开侧栏、抽屉内跟手关闭与 Tab 手势 |
 
 ### 1.3 在整体架构中的位置
 
@@ -85,7 +85,7 @@ date: 2026-08-13
 | **单层状态源** | `layoutStore.leftDrawerOpen` 是侧边栏可见性的唯一真相源，任何组件（包括手势、遮罩点击、物理返回键）均通过 `setLeftDrawer(bool)` 修改，禁止直接赋值 |
 | **触控优先** | 全部手势为 Android 触控设计：Swipe 展开编辑、拖拽排序柄（`.drag-handle`）、边缘滑动打开/关闭；大宽度 Android 窗口可把侧栏常驻，但不建立桌面端交互支持 |
 | **本地过滤** | 搜索过滤纯前端进行，不调用后端 Command，保证 0 网络延迟；过滤字段仅限 `name`，保证性能 |
-| **乐观更新** | 拖拽排序后先更新本地 `settingsStore.settings.agentOrder`，再异步持久化到后端；若后端失败，下次启动时自动回读到旧顺序 |
+| **乐观更新** | `agentOrderStore` 立即显示最后一次拖拽顺序，300ms 防抖后串行保存；失败保留本地顺序并提示再次拖动重试，不改写配置中心的已提交快照 |
 | **手势仲裁** | Swipe 与垂直滚动、侧边栏关闭、排序拖拽共享同一触控面，通过方向锁定（`hasDeterminedDirection`）+ 排序状态互斥 + `stopPropagation` 分层解决冲突 |
 
 ---
@@ -148,40 +148,46 @@ date: 2026-08-13
 
 ### 2.3 打开/关闭动画
 
-侧边栏使用纯 CSS `transform` 实现硬件加速动画：
+侧边栏的展开、收起与回弹使用 CSS `transform`，跟手过程由手势直接更新位移：
 
 ```css
 .vcp-drawer {
-  transition: transform 0.4s cubic-bezier(0.16, 1, 0.3, 1);
+  transition:
+    transform var(--vcp-drawer-close-duration) var(--vcp-drawer-close-easing),
+    visibility 0s linear var(--vcp-drawer-close-duration);
+  will-change: transform;
   z-index: var(--layer-drawer);   /* 20 */
 }
 
 .vcp-drawer-left {
-  transform: translateX(-100%);
+  transform: translate3d(-100%, 0, 0);
 }
 
 .vcp-drawer-left.is-open {
-  transform: translateX(0);
+  transform: translate3d(0, 0, 0);
+  transition:
+    transform var(--vcp-drawer-open-duration) var(--vcp-drawer-open-easing),
+    visibility 0s;
 }
 ```
 
-> 源码位置：`src/components/layout/AgentSidebar.vue` 第 109–129 行
+> 源码位置：`src/components/layout/AgentSidebar.vue`；共享时序定义于 `src/assets/themes.css`
 
 动画参数：
-- **时长**：400ms
-- **缓动**：`cubic-bezier(0.16, 1, 0.3, 1)` — 带轻微过冲的减速曲线，使滑入更具物理感
-- **属性**：仅 `transform`（GPU 合成层，避免重排）
-- **边缘阴影**：静态渐变层常驻，仅动画 `opacity`；关闭时在 280ms 内淡出，早于 `visibility` 隐藏
+- **展开**：280ms，`cubic-bezier(0.16, 1, 0.3, 1)` 减速停驻
+- **收起**：220ms，`cubic-bezier(0.4, 0, 1, 1)` 加速离场；减少动态效果偏好下两种时长均为 0ms
+- **属性与范围**：外层只改变 `transform`，内部 surface 使用 `contain: layout paint`；`will-change: transform` 限于覆盖式抽屉。实际合成与帧率需设备证据
+- **边缘阴影与遮罩**：静态渐变阴影和 `App.vue` 常驻遮罩仅动画 `opacity`，共享展开/收起时序；遮罩在收起结束后才隐藏，期间继续拦截点击
 - **层级**：语义化 `z-drawer`（`var(--layer-drawer)` = 20），位于 `content`（0）之上、`overlay`（30）之下
 
 **大宽度 Android 窗口常驻**（`@media (min-width: 1024px)`）：
 - 左侧栏改为 `position: relative` 与固定 280px pane，不再覆盖主内容；
-- `visibility/pointer-events` 保持可用，`transform` 归零并禁用过渡；
+- `visibility/pointer-events` 保持可用，`transform` 设为 `none` 并禁用过渡；`will-change` 还原为 `auto`，surface containment 还原为 `none`；
 - 层级从 drawer（20）回到 local（10）；
 - 1024px 是当前由主区可读宽度与侧栏宽度推导的 CSS viewport 阈值，不叫“桌面断点”。分屏或折叠后低于阈值时自动回到 overlay drawer；
 - 右侧栏使用独立的 1280px 常驻阈值，因此 1024–1279px 是左栏常驻、右栏仍为抽屉的 single-pane 模式。
 
-### 2.4 手势滑动打开（useSidebarSwipe）
+### 2.4 打开、跟手关闭与 Tab 手势（useSidebarSwipe）
 
 `AgentSidebar.vue` 内部通过 `useSidebarSwipe` 监听侧边栏容器上的**左滑关闭**与**右滑切 Tab** 手势：
 
@@ -198,18 +204,20 @@ useSidebarSwipe(sidebarRef, {
 
 > 源码位置：`src/components/layout/AgentSidebar.vue` 第 21–31 行
 
-`useSidebarSwipe` 同时被 `App.vue` 以 `type: 'global'` 调用，实现**从屏幕左边缘向右滑动打开侧边栏**的全局能力。两种实例共存，通过 `layoutStore.leftDrawerOpen` 状态互斥避免重复响应。
+`useSidebarSwipe` 同时被 `App.vue` 以 `type: 'global'` 调用，在允许手势的主区右滑松手后打开左栏、左滑松手后打开右栏；当前实现不限定触摸必须从屏幕边缘开始。global 排除抽屉与遮罩，局部实例沿 touch 冒泡尊重 Agent 行自己的滑动与排序。
 
 `useSidebarSwipe` 核心参数（`src/core/composables/useSidebarSwipe.ts`）：
 
 | 参数 | 全局模式 (`global`) | 侧边栏内模式 (`left`) |
 |------|---------------------|----------------------|
-| `threshold` | 30 | 15 |
-| 触发位移 | `absX > 60` | `absX > 50` |
-| 方向判定 | `absY / absX < 0.577`（30°以内） | 同上 |
-| 左边缘过滤 | 避开 `.vcp-scrollable` | 无需过滤 |
+| 起始阈值 | 30px | 10px 方向锁 |
+| 触发位移 | `absX > 60`，松手后打开 | 关闭位移达到宽度 25%，或关闭方向位移至少 20px 且最近速度 `>=0.5px/ms`；右滑切 Tab 仍需 `>50px` |
+| 方向判定 | `absY / absX < 0.577`（30°以内） | 同上；纵向锁定后本轮不再接管 |
+| 滚动区过滤 | 避开 `.vcp-scrollable` 及横向滚动/输入区域 | 放行纵向列表内的横向关闭，排除横向滚动/输入区域与 `.no-swipe` |
 | 左滑行为 | 打开右侧边栏 | 关闭左侧边栏 |
 | 右滑行为 | 打开左侧边栏 | 执行 `onTabSwitch` |
+
+局部关闭手势通过 `requestAnimationFrame` 直接写入抽屉 `translate3d` 与遮罩透明度，释放前不修改 Store 开关。甩手速度使用最近轨迹，末次移动后停顿超过 100ms 不再触发甩手关闭。释放后清理临时样式，由 CSS 完成关闭或回弹；已接管拖动会抑制其后的点击。取消、多指、通话、外部开关、resize 和卸载均清理本次跟踪。右栏采用对称的右滑关闭逻辑，但通知卡自身的右滑删除优先消费 touch 事件。
 
 ---
 
@@ -353,35 +361,12 @@ const filteredCombinedItems = computed(() => {
 | Store | 使用的状态 | 用途 |
 |-------|-----------|------|
 | `assistantStore` | `agents`, `groups`, `combinedItems`, `unreadCounts`, `loading` | 原始数据与加载态 |
-| `settingsStore` | `settings.agentOrder`, `settings.groupOrder` | 自定义排序序列 |
+| `agentOrderStore` | `orderedAgents`, `orderedGroups` | 合并待保存顺序与已提交的 `navigation.agentOrder/groupOrder` |
 | `sessionStore` | `currentSelectedItem` | 当前选中高亮 |
 
-列表并非直接使用 `assistantStore.agents`，而是通过 `computed` 进行**订单化重排**：
+`AgentList.vue` 消费 `agentOrderStore` 的两个有序列表。Store 优先使用待保存顺序，没有草稿时使用配置中心已提交的 `navigation` 顺序，再调用 `agentOrder.ts` 的 `sortByOrder` 投影实体列表。
 
-```ts
-const orderedAgents = computed(() => {
-  const agents = assistantStore.agents;
-  const order = settingsStore.settings?.agentOrder || [];
-  if (order.length === 0) return agents;
-
-  const sorted = [...agents].sort((a, b) => {
-    const indexA = order.indexOf(a.id);
-    const indexB = order.indexOf(b.id);
-    if (indexA === -1 && indexB === -1) return 0;
-    if (indexA === -1) return 1;   // 未排序项置后
-    if (indexB === -1) return -1;
-    return indexA - indexB;
-  });
-  return sorted;
-});
-```
-
-> 源码位置：`src/features/agent/AgentList.vue` 第 46–60 行
-
-`orderedGroups` 使用相同算法（第 30–44 行）。排序逻辑特点：
-- `order` 数组存储的是 ID 序列，而非完整对象 — 紧凑、可序列化
-- 新 Agent（ID 不在 `order` 中）默认排在末尾（`return 1`）
-- 排序是**纯函数**，不修改 `assistantStore.agents` 原数组
+排序先建立 ID → 排名 Map，比较器不反复执行 `indexOf`；重复 ID 保留第一次出现的排名。未列入顺序的实体稳定排在末尾，空顺序直接返回原列表，非空顺序只排序副本。实体删除会从待保存顺序移除，新实体按当前清单顺序补入；仅名称等元数据刷新不重启保存计时器。
 
 ### 5.2 单条 Agent 卡片结构
 
@@ -518,69 +503,15 @@ onUnmounted(() => agentSortable?.destroy());
 
 ### 6.2 排序变更的本地更新
 
-`onEnd` 回调在拖拽释放时触发，计算新顺序并立即更新 Store：
+`onEnd` 校验当前列表和被拖实体，从 Sortable 已排列的 DOM 读取最终 ID 顺序；再把手动移动的节点恢复到 Vue 上次已知位置，交给 `orderStore.setOrder(ownerType, newOrder)` 驱动响应式更新，避免 Vue keyed diff 重复移动。
 
-```ts
-onEnd: (evt) => {
-  isSorting.value = false;
-  const newOrder = orderedAgents.value.map((a) => a.id);
-  const [movedItem] = newOrder.splice(evt.oldIndex!, 1);
-  newOrder.splice(evt.newIndex!, 0, movedItem);
-  settingsStore.updateSettings({ agentOrder: newOrder });
-}
-```
-
-> 源码位置：`src/features/agent/AgentList.vue` 第 127–133 行（Agent 列表）；第 94–100 行（Group 列表）
-
-更新流程：
-
-```
-用户释放拖拽
-    │
-    ▼
-┌─────────────────────┐
-│ 读取当前 orderedXxx │──> computed 自动反映旧顺序
-│ 的 ID 序列          │
-└──────────┬──────────┘
-           ▼
-┌─────────────────────┐
-│ 用 splice 调整顺序  │──> oldIndex 移除，newIndex 插入
-│ (纯数组操作)         │
-└──────────┬──────────┘
-           ▼
-┌─────────────────────┐
-│ settingsStore.      │──> 乐观更新：本地 settings.agentOrder
-│ updateSettings({    │    立即变更，列表响应式重排
-│   agentOrder: ...   │
-│ })                  │
-└──────────┬──────────┘
-           ▼
-┌─────────────────────┐
-│ 异步持久化到后端     │──> update_settings Command
-│ (updateSettings 内部)│    失败时不回滚（下次启动回读）
-└─────────────────────┘
-```
+`agentOrderStore` 立即展示该顺序，每次新拖拽重置 300ms 防抖。每种实体只保留一份最新草稿，切换侧栏页签或列表重挂载不丢失待保存顺序；不堆积中间拖拽结果。
 
 ### 6.3 排序持久化到后端
 
-`settingsStore.updateSettings` 将 `agentOrder` / `groupOrder` 持久化到 Rust 后端：
+同一种列表的保存串行执行：前一次保存返回后，才通过 `settingsStore.updateFields` 为最新草稿构造请求，使用当前已确认的领域 revision 与字段基线。持久字段为 `navigation.agentOrder` 和 `navigation.groupOrder`，由配置中心 `update_settings` 的字段补丁写入 SQLite。
 
-```ts
-const updateSettings = async (updates: Record<string, any>) => {
-  // 合并到本地 settings 对象
-  Object.assign(settings.value, updates);
-  // 异步保存到后端
-  await saveSettings();
-};
-```
-
-> 源码位置：`src/core/stores/settings.ts` 第 70–85 行
-
-Rust 后端对应的字段：
-- `agentOrder: string[]` — Agent ID 数组
-- `groupOrder: string[]` — Group ID 数组
-
-持久化策略为**全量覆盖**（`saveSettings` 将整个 settings 对象序列化后写入 SQLite），而非增量 patch。由于 settings 对象体积很小，全量覆盖的开销可忽略。
+保存成功且没有后续拖拽时清除草稿，显示已提交快照；保存期间的新草稿继续保留，防抖到期后再提交。失败显示“排序未保存”，保留本地展示顺序，用户再次拖动可重试；不把失败草稿写进 `settingsStore.settings`。
 
 ---
 
@@ -815,7 +746,7 @@ Rust 后端 `create_agent` 的处理（详见 `docs/modules/13_Agent领域总览
 ### 9.1 打开侧边栏的时序
 
 ```
-用户从屏幕左边缘向右滑动 (>60px)
+用户在允许全局手势的主区向右滑动 (>60px) 后松手
     │
     ▼
 useSidebarSwipe (type: 'global')
@@ -833,10 +764,10 @@ layoutStore.setLeftDrawer(true)
 AgentSidebar.vue :class="{ 'is-open': true }"
     │
     ▼
-CSS transform: translateX(-100%) → translateX(0)
+CSS transform: translate3d(-100%, 0, 0) → translate3d(0, 0, 0)
     │
     ▼
-侧边栏完全展开 (400ms)
+侧边栏完成展开 (280ms；减少动态效果时为 0ms)
 ```
 
 ### 9.2 切换 Agent 的时序
@@ -906,17 +837,17 @@ SortableJS onEnd
     │
     ├──► isSorting = false
     │
-    ├──► 计算 newOrder（splice 调整）
+    ├──► 读取 DOM 最终 ID 顺序，恢复 Vue 原 DOM 顺序
     │
-    └──► settingsStore.updateSettings({ agentOrder: newOrder })
+    └──► agentOrderStore.setOrder(ownerType, newOrder)
             │
-            ├──► Object.assign(settings, { agentOrder })
+            ├──► 替换本地最新顺序草稿
             │       │
             │       └──► orderedAgents computed 自动重排
             │
-            └──► 异步 saveSettings() → Rust update_settings
+            └──► 300ms 防抖 + 同列表串行 → settingsStore.updateFields
                         │
-                        └──► SQLite settings 表全量写入
+                        └──► Rust update_settings → SQLite navigation 领域补丁
 ```
 
 ---
@@ -939,7 +870,7 @@ SortableJS onEnd
 | `get_avatar` | `VcpAvatar.vue` 内部 | `{ ownerType, ownerId }` | `AvatarResult \| null` | 头像组件挂载时加载头像 |
 | `get_unread_counts` | `assistantStore.refreshUnreadCounts()` | — | `Record<string, number>` | fetchAgents / fetchGroups 后批量刷新未读 |
 | `get_topics` | `sessionStore.selectItem()` | `{ ownerId, ownerType }` | `Topic[]` | 切换 Agent/Group 时获取话题列表 |
-| `update_settings` | `settingsStore.saveSettings()` (内部) | `Settings` 对象 | `boolean` | 拖拽排序后持久化顺序、任何设置变更 |
+| `update_settings` | `agentOrderStore` → `settingsStore.updateFields()` | `{ request: ConfigUpdate }` | `ConfigSaveResult` | 防抖后保存最终排序字段，保留 revision 与字段冲突检查 |
 
 ### 10.2 事件监听表
 
@@ -1007,8 +938,8 @@ SortableJS onEnd
 | MAX_SWIPE | — | Swipe 完全展开时的最大位移，80px | `AgentList.vue` |
 | SortableJS | — | 第三方拖拽排序库，用于 Agent/Group 列表的拖拽重排 | `sortablejs` (npm) |
 | drag-handle | — | SortableJS 的拖拽柄 CSS 类，本模块中整个卡片均可作为柄 | `AgentList.vue` |
-| useSidebarSwipe | — | 全局组合式函数，统一处理侧边栏边缘滑动手势 | `useSidebarSwipe.ts` |
-| global / left 模式 | — | `useSidebarSwipe` 的两种工作模式：`global` 从屏幕边缘打开侧边栏；`left` 在侧边栏内滑动关闭或切 Tab | `useSidebarSwipe.ts` |
+| useSidebarSwipe | — | 组合式函数，协调全局打开与抽屉局部跟手关闭 | `useSidebarSwipe.ts` |
+| global / left / right 模式 | — | `global` 在主区松手打开侧栏；`left` 跟手关闭或切 Tab；`right` 跟手关闭 | `useSidebarSwipe.ts` |
 | glass-panel | — | UnoCSS 快捷类，玻璃拟态面板样式（半透明背景 +  backdrop-blur） | `uno.config.ts` |
 | glass-panel-active | — | 选中态的玻璃面板变体，通常表现为边框色或背景提亮 | `src/assets/themes.css` |
 | Modal History | — | `useModalHistory` 提供的模态栈管理，使系统返回键可按层级关闭覆盖层 | `useModalHistory.ts` |

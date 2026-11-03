@@ -16,6 +16,7 @@ import { useOverlayStore } from '../../../core/stores/overlay';
 import { useNotificationStore } from '../../../core/stores/notification';
 import { allGuides, getGuide } from '../registry';
 import type { GuideDefinition } from '../types';
+import { parseLocalPreferenceObject } from '../../../core/preferences/localPreference';
 
 export const DEFAULT_SETTLE_MS = 600;
 export const QUEUE_RESUME_DELAY_MS = 250;
@@ -86,7 +87,7 @@ export const useGuideStore = defineStore('guide', () => {
     activeStepIndex.value = 0;
     // 返回键在指引激活期间完全禁止：close 返回 false 时 useModalHistory
     // 自动补回 history entry（唯一退出出口是末步「我知道了」）。
-    registerModal(`Guide:${id}`, () => false);
+    registerModal(`Guide:${id}`, () => false, undefined, undefined, () => false);
   };
 
   /**
@@ -141,7 +142,7 @@ export const useGuideStore = defineStore('guide', () => {
     const def = getGuide(id);
     if (!def) return;
     const overlayStore = useOverlayStore();
-    if (overlayStore.isSettingsOpen) overlayStore.closeSettings();
+    if (!def.prepare && overlayStore.isSettingsOpen) overlayStore.closeSettings();
     try {
       def.prepare?.();
     } catch (e) {
@@ -281,5 +282,17 @@ export const useGuideStore = defineStore('guide', () => {
 }, {
   persist: {
     pick: ['completed', 'lastSeenAppVersion'],
+    serializer: {
+      serialize: JSON.stringify,
+      deserialize(raw) {
+        const value = parseLocalPreferenceObject(raw);
+        return {
+          completed: Array.isArray(value.completed) && value.completed.every(id => typeof id === 'string')
+            ? value.completed : [],
+          lastSeenAppVersion: typeof value.lastSeenAppVersion === 'string' ? value.lastSeenAppVersion : null,
+        };
+      },
+    },
+    afterHydrate: ({ store }) => store.$persist(),
   },
 });

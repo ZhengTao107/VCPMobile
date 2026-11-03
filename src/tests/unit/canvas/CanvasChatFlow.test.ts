@@ -1,6 +1,7 @@
 import { describe, expect, it, vi, beforeEach } from "vitest";
 import { flushPromises } from "@vue/test-utils";
 import { mockInvoke, clearInvokeMocks } from "@/tests/mocks/tauri";
+import { mockChatNavigation } from "@/tests/helpers/chatNavigation";
 import { mountWithPinia } from "@/tests/utils/mount";
 
 vi.mock("@/features/chat/ChatView.vue", async () => {
@@ -64,6 +65,7 @@ const button = (wrapper: ReturnType<typeof mountWithPinia>, text: string) =>
 describe("Canvas 文稿预览", () => {
   beforeEach(() => {
     clearInvokeMocks();
+    mockChatNavigation();
     mockCanvasBackend();
   });
 
@@ -77,6 +79,7 @@ describe("Canvas 文稿预览", () => {
 describe("Canvas [对话] 流程", () => {
   beforeEach(() => {
     clearInvokeMocks();
+    mockChatNavigation();
     mockCanvasBackend();
   });
 
@@ -107,6 +110,8 @@ describe("Canvas [对话] 流程", () => {
 
   it("绑定的 owner 不在手机上：显示原因与重试，补齐后重试成功", async () => {
     clearInvokeMocks();
+    let ghostKnown = false;
+    mockChatNavigation({ reject: (target) => !ghostKnown && JSON.stringify(target ?? null).includes("ghost") });
     mockCanvasBackend({ "aahs.txt": { agentId: "ghost", topicId: "tg", itemType: "agents" } });
     const { wrapper, session, assistants } = await mountCanvas();
     await tab(wrapper, "对话").trigger("click");
@@ -117,6 +122,7 @@ describe("Canvas [对话] 流程", () => {
     expect(wrapper.find('[data-test="chat-view"]').exists()).toBe(false);
 
     assistants.agents = [agent("a0"), agent("a1"), agent("ghost")];
+    ghostKnown = true;
     await button(wrapper, "重试").trigger("click");
     await flushPromises();
     expect(wrapper.find('[role="alert"]').exists()).toBe(false);

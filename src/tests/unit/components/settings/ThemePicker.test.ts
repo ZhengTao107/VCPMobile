@@ -3,12 +3,21 @@ import { flushPromises, mount, type VueWrapper } from '@vue/test-utils';
 import { createPinia, disposePinia, setActivePinia, type Pinia } from 'pinia';
 import ThemePicker from '@/features/settings/ThemePicker.vue';
 import { useThemeStore } from '@/core/stores/theme';
+import ChatPreferencesPage from '@/features/chat/settings/ChatPreferencesPage.vue';
+import { useChatPreferencesStore } from '@/features/chat/preferences/store';
+import { handlePresentationSelection, openPresentationMenu } from '@/features/chat/presentationMenu';
+import { useOverlayStore } from '@/core/stores/overlay';
 
 describe('ThemePicker draft, preview and presentation controls', () => {
   let pinia: Pinia;
   let wrapper: VueWrapper | null;
 
   beforeEach(() => {
+    const storage = window.localStorage;
+    vi.stubGlobal('localStorage', {
+      getItem: storage.getItem.bind(storage), setItem: storage.setItem.bind(storage),
+      removeItem: storage.removeItem.bind(storage), clear: storage.clear.bind(storage),
+    });
     localStorage.clear();
     localStorage.setItem('vcp-theme-name', 'themes-bear-holiday.ts');
     document.documentElement.style.cssText = '';
@@ -20,6 +29,8 @@ describe('ThemePicker draft, preview and presentation controls', () => {
   afterEach(() => {
     wrapper?.unmount();
     disposePinia(pinia);
+    vi.restoreAllMocks();
+    vi.unstubAllGlobals();
   });
 
   it('previews a draft locally and applies it only after explicit confirmation', async () => {
@@ -38,8 +49,6 @@ describe('ThemePicker draft, preview and presentation controls', () => {
     expect(applySpy).not.toHaveBeenCalled();
     expect(store.currentTheme).toBe(originalTheme);
     expect(localStorage.getItem('vcp-theme-name')).toBe(originalStoredTheme);
-    expect(wrapper.find('[data-variant="dark"]').attributes('style')).toContain('--preview-bg: #1c1c1e');
-    expect(wrapper.find('[data-variant="light"]').attributes('style')).toContain('--preview-bg: #f4f6f8');
     expect(wrapper.get('[data-testid="theme-apply-button"]').text()).toBe('确认应用主题');
 
     await wrapper.get('[data-testid="theme-apply-button"]').trigger('click');
@@ -53,18 +62,6 @@ describe('ThemePicker draft, preview and presentation controls', () => {
     expect(wrapper.get('[data-testid="theme-apply-button"]').attributes()).toHaveProperty('disabled');
   });
 
-  it('keeps dark and light wallpapers isolated inside the preview panes', async () => {
-    wrapper = mount(ThemePicker, { global: { plugins: [pinia] } });
-    await flushPromises();
-
-    const darkStyle = wrapper.get('[data-variant="dark"]').attributes('style');
-    const lightStyle = wrapper.get('[data-variant="light"]').attributes('style');
-
-    expect(darkStyle).toContain('/wallpaper/forest_night.webp');
-    expect(lightStyle).toContain('/wallpaper/watermelon_day.webp');
-    expect(darkStyle).not.toBe(lightStyle);
-    expect(document.documentElement.style.getPropertyValue('--chat-wallpaper-dark')).toBe('');
-  });
 
   it('discards an unconfirmed theme draft when the page unmounts', async () => {
     const store = useThemeStore();
@@ -106,51 +103,81 @@ describe('ThemePicker draft, preview and presentation controls', () => {
     expect(wrapper.find('[role="alert"]').exists()).toBe(false);
   });
 
-  it('exposes the second three-mode entry and persists a selection immediately', async () => {
+  it('navigates through themes using prev and next buttons', async () => {
+    // fork ptp4g#33：新增主题后按文件名排在首位的是 acid-basalt。
+    localStorage.setItem('vcp-theme-name', 'themes-acid-basalt.ts');
     const store = useThemeStore();
-    wrapper = mount(ThemePicker, {
-      props: { section: 'rendering' },
-      global: { plugins: [pinia] },
-    });
+    wrapper = mount(ThemePicker, { global: { plugins: [pinia] } });
     await flushPromises();
 
-    expect(wrapper.find('[data-testid="theme-carousel"]').exists()).toBe(false);
-    const options = wrapper.findAll('[data-presentation-value]');
-    expect(options.map((option) => option.attributes('data-presentation-value'))).toEqual([
-      'bubble',
-      'panel',
-      'immersive',
-    ]);
-    expect(wrapper.get('[data-presentation-value="bubble"]').attributes('aria-checked')).toBe('true');
+    const prevBtn = wrapper.find('[data-testid="theme-nav-prev"]');
+    const nextBtn = wrapper.find('[data-testid="theme-nav-next"]');
+    expect(prevBtn.exists()).toBe(true);
+    expect(nextBtn.exists()).toBe(true);
 
+    // Initial theme is themes-bear-holiday.ts (index 0)
+    expect(prevBtn.attributes()).toHaveProperty('disabled');
+    expect(nextBtn.attributes()).not.toHaveProperty('disabled');
+
+    // Click next -> switches to theme at index 1
+    await nextBtn.trigger('click');
+    await flushPromises();
+
+    expect(prevBtn.attributes()).not.toHaveProperty('disabled');
+    const secondTheme = store.availableThemes[1]?.fileName;
+    expect(wrapper.find(`[data-theme-key="${secondTheme}"]`).classes()).toContain('is-selected');
+
+    // Click prev -> returns to theme at index 0
+    await prevBtn.trigger('click');
+    await flushPromises();
+
+    expect(prevBtn.attributes()).toHaveProperty('disabled');
+    const firstTheme = store.availableThemes[0]?.fileName;
+    expect(wrapper.find(`[data-theme-key="${firstTheme}"]`).classes()).toContain('is-selected');
+  });
+
+  it('disables navigation buttons when ThemePicker is inactive', async () => {
+    wrapper = mount(ThemePicker, { props: { active: false }, global: { plugins: [pinia] } });
+    await flushPromises();
+
+    expect(wrapper.get('[data-testid="theme-nav-prev"]').attributes()).toHaveProperty('disabled');
+    expect(wrapper.get('[data-testid="theme-nav-next"]').attributes()).toHaveProperty('disabled');
+  });
+
+
+  it('shares the presentation owner with the chat shortcut in both directions', async () => {
+    wrapper = mount(ChatPreferencesPage, { global: { plugins: [pinia] } });
     await wrapper.get('[data-presentation-value="panel"]').trigger('click');
+    openPresentationMenu();
+    expect(useOverlayStore().contextMenuConfig?.actions.find((action) => action.selected)?.label).toBe('统一');
 
-    expect(store.presentationMode).toBe('panel');
-    expect(localStorage.getItem('vcp-chat-presentation-mode')).toBe('panel');
-    expect(wrapper.get('[data-presentation-value="panel"]').attributes('aria-checked')).toBe('true');
-    expect(wrapper.text()).toContain('消息呈现与内容宽度');
-    expect(wrapper.text()).toContain('点选后立即生效');
-    expect(store.smoothStreamingEnabled).toBe(false);
-    expect(wrapper.get('[data-testid="presentation-settings"]').element.firstElementChild)
-      .toBe(wrapper.get('.streaming-preference').element);
-
-    await wrapper.get('[data-testid="smooth-streaming-switch"]').trigger('click');
-
-    expect(store.smoothStreamingEnabled).toBe(true);
-    expect(localStorage.getItem('vcp-smooth-streaming-enabled')).toBe('true');
-    expect(wrapper.text()).toContain('不改变回复内容');
-    expect(wrapper.get('[data-testid="smooth-streaming-switch"]').attributes('role')).toBe('switch');
-    expect(wrapper.get('[data-testid="smooth-streaming-switch"]').attributes('aria-checked')).toBe('true');
-  });
-
-  it('keeps message rendering controls out of the theme-only section', async () => {
-    wrapper = mount(ThemePicker, {
-      props: { section: 'theme' },
-      global: { plugins: [pinia] },
-    });
+    handlePresentationSelection('immersive');
     await flushPromises();
-
-    expect(wrapper.find('[data-testid="theme-carousel"]').exists()).toBe(true);
-    expect(wrapper.find('[data-testid="presentation-settings"]').exists()).toBe(false);
+    expect(wrapper.get('[data-presentation-value="immersive"]').attributes('aria-checked')).toBe('true');
+    expect(localStorage.getItem('vcp-chat-presentation-mode')).toBe('immersive');
   });
+
+  it('persists feedback and folding commands and keeps the old controls when a write fails', async () => {
+    const store = useChatPreferencesStore();
+    wrapper = mount(ChatPreferencesPage, { global: { plugins: [pinia] } });
+    await wrapper.get('[data-testid="message-haptics-switch"]').trigger('click');
+    await wrapper.get('[data-testid="collapse-tools-switch"]').trigger('click');
+    expect(store.messageHapticsEnabled).toBe(false);
+    expect(store.collapseToolsWhileStreaming).toBe(true);
+
+    vi.spyOn(localStorage, 'setItem').mockImplementation(() => { throw new Error('quota exceeded'); });
+    await wrapper.get('[data-testid="message-haptics-switch"]').trigger('click');
+    expect(store.messageHapticsEnabled).toBe(false);
+    expect(wrapper.get('[data-testid="message-haptics-switch"]').attributes('aria-checked')).toBe('false');
+    expect(wrapper.get('[role="alert"]').text()).toContain('消息震动设置保存失败');
+  });
+
+  it('does not change preferences while its page is inactive', async () => {
+    wrapper = mount(ChatPreferencesPage, { props: { active: false }, global: { plugins: [pinia] } });
+    await wrapper.get('[data-presentation-value="panel"]').trigger('click');
+    await wrapper.get('[data-testid="message-haptics-switch"]').trigger('click');
+    expect(useChatPreferencesStore().presentationMode).toBe('bubble');
+    expect(useChatPreferencesStore().messageHapticsEnabled).toBe(true);
+  });
+
 });

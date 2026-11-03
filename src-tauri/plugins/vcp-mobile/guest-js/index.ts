@@ -42,22 +42,34 @@ export interface PickedFileBatch {
   skipped: number;
 }
 
-export type PickFileMode = 'file' | 'camera' | 'gallery' | 'avatar';
-
-export function pickFile(mode?: PickFileMode): Promise<PickedFile> {
-  return invoke<PickedFile>('plugin:vcp-mobile|pick_file', mode ? { mode } : undefined);
+/** Multi-select acquisition keeps successful items when another provider fails. */
+export interface PickedFiles {
+  files: PickedFile[];
+  errors: { name: string; message: string }[];
 }
+
+export type PickFileMode = 'file' | 'camera' | 'gallery' | 'avatar' | 'config' | 'voiceSample';
+
+export function pickFile(mode?: PickFileMode, options?: { operationId?: string; maxBytes?: number }): Promise<PickedFile> {
+  return invoke<PickedFile>('plugin:vcp-mobile|pick_file', { mode, ...options });
+}
+
+export function cancelFileOperation(operationId: string): Promise<void> {
+  return invoke('plugin:vcp-mobile|cancel_file_operation', { operationId });
+}
+
+export interface NativeFileActionResult { outcome: 'opened' | 'completed' | 'cancelled' | 'cannotPreview' }
 
 export function deleteTempFile(filePath: string): Promise<void> {
   return invoke('plugin:vcp-mobile|delete_temp_file', { filePath });
 }
 
-export function openFileNative(path: string): Promise<void> {
-  return invoke('plugin:vcp-mobile|open_file_native', { path, action: 'view' });
+export function openFileNative(path: string, fileName?: string): Promise<NativeFileActionResult> {
+  return invoke('plugin:vcp-mobile|open_file_native', { path, action: 'view', fileName });
 }
 
-export function shareFileNative(path: string): Promise<void> {
-  return invoke('plugin:vcp-mobile|open_file_native', { path, action: 'share' });
+export function shareFileNative(path: string, fileName?: string): Promise<NativeFileActionResult> {
+  return invoke('plugin:vcp-mobile|open_file_native', { path, action: 'share', fileName });
 }
 
 export interface ApkSignatureVerification {

@@ -100,24 +100,23 @@ describe("auto sync trigger", () => {
 });
 
 describe("auto sync readiness", () => {
-  const configured = {
-    syncServerUrl: "ws://192.168.1.10:5975",
-    syncToken: "sync-token-1",
-  } as unknown as AppSettings;
+  const withSync = (sync: Record<string, unknown>) =>
+    ({ sync: { serverUrl: "ws://192.168.1.10:5975", token: "sync-token-1", ...sync } }) as unknown as AppSettings;
+  const configured = withSync({});
 
   it("defaults on when sync address and token are configured", () => {
     expect(isAutoSyncReady(configured)).toBe(true);
-    expect(isAutoSyncReady({ ...configured, autoSync: true })).toBe(true);
+    expect(isAutoSyncReady(withSync({ autoSync: true }))).toBe(true);
   });
 
   it("stays off without settings, address or token", () => {
     expect(isAutoSyncReady(null)).toBe(false);
-    expect(isAutoSyncReady({ ...configured, syncServerUrl: "  " })).toBe(false);
-    expect(isAutoSyncReady({ ...configured, syncToken: "" })).toBe(false);
+    expect(isAutoSyncReady(withSync({ serverUrl: "  " }))).toBe(false);
+    expect(isAutoSyncReady(withSync({ token: "" }))).toBe(false);
   });
 
   it("is fully disabled by the switch", () => {
-    expect(isAutoSyncReady({ ...configured, autoSync: false })).toBe(false);
+    expect(isAutoSyncReady(withSync({ autoSync: false }))).toBe(false);
   });
 });
 

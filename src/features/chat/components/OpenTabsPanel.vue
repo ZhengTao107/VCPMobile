@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, onUnmounted, reactive, ref, watch } from "vue";
 import { invoke } from "@tauri-apps/api/core";
-import { ChevronDown, ChevronRight, History, Laptop, Monitor, Smartphone } from "lucide-vue-next";
+import { ChevronDown, ChevronRight, History, Laptop, Monitor, Smartphone } from "@lucide/vue";
 import { useModalHistory } from "../../../core/composables/useModalHistory";
 import {
   canvasTabKey,

@@ -1,4 +1,4 @@
-import { Copy, Edit3, X, XCircle } from "lucide-vue-next";
+import { Copy, Edit3, X, XCircle } from "@lucide/vue";
 import type { OverlayActionItem, PromptConfig } from "../../../core/types/overlay";
 import {
   isCanvasTarget,

@@ -6,18 +6,15 @@ import { useSettingsStore } from './settings';
 import { useThemeStore } from './theme';
 import { useNotificationStore, type VcpStatus } from './notification';
 import { useChatSessionStore } from './chatSessionStore';
-import { useChatHistoryStore } from './chatHistoryStore';
 import { useTopicStore } from './topicListManager';
 import { useAvatarStore } from './avatar';
 import { isAndroid, isIOS } from '../utils/platform';
-import { readNotificationPermission } from '../../features/notification/nativeNotifications';
+import { isNotificationAuthorized, readNotificationPermission } from '../../features/notification/nativeNotifications';
 import { selectLatestLifecycleSnapshot, type LifecycleSnapshotDto } from '../types/lifecycle';
-import type {
-  ListenerPermissionDto,
-  PermissionStatusDto,
-} from '../types/native';
+import { hasMissingStartupPermission, type PermissionStatusDto } from '../types/native';
 import { bootMark, reportBootTrace, trackBootStage } from '../utils/bootTrace';
 import { useNotificationProcessor } from '../composables/useNotificationProcessor';
+import { useVoiceDocumentStore } from '../../features/chat/voice/voiceDocument';
 
 export type AppState = 'PERMISSIONS' | 'BOOTING' | 'CONNECTING' | 'PRELOADING' | 'READY' | 'ERROR' | 'OPTIMIZING';
 
@@ -37,15 +34,21 @@ interface SystemSnapshotDto {
   core: 'initializing' | 'optimizing' | 'ready' | 'error';
   message: string;
   log: Extract<VcpStatus['status'], 'closed' | 'connecting' | 'connected' | 'error'>;
+  logConfigurationError: string | null;
   sync: string;
   databaseRecovery: DatabaseRecoveryNotice | null;
   backgroundServiceFailures: Array<'guardian' | 'helper' | 'events'>;
 }
 
+const LOG_STATUS_MESSAGES: Record<SystemSnapshotDto['log'], string> = {
+  closed: '未连接',
+  connecting: '正在连接...',
+  connected: '已连接',
+  error: '连接错误',
+};
 
 
 const CONNECT_TIMEOUT_MS = 15000;
-const NOTIFICATION_INTRO_KEY = 'vcp_ios_notification_intro_v1';
 // [fork ptp4g#9] Android 权限引导"稍后再说"的记忆，仅记录用户选择，不代表系统授权。
 const ANDROID_PERMISSION_SKIP_KEY = 'vcp_android_permission_skip_v1';
 
@@ -74,17 +77,7 @@ export const useAppLifecycleStore = defineStore('appLifecycle', () => {
   let bootstrapPromise: Promise<void> | null = null;
   let coreReadyUnlisten: (() => void) | null = null;
   let connectTimeoutId: ReturnType<typeof setTimeout> | null = null;
-  let optionalNotificationIntroDismissed = false;
   let androidPermissionGateSkipped = false;
-
-  const hasSeenNotificationIntroduction = () => {
-    if (optionalNotificationIntroDismissed) return true;
-    try {
-      return localStorage.getItem(NOTIFICATION_INTRO_KEY) === 'seen';
-    } catch {
-      return false;
-    }
-  };
 
   const hasSkippedAndroidPermissionGate = () => {
     if (androidPermissionGateSkipped) return true;
@@ -115,7 +108,7 @@ export const useAppLifecycleStore = defineStore('appLifecycle', () => {
       case 'PRELOADING':
         return currentPhaseLabel.value || '正在预加载核心数据...';
       case 'OPTIMIZING':
-        return '正在优化数据库...';
+        return '正在维护数据库';
       case 'ERROR':
         return errorMsg.value || '启动失败';
       case 'READY':
@@ -153,12 +146,6 @@ export const useAppLifecycleStore = defineStore('appLifecycle', () => {
     isBootstrapping.value = false;
     bootstrapPromise = null;
     setState('ERROR', message);
-    // 统一更新通知系统的核心状态槽
-    notificationStore.updateCoreStatus({ 
-      status: 'error', 
-      message, 
-      source: 'Core' 
-    });
     console.error('[Lifecycle] FATAL:', message);
   };
 
@@ -200,22 +187,11 @@ export const useAppLifecycleStore = defineStore('appLifecycle', () => {
       const promises: Promise<unknown>[] = [
         trackBootStage('fe:preload_settings', settingsStore.fetchSettings()),
         trackBootStage('fe:preload_agents', assistantStore.fetchAgentsAndGroups()),
-        trackBootStage('fe:preload_avatars', avatarStore.preloadMetadata())
+        trackBootStage('fe:preload_avatars', avatarStore.preloadMetadata()),
+        trackBootStage('fe:restore_chat_focus', sessionStore.restoreFocus()),
       ];
 
-      // 启动预加载：若 Pinia 恢复了活跃会话，提前拉取首屏聊天历史
-      // 让 DB + IPC 开销与 Vue 组件挂载并行，ChatView mount 后直接命中缓存（零延迟）
-      if (sessionStore.currentSelectedItem?.id && sessionStore.currentTopicId) {
-        const historyStore = useChatHistoryStore();
-        const ownerId = sessionStore.currentSelectedItem.id;
-        const ownerType = sessionStore.currentSelectedItem.type;
-        const topicId = sessionStore.currentTopicId;
-        if (ownerType === 'agent' || ownerType === 'group') {
-          console.log(`[Lifecycle] Preloading chat history for ${ownerType} ${ownerId}, topic: ${topicId}`);
-          promises.push(trackBootStage('fe:preload_history', historyStore.preloadHistory(ownerId, ownerType, topicId, 5)));
-        }
-      }
-
+      // Restore the admitted focus/window before the chat page mounts.
       await Promise.all(promises);
       bootMark('fe:preload_done');
       sessionStore.reconcileCurrentConversation();
@@ -273,6 +249,8 @@ export const useAppLifecycleStore = defineStore('appLifecycle', () => {
     await new Promise<void>((resolve, reject) => {
       let settled = false;
       let timeoutId: ReturnType<typeof setTimeout> | undefined;
+      // Keep the binding initialized before watch's immediate callback can use cleanup.
+      // eslint-disable-next-line prefer-const
       let unwatch: (() => void);
 
       const cleanup = () => {
@@ -294,7 +272,7 @@ export const useAppLifecycleStore = defineStore('appLifecycle', () => {
         (newStatus) => {
           if (settled) return;
 
-          // 数据库物理优化可能超过 15 秒，期间暂停核心就绪超时。
+          // 数据库故障核查和旧库物理升级可能超过普通启动的等待期限。
           if (newStatus === 'optimizing') {
             state.value = 'OPTIMIZING';
             currentPhaseLabel.value = notificationStore.vcpCoreStatus.message;
@@ -319,7 +297,10 @@ export const useAppLifecycleStore = defineStore('appLifecycle', () => {
     });
   };
 
+  let logStatusRead = 0;
   const hydrateSystemStatus = async () => {
+    const read = ++logStatusRead;
+    const previousLogStatus = notificationStore.vcpStatus;
     try {
       console.log('[Lifecycle] Fetching system status snapshot...');
       const snapshot = await invoke<SystemSnapshotDto>('get_system_snapshot');
@@ -350,11 +331,28 @@ export const useAppLifecycleStore = defineStore('appLifecycle', () => {
         });
       }
 
-      notificationStore.updateStatus({
-        status: snapshot.log,
-        message: snapshot.log === 'connected' ? '已连接' : '正在连接...',
-        source: 'VCPLog'
-      });
+      if (snapshot.logConfigurationError) {
+        notificationStore.addNotification(processPayload({
+          type: 'vcp-log-message',
+          data: {
+            id: 'vcp_connection_configuration_error',
+            status: 'error',
+            tool_name: 'VCPLog / VCPInfo 配置错误',
+            content: `连接已停止：${snapshot.logConfigurationError} 请在设置中修正 WebSocket 地址或 Key。`,
+            source: 'VCPLog / VCPInfo',
+          },
+        }));
+      }
+
+      if (read === logStatusRead && notificationStore.vcpStatus === previousLogStatus) {
+        notificationStore.updateStatus({
+          status: snapshot.log,
+          message: snapshot.log === 'closed' && snapshot.logConfigurationError
+            ? `连接已停止：${snapshot.logConfigurationError}`
+            : LOG_STATUS_MESSAGES[snapshot.log],
+          source: 'VCPLog'
+        });
+      }
 
       console.log('[Lifecycle] Snapshot hydrated:', JSON.stringify(snapshot));
     } catch (e) {
@@ -380,14 +378,18 @@ export const useAppLifecycleStore = defineStore('appLifecycle', () => {
         errorMsg.value = null;
         hasBootstrapped.value = false;
 
-        // Android keeps its existing required keepalive setup. iOS notification
-        // authorization is optional and is requested only by the user's action.
+        // Revoke the previous document's capture and independent playback even
+        // if startup stops at the permission guide. Playback release has its
+        // own admission barrier; the cached voice connection does not await it.
+        void useVoiceDocumentStore().connect().catch(error => {
+          console.warn('[Lifecycle] Voice document connection failed:', error);
+        });
+
         if (isAndroid) {
           try {
             const pStatus = await invoke<PermissionStatusDto>('plugin:vcp-mobile|check_all_permissions');
-            const listenerRes = await invoke<ListenerPermissionDto>('plugin:vcp-mobile|check_notification_listener_permission');
             bootMark('fe:permissions_done');
-            if (!pStatus.notification || !pStatus.battery || !listenerRes.enabled) {
+            if (hasMissingStartupPermission(pStatus)) {
               if (!hasSkippedAndroidPermissionGate()) {
                 console.log('[Lifecycle] Missing keep-alive critical permissions, entering permission gate');
                 // 仅在确认缺失权限时才将状态设为 PERMISSIONS，避免权限完整时引导页一闪而过
@@ -421,18 +423,18 @@ export const useAppLifecycleStore = defineStore('appLifecycle', () => {
           }
         }
 
-        if (isIOS && !hasSeenNotificationIntroduction()) {
+        if (isIOS) {
+          let notificationsAllowed = false;
           try {
-            const permission = await readNotificationPermission();
-            if (permission.authorization === 'notDetermined') {
-              setState('PERMISSIONS', '介绍可选的系统通知');
-              bootstrapPromise = null;
-              isBootstrapping.value = false;
-              return;
-            }
+            notificationsAllowed = isNotificationAuthorized(await readNotificationPermission());
           } catch (cause) {
-            // An optional permission query must not prevent entering the app.
-            console.warn('[Lifecycle] Optional notification permission unavailable:', cause);
+            console.warn('[Lifecycle] Could not verify notification permission:', cause);
+          }
+          if (!notificationsAllowed) {
+            setState('PERMISSIONS', '需要开启通知才能进入应用');
+            bootstrapPromise = null;
+            isBootstrapping.value = false;
+            return;
           }
         }
 
@@ -461,28 +463,16 @@ export const useAppLifecycleStore = defineStore('appLifecycle', () => {
     return bootstrapPromise;
   };
 
-  const continueFromPermissionGuide = () => {
-    if (isIOS) {
-      optionalNotificationIntroDismissed = true;
-      try {
-        // This records only that the explanation was seen, never OS authorization.
-        localStorage.setItem(NOTIFICATION_INTRO_KEY, 'seen');
-      } catch (cause) {
-        console.warn('[Lifecycle] Could not remember notification introduction:', cause);
-      }
-    }
-    if (isAndroid) {
-      // [fork ptp4g#9] 记录用户已选择进入；权限仍缺失时以后启动不再拦门，只常驻提示。
-      androidPermissionGateSkipped = true;
-      try {
-        localStorage.setItem(ANDROID_PERMISSION_SKIP_KEY, 'skipped');
-      } catch (cause) {
-        console.warn('[Lifecycle] Could not remember Android permission skip:', cause);
-      }
+  // [fork ptp4g#9] Android 缺权限时"稍后再说"：记住选择后放行，以后启动只常驻提示不再拦门。
+  const skipPermissionGuide = () => {
+    androidPermissionGateSkipped = true;
+    try {
+      localStorage.setItem(ANDROID_PERMISSION_SKIP_KEY, 'skipped');
+    } catch (cause) {
+      console.warn('[Lifecycle] Could not remember Android permission skip:', cause);
     }
     return bootstrap(true);
   };
-
   return {
     state,
     errorMsg,
@@ -496,7 +486,8 @@ export const useAppLifecycleStore = defineStore('appLifecycle', () => {
     applyLifecycleSnapshot,
     coreStatus: computed(() => notificationStore.vcpCoreStatus),
     bootstrap,
-    continueFromPermissionGuide,
+    continueFromPermissionGuide: () => bootstrap(true),
+    skipPermissionGuide,
     hydrateSystemStatus
   };
 });

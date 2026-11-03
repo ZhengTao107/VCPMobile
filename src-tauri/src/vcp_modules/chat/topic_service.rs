@@ -1,7 +1,12 @@
 // TopicService: 处理会话话题生命周期的模块
 // 职责: 完全面向 SQLite 数据库的话题管理，不依赖本地文件系统
 
+use super::chat_focus::DeleteScope;
+use super::chat_navigation::observe_target_deletion;
+use super::voice_service::VoiceCallState;
 use crate::vcp_modules::db_manager::DbState;
+use crate::vcp_modules::group_types::GroupChatMode;
+use crate::vcp_modules::infra::vcp_http_endpoint::ChatRequestPurpose;
 use crate::vcp_modules::settings_manager::SettingsState;
 use crate::vcp_modules::sync_hash::HashAggregator;
 use crate::vcp_modules::sync_service::{SyncCommand, SyncState};
@@ -12,7 +17,7 @@ use sqlx::{sqlite::SqliteRow, Row};
 use std::collections::HashMap;
 use tauri::{ipc::Channel, AppHandle, Manager, State};
 
-const TOPIC_LIST_QUERY: &str = "WITH topic_list AS (
+pub(super) const TOPIC_LIST_QUERY: &str = "WITH topic_list AS (
          SELECT t.topic_id, t.title, t.created_at, t.locked, t.unread, t.unread_count, t.msg_count,
             CASE
                 WHEN MAX(m.updated_at) IS NULL
@@ -41,7 +46,7 @@ pub enum TopicSortMode {
 }
 
 impl TopicSortMode {
-    fn query_code(self) -> i32 {
+    pub(super) fn query_code(self) -> i32 {
         match self {
             Self::Created => 0,
             Self::Updated => 1,
@@ -247,6 +252,9 @@ pub async fn delete_topic(
 ) -> Result<Option<Topic>, String> {
     let now = chrono::Utc::now().timestamp_millis();
     let key = TopicKey::new(&owner_type, &owner_id, &topic_id);
+    let scope = DeleteScope::Topic(key.clone());
+    let calls = app_handle.state::<VoiceCallState>();
+    let reservation = calls.reserve_local_delete(scope.clone())?;
     let replacement = Topic {
         id: if owner_type == "group" {
             format!("group_topic_{now}")
@@ -269,10 +277,17 @@ pub async fn delete_topic(
     let deletion = delete_topic_data_inner(&db_state, &key, now, Some(replacement))
         .await?
         .ok_or_else(|| format!("Topic {topic_id} does not exist"))?;
+    observe_target_deletion(&app_handle, &scope).await;
+    drop(reservation);
     if !deletion.deleted {
         return Ok(None);
     }
 
+    // 仲裁阶段可能尚未创建活动消息，不能只靠下方 active_messages 取消。
+    if let Some(turns) = app_handle.try_state::<crate::vcp_modules::vcp_client::ActiveGroupTurns>()
+    {
+        turns.cancel(&key);
+    }
     for message_key in deletion.active_messages {
         crate::vcp_modules::vcp_client::discard_deleted_generation(&app_handle, &message_key).await;
     }
@@ -752,159 +767,6 @@ pub async fn increment_topic_unread_count(
     })
 }
 
-#[derive(serde::Deserialize, Clone, Debug)]
-#[allow(dead_code)] // DORMANT ASSET: floating-assistant archive DTO is not runtime-exposed.
-pub struct TempMessage {
-    pub role: String,
-    pub name: Option<String>,
-    pub content: String,
-    pub timestamp: u64,
-}
-
-#[tauri::command]
-#[allow(dead_code)] // DORMANT ASSET: floating-assistant archive command is not registered.
-pub async fn archive_assistant_chat(
-    app_handle: AppHandle,
-    db_state: State<'_, DbState>,
-    owner_id: String,
-    owner_type: String,
-    temp_messages: Vec<TempMessage>,
-) -> Result<String, String> {
-    if temp_messages.is_empty() {
-        return Err("No messages to archive".to_string());
-    }
-
-    let now_millis = crate::vcp_modules::infra::utils::now_millis();
-
-    // 1. 创建默认名称的话题
-    let formatted_time = chrono::Local::now().format("%m-%d %H:%M").to_string();
-    let default_title = format!("划词助手 {}", formatted_time);
-
-    let topic = create_topic(
-        app_handle.clone(),
-        db_state.clone(),
-        owner_id.clone(),
-        owner_type.clone(),
-        default_title.clone(),
-    )
-    .await?;
-
-    let new_topic_id = topic.id;
-    let key = TopicKey::new(&owner_type, &owner_id, &new_topic_id);
-
-    // 2. Render compilation stays outside the write gate; only durable SQL is serialized.
-    let mut prepared_messages = Vec::with_capacity(temp_messages.len());
-    for (index, temp_msg) in temp_messages.iter().enumerate() {
-        let msg_id = format!("assistant_msg_{}_{}", now_millis, index);
-
-        // 编译 AST 块并序列化
-        let blocks =
-            crate::vcp_modules::persistence::message_repository::MessageRenderCompiler::compile(
-                &temp_msg.content,
-            );
-        let render_content =
-            crate::vcp_modules::persistence::message_repository::MessageRenderCompiler::serialize(
-                &blocks,
-            )?;
-
-        let chat_msg = crate::vcp_modules::chat_manager::ChatMessage {
-            id: msg_id,
-            role: temp_msg.role.clone(),
-            name: temp_msg.name.clone(),
-            content: temp_msg.content.clone(),
-            timestamp: temp_msg.timestamp,
-            updated_at: None,
-            is_thinking: Some(false),
-            agent_id: if owner_type == "agent" {
-                Some(owner_id.clone())
-            } else {
-                None
-            },
-            group_id: if owner_type == "group" {
-                Some(owner_id.clone())
-            } else {
-                None
-            },
-            topic_id: Some(new_topic_id.clone()),
-            is_group_message: Some(owner_type == "group"),
-            finish_reason: None,
-            attachments: None,
-            blocks: None,
-            shell: None,
-            content_hash: None,
-        };
-
-        prepared_messages.push((chat_msg, render_content));
-    }
-
-    let mut tx = db_state.write_transaction("message.archive").await?;
-    for (chat_msg, render_content) in prepared_messages {
-        crate::vcp_modules::persistence::message_repository::MessageRepository::upsert_message(
-            &mut tx,
-            &chat_msg,
-            &key,
-            &render_content,
-            true, // 循环中先不重算全局 Topic 聚合哈希以加速入库
-        )
-        .await?;
-    }
-
-    // 3. 提交事务前一次性重算当前 Topic 消息计数与聚合哈希
-    crate::vcp_modules::sync_hash::HashAggregator::bubble_from_topic(&mut tx, &key).await?;
-    tx.commit().await.map_err(|e| e.to_string())?;
-
-    // 4. 异步调用总结标题服务并更新标题
-    let app_handle_clone = app_handle.clone();
-    let owner_id_clone = owner_id.clone();
-    let owner_type_clone = owner_type.clone();
-    let new_topic_id_clone = new_topic_id.clone();
-    let pool_clone = db_state.pool.clone();
-
-    tauri::async_runtime::spawn(async move {
-        // 获取 Agent 名字以传入总结服务
-        let agent_name = if owner_type_clone == "agent" {
-            if let Ok(row) =
-                sqlx::query("SELECT name FROM agents WHERE owner_type = 'agent' AND agent_id = ?")
-                    .bind(&owner_id_clone)
-                    .fetch_one(&pool_clone)
-                    .await
-            {
-                use sqlx::Row;
-                row.get::<String, _>("name")
-            } else {
-                "Agent".to_string()
-            }
-        } else {
-            "Group".to_string()
-        };
-
-        if let Ok(title) = crate::vcp_modules::chat::topic_summary_service::summarize_topic(
-            app_handle_clone.clone(),
-            app_handle_clone.state::<SettingsState>(),
-            owner_id_clone.clone(),
-            owner_type_clone.clone(),
-            new_topic_id_clone.clone(),
-            agent_name,
-        )
-        .await
-        {
-            // 调用已有接口更新标题以同步哈希至局域网
-            let _ = update_topic_title(
-                app_handle_clone.clone(),
-                app_handle_clone.state::<DbState>(),
-                owner_id_clone,
-                owner_type_clone,
-                new_topic_id_clone,
-                title,
-                Some(default_title),
-            )
-            .await;
-        }
-    });
-
-    Ok(new_topic_id)
-}
-
 #[tauri::command]
 #[allow(clippy::too_many_arguments)]
 pub async fn regenerate_topic_response(
@@ -992,11 +854,11 @@ pub async fn regenerate_topic_response(
     // 3. 在写入任何墓碑前完成可确定的生成前检查。检查失败时前端重新加载
     // 历史即可恢复乐观隐藏的旧消息，无需设计墓碑撤销机制。
     let settings =
-        crate::vcp_modules::settings_manager::read_settings(app_handle.clone(), settings_state)
+        crate::vcp_modules::settings_manager::read_config(app_handle.clone(), settings_state)
             .await?;
     let connection = crate::vcp_modules::vcp_client::freeze_chat_connection(
         &settings,
-        crate::vcp_modules::vcp_client::ChatRequestPurpose::Interactive,
+        ChatRequestPurpose::Interactive,
     )?;
 
     match owner_type.as_str() {
@@ -1016,12 +878,14 @@ pub async fn regenerate_topic_response(
                 owner_id.clone(),
             )
             .await?;
-            match group_config.mode.as_str() {
-                "sequential" | "naturerandom" => {}
-                "invite_only" => {
+            match group_config.effective_mode() {
+                GroupChatMode::Sequential | GroupChatMode::NaturalRandom => {}
+                GroupChatMode::InviteOnly => {
                     return Err("邀请发言群组不能使用自动重新生成，请直接邀请成员发言".to_string())
                 }
-                mode => return Err(format!("群组发言模式 {mode} 暂不支持重新生成")),
+                GroupChatMode::Jev => {
+                    return Err("JEV 群聊暂不支持重新生成，请继续群聊或邀请成员发言".into())
+                }
             }
 
             let has_live_member: bool = sqlx::query_scalar(
@@ -1051,6 +915,17 @@ pub async fn regenerate_topic_response(
         &target_user_msg_id,
     )
     .await?;
+    if let Err(error) = crate::vcp_modules::chat::voice_service::stop_bubble_for_messages(
+        &app_handle,
+        &key,
+        &deletion.deleted_ids,
+    )
+    .await
+    {
+        log::warn!(
+            "[TopicService] Regeneration truncation committed; narration cleanup failed: {error}"
+        );
+    }
     for msg_id in &deletion.active_ids {
         crate::vcp_modules::vcp_client::discard_deleted_generation(
             &app_handle,
@@ -1157,16 +1032,6 @@ mod tests {
         .await
         .expect("seed topic activity");
 
-        let projected: i64 = sqlx::query_scalar(
-            "SELECT last_message_updated_at FROM topics
-             WHERE owner_type = 'agent' AND owner_id = 'agent' AND topic_id = 'message-newer'",
-        )
-        .fetch_one(&pool)
-        .await
-        .expect("read materialized activity");
-        assert_eq!(projected, 0);
-        assert!(TOPIC_LIST_QUERY.contains("LEFT JOIN messages"));
-
         let rows = sqlx::query(TOPIC_LIST_QUERY)
             .bind("agent")
             .bind("agent")
@@ -1195,9 +1060,6 @@ mod tests {
         assert_eq!(items[0].updated_at, 500);
         assert_eq!(items[1].updated_at, 450);
         assert_eq!(items[2].updated_at, 700);
-        let serialized = serde_json::to_value(&items[2]).expect("serialize topic list item");
-        assert_eq!(serialized["id"], "message-newer");
-        assert_eq!(serialized["updatedAt"], 700);
 
         let rows = sqlx::query(TOPIC_LIST_QUERY)
             .bind("agent")

@@ -13,7 +13,7 @@ import { invoke } from '@tauri-apps/api/core';
 import { useAppLifecycleStore } from '../../core/stores/appLifecycle';
 import { useNotificationStore } from '../../core/stores/notification';
 import { isAndroid, isIOS } from '../../core/utils/platform';
-import { saveToDownloads } from '../../../src-tauri/plugins/vcp-mobile/guest-js';
+import type { DownloadsSaveResult } from '../../../src-tauri/plugins/vcp-mobile/guest-js';
 import {
   addressingOf,
   folderKindOf,
@@ -445,6 +445,8 @@ export const useMailStore = defineStore('mail', () => {
   }
 
   // ---------- V1.1：附件下载 ----------
+  let attachmentExporting = false;
+
   async function downloadAttachment(
     mailId: string,
     partId: string,
@@ -452,27 +454,28 @@ export const useMailStore = defineStore('mail', () => {
   ): Promise<void> {
     const box = selectedMailbox.value;
     if (!box) return;
-    if (!isAndroid) {
-      toast('info', isIOS ? '当前 iOS 版本尚未接入附件文件导出' : '当前预览环境不提供原生附件文件导出');
+    if (!isAndroid && !isIOS) {
+      toast('info', '当前预览环境不提供原生附件文件导出');
       return;
     }
+    if (attachmentExporting) {
+      toast('info', '已有附件正在导出，请等待完成后重试');
+      return;
+    }
+    attachmentExporting = true;
     try {
-      const payload = await invoke<Record<string, unknown>>('mail_attachment', {
+      const result = await invoke<DownloadsSaveResult>('mail_attachment', {
         mailId,
         partId,
+        filename,
         ...addressingOf(box),
       });
-      const dataBase64 = String(payload.dataBase64 ?? '');
-      const name = String(payload.filename ?? filename);
-      if (!dataBase64) throw new Error('附件内容为空');
-      const result = await saveToDownloads(
-        name,
-        dataBase64,
-        typeof payload.contentType === 'string' ? payload.contentType : undefined,
-      );
-      toast('success', `附件已保存到下载目录：${result.displayName}`);
+      toast('success', `${isIOS ? '附件已保存到所选文件位置' : '附件已保存到下载目录'}：${result.displayName}`);
     } catch (raw) {
-      toast('error', `附件下载失败：${toMessage(raw)}`);
+      if (String(raw).toLowerCase().includes('cancel')) return;
+      toast('error', toMessage(raw));
+    } finally {
+      attachmentExporting = false;
     }
   }
 

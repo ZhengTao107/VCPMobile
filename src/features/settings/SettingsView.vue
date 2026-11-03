@@ -1,36 +1,17 @@
 <script setup lang="ts">
-import { ref, onMounted, watch, computed, defineAsyncComponent } from "vue";
-import { useModalHistory } from "../../core/composables/useModalHistory";
-import {
-  diffSettingsPatch,
-  useSettingsStore,
-  type AppSettings,
-} from "../../core/stores/settings";
+import { ref, watch, computed, defineComponent, onErrorCaptured, onScopeDispose } from "vue";
 import { useThemeStore } from "../../core/stores/theme";
+import { LAYER_PAGE_BASE } from "../../core/constants/layers";
 import SlidePage from "../../components/ui/SlidePage.vue";
 
-// 轻量原语保持静态；全部区块组件改为懒加载——设置主页只渲染分类列表，
-// 首次打开不再解析 UserProfile/Theme/ModelSelector/About 等与主页无关的代码
-import SettingsCard from "../../components/settings/SettingsCard.vue";
 import SettingsRow from "../../components/settings/SettingsRow.vue";
-import SettingsSection from "../../components/settings/SettingsSection.vue";
-import SettingsDisclosure from "../../components/settings/SettingsDisclosure.vue";
 import FluidBackground from "../../components/ui/WebGLFluidBackground.vue";
-import { SETTINGS_GROUPS, findSettingsPage } from "./settingsGroups";
-const UserProfileSection = defineAsyncComponent(() => import("./components/UserProfileSection.vue"));
-const SyncSettingsSection = defineAsyncComponent(() => import("./components/SyncSettingsSection.vue"));
-const ConfigBackupSection = defineAsyncComponent(() => import("./components/ConfigBackupSection.vue"));
-const VcpCoreSettingsSection = defineAsyncComponent(() => import("./components/VcpCoreSettingsSection.vue"));
-const ThemePicker = defineAsyncComponent(() => import("./ThemePicker.vue"));
-const ModelSelector = defineAsyncComponent(() => import("../../components/ModelSelector.vue"));
-const AboutSection = defineAsyncComponent(() => import("./components/AboutSection.vue"));
-
-// 低频子页面（advanced / guide）：懒加载，用户点进子页面时才解析
-// const AssistantSettingsSection = defineAsyncComponent(() => import("./components/AssistantSettingsSection.vue"));
-const TopicSummarySection = defineAsyncComponent(() => import("./components/TopicSummarySection.vue"));
-const MaintenanceSection = defineAsyncComponent(() => import("./components/MaintenanceSection.vue"));
-const GuideCenterSection = defineAsyncComponent(() => import("../guide/components/GuideCenterSection.vue"));
-
+import { settingsPages } from "./catalog";
+import { useSettingsNavigation } from "./useSettingsNavigation";
+import { useDeveloperSettingsStore } from './developer/store';
+import { useSettingsStore } from '../../core/stores/settings';
+import { useOverlayStore } from '../../core/stores/overlay';
+import type { SettingsPageId } from './contracts';
 
 const props = withDefaults(
   defineProps<{
@@ -39,7 +20,7 @@ const props = withDefaults(
   }>(),
   {
     isOpen: false,
-    zIndex: 50,
+    zIndex: LAYER_PAGE_BASE,
   },
 );
 
@@ -47,118 +28,65 @@ const emit = defineEmits<{
   close: [];
 }>();
 
-const settingsStore = useSettingsStore();
-const { registerModal, unregisterModal } = useModalHistory();
-const SUBPAGE_MODAL_ID = "SettingsSubPage";
-
-const settings = ref<AppSettings>({
-  userName: "User",
-  vcpServerUrl: "",
-  chatEndpointMode: "standard",
-  vcpApiKey: "",
-  vcpLogUrl: "",
-  vcpLogKey: "",
-  syncServerUrl: "",
-  syncHttpUrl: "",
-  syncToken: "",
-  adminUsername: "",
-  adminPassword: "",
-  fileKey: "",
-  agentOrder: [],
-  groupOrder: [],
-  topicSummaryModel: "gemini-3.1-flash-lite",
-  syncLogLevel: "INFO",
-  currentThemeMode: null,
-  syncPrerenderEnabled: false,
-  // [SUSPENDED BETA] 浮动助手（划词悬浮球）功能当前已暂停使用，默认值保留供后续重启
-  enableAssistant: false,
-  assistantAgentId: "",
-  distributedEnabled: false,
-  distributedWsUrl: "",
-  distributedVcpKey: "",
-  distributedDeviceName: "",
+const subpageSurface = ref<HTMLElement | null>(null);
+const {
+  activeVisit, displayedVisit, pageError, navigationError, attempt, loading, loaded,
+  openPage, navigateTo, openDeveloperPage, requestLeave, failPage, retryPage, finishPageLeave,
+} = useSettingsNavigation({
+  isOpen: computed(() => props.isOpen),
+  surface: () => subpageSurface.value,
+  close: () => emit("close"),
 });
-const settingsBaseline = ref<AppSettings | null>(null);
-const cloneSettings = (value: AppSettings): AppSettings =>
-  JSON.parse(JSON.stringify(value)) as AppSettings;
 
-const loading = ref(true);
-const showSummaryModelSelector = ref(false);
-// ModelSelector 常驻挂载会随设置页首开解析；首开闩锁：第一次真正需要选择模型时才挂载
-const summarySelectorMounted = ref(false);
-watch(showSummaryModelSelector, (open) => {
-  if (open) summarySelectorMounted.value = true;
-});
-const currentSubPage = ref<string | null>(null);
-const visibleSubPage = ref<string | null>(null);
+const developerSettings = useDeveloperSettingsStore();
+const rootPages = settingsPages.filter((page) => !page.parent);
+const openDeveloper = () => { if (developerSettings.enabled) openDeveloperPage(); };
 
-// 分组与顺序见 settingsGroups.ts（连接 → 同步 → 聊天 → 外观 → 高级）
-const subPageTitle = computed(() => findSettingsPage(currentSubPage.value)?.title || "");
-
-const onSummaryModelSelect = (modelId: string) => {
-  settings.value.topicSummaryModel = modelId;
-  saveSettings();
-};
-
-const closeSettings = () => {
-  currentSubPage.value = null;
-  emit("close");
-};
-
-const goBack = async () => {
-  try {
-    await saveSettings();
-  } catch (e) {
-    console.error("Failed to save settings:", e);
-  }
-  currentSubPage.value = null;
-};
-
-const loadSettings = async () => {
-  try {
-    await settingsStore.fetchSettings();
-    if (settingsStore.settings) {
-      const loaded = cloneSettings(settingsStore.settings);
-      settings.value = loaded;
-      settingsBaseline.value = cloneSettings(loaded);
+const overlayStore = useOverlayStore();
+watch(
+  [() => props.isOpen, () => overlayStore.requestedSettingsSubPage],
+  ([open, targetSubPage]) => {
+    if (open && targetSubPage) {
+      navigateTo(targetSubPage as SettingsPageId);
+      overlayStore.consumeRequestedSettingsSubPage();
     }
-  } catch (e) {
-    console.error("[SettingsView] Failed to load settings:", e);
-  } finally {
-    loading.value = false;
-  }
-};
+  },
+  { immediate: true },
+);
 
-// 配置导入完成后：用持久化后的设置重置工作副本与基线，避免 goBack 时重复 diff 落盘
-const onConfigImported = () => {
-  if (settingsStore.settings) {
-    const persisted = cloneSettings(settingsStore.settings);
-    settings.value = persisted;
-    settingsBaseline.value = cloneSettings(persisted);
-  }
+const displayedPage = computed(() => settingsPages.find((page) => page.id === displayedVisit.value?.id));
+const subPageTitle = computed(() => settingsPages.find((page) => page.id === activeVisit.value?.id)?.title || "");
+const pageActive = computed(() => props.isOpen && activeVisit.value === displayedVisit.value && !!activeVisit.value);
+const settingsStore = useSettingsStore();
+const homeActive = computed(() => props.isOpen && !displayedVisit.value);
+const reloadSettings = async () => {
+  if (!homeActive.value || settingsStore.loading) return;
+  try { await settingsStore.fetchSettings(); } catch { /* The Store owns the displayed read error. */ }
 };
+// Outer close retains the current picture; its own after-leave releases the child.
+const pageVisible = computed(() => !!activeVisit.value || !props.isOpen);
 
-const saveSettings = async (): Promise<boolean> => {
-  try {
-    const baseline = settingsBaseline.value;
-    if (!baseline) return false;
-    const draftAtStart = cloneSettings(settings.value);
-    const patch = diffSettingsPatch(baseline, draftAtStart);
-    if (Object.keys(patch).length === 0) return true;
-    const persisted = await settingsStore.updateSettings(patch);
-    // 保存期间用户可能继续编辑；只推进持久化基线，不用旧响应覆盖活草稿。
-    settingsBaseline.value = cloneSettings(persisted);
-    console.log("Settings saved!");
-    return true;
-  } catch (e) {
-    console.error("Failed to save settings:", e);
-    return false;
-  }
-};
-
-onMounted(() => {
-  if (props.isOpen) loadSettings();
+const PageLoadBoundary = defineComponent({
+  props: { visit: { type: Number, required: true } },
+  emits: { error: (_visit: number, _error: unknown) => true },
+  setup(boundaryProps, { slots, emit: emitError }) {
+    onErrorCaptured((error) => {
+      emitError('error', boundaryProps.visit, error);
+      return false;
+    });
+    return () => slots.default?.();
+  },
 });
+
+const finishSubpageTransition = (element: Element) => {
+  finishPageLeave(Number((element as HTMLElement).dataset.settingsVisit));
+};
+const finishSettingsTransition = (element: Element) => {
+  finishPageLeave(Number((element as HTMLElement).dataset.settingsClosingVisit));
+};
+const rememberClosingVisit = (element: Element) => {
+  (element as HTMLElement).dataset.settingsClosingVisit = String(displayedVisit.value?.serial ?? '');
+};
 
 // 子页面预热：设置页打开后，在浏览器空闲时后台预载主题/关于子页的异步 chunk。
 // 否则进入子页时「chunk 下载 → fetchThemes → 预览区空态切内容 → 卡片轨吸附定位」
@@ -168,51 +96,26 @@ onMounted(() => {
 // 这里真正需要预热的只有 chunk；挂到 idle 是为避免与设置页首开动画
 // 争抢主线程——与 initTheme 的空闲加载模式保持同构，不开同步预热的后门。
 const themeStore = useThemeStore();
+let idleWarmup: number | null = null;
+let warmupTimeout: ReturnType<typeof setTimeout> | null = null;
 const warmSubPages = () => {
-  const idle: (cb: () => void) => void =
-    (window as any).requestIdleCallback?.bind(window) || ((cb) => setTimeout(cb, 1000));
-  idle(() => {
+  if (idleWarmup !== null || warmupTimeout !== null) return;
+  const preload = () => {
+    idleWarmup = null;
+    warmupTimeout = null;
     if (themeStore.availableThemes.length === 0) void themeStore.fetchThemes();
-    void import("./ThemePicker.vue");
-    void import("./components/AboutSection.vue");
-  });
+    // A failed optional preload must leave the actual page loader free to retry.
+    void import("./ThemePicker.vue").catch(() => {});
+    void import("./components/AboutSection.vue").catch(() => {});
+  };
+  if (window.requestIdleCallback) idleWarmup = window.requestIdleCallback(preload);
+  else warmupTimeout = setTimeout(preload, 1000);
 };
 
-watch(
-  () => props.isOpen,
-  (val: boolean) => {
-    if (val) {
-      currentSubPage.value = null; // 重新打开时，先确保重置回设置主页，防止滞留子页面
-      loadSettings();
-      warmSubPages();
-    } else {
-      // 关闭时绝不重置，防止与外层 SlidePage 的退场 Transition 动画产生 DOM 突兀卸载冲突
-    }
-  },
-);
-
-// 不走 AppSettings 草稿持久化的子页面：物理返回时跳过无意义的 saveSettings
-const READ_ONLY_SUBPAGES = new Set(['about', 'rendering']);
-
-watch(currentSubPage, (val) => {
-  if (val) {
-    visibleSubPage.value = val;
-    registerModal(SUBPAGE_MODAL_ID, () => {
-      if (READ_ONLY_SUBPAGES.has(currentSubPage.value ?? '')) {
-        currentSubPage.value = null;
-      } else {
-        goBack();
-      }
-    });
-  } else {
-    unregisterModal(SUBPAGE_MODAL_ID);
-    // 延迟清空子页面，防止与外层 SlidePage 的退场 Transition 动画（0.3s-0.35s）产生 DOM 突兀卸载冲突
-    setTimeout(() => {
-      if (!currentSubPage.value) {
-        visibleSubPage.value = null;
-      }
-    }, 350);
-  }
+watch(() => props.isOpen, (open) => { if (open) warmSubPages(); }, { immediate: true });
+onScopeDispose(() => {
+  if (idleWarmup !== null) window.cancelIdleCallback?.(idleWarmup);
+  if (warmupTimeout !== null) clearTimeout(warmupTimeout);
 });
 
 // ── 关于页：独立沉浸式覆盖层 ─────────────────────────────────────────────
@@ -221,251 +124,153 @@ watch(currentSubPage, (val) => {
 // 以淡入+轻微上浮进场。背景宿主常驻保活（v-show），经 idle 预编译着色器，
 // 仅在关于页可见期间运行渲染循环。
 const fluidBgRef = ref<{ setActive: (value: boolean) => void } | null>(null);
-const aboutVisible = computed(() => currentSubPage.value === "about");
-
-let fluidDeactivateTimer: ReturnType<typeof setTimeout> | null = null;
-const syncFluidActive = () => {
-  const shouldActive = props.isOpen && aboutVisible.value;
-  if (shouldActive) {
-    if (fluidDeactivateTimer) {
-      clearTimeout(fluidDeactivateTimer);
-      fluidDeactivateTimer = null;
-    }
-    fluidBgRef.value?.setActive(true);
-  } else {
-    // 延迟停用：覆盖层/设置页退场动画期间保留最后一帧，动画结束后再停 GPU 循环
-    if (fluidDeactivateTimer) clearTimeout(fluidDeactivateTimer);
-    fluidDeactivateTimer = setTimeout(() => {
-      fluidDeactivateTimer = null;
-      if (!(props.isOpen && aboutVisible.value)) fluidBgRef.value?.setActive(false);
-    }, 400);
-  }
-};
-watch(aboutVisible, syncFluidActive);
-watch(() => props.isOpen, syncFluidActive);
+const aboutDisplayed = computed(() => displayedPage.value?.frame === "immersive");
+const aboutActive = computed(() => aboutDisplayed.value && pageActive.value);
+watch([aboutActive, fluidBgRef], ([active]) => fluidBgRef.value?.setActive(active), { flush: 'sync' });
+onScopeDispose(() => fluidBgRef.value?.setActive(false));
 </script>
 
 <template>
-  <SlidePage :is-open="props.isOpen" :z-index="props.zIndex">
+  <SlidePage :is-open="props.isOpen" :z-index="props.zIndex"
+    @before-leave="rememberClosingVisit" @after-leave="finishSettingsTransition">
     <div
+      ref="subpageSurface"
       class="settings-view relative flex flex-col h-full w-full bg-secondary-bg text-primary-text pointer-events-auto"
     >
       <!-- Header -->
       <header
-        class="px-4 py-3 flex items-center justify-between border-b border-white/10 pt-[calc(var(--vcp-safe-top,24px)+12px)] pb-3 shrink-0"
+        :inert="aboutDisplayed || !props.isOpen"
+        class="border-b border-white/10 pt-[calc(var(--vcp-safe-top,24px)+12px)] pb-3 shrink-0"
       >
-        <h2 class="text-xl font-bold">{{ currentSubPage ? subPageTitle : '全局设置' }}</h2>
-        <button
-          @click="currentSubPage ? goBack() : closeSettings()"
-          class="p-2 active:scale-90 transition-all flex items-center justify-center opacity-70 active:opacity-100"
-        >
-          <svg
-            v-if="currentSubPage"
-            width="22"
-            height="22"
-            viewBox="0 0 24 24"
-            fill="none"
-            stroke="currentColor"
-            stroke-width="2.5"
-            stroke-linecap="round"
-            stroke-linejoin="round"
+        <div class="flex items-center justify-between w-full min-w-0"
+          :class="activeVisit ? 'px-4' : 'mx-auto max-w-3xl px-4 sm:px-6'">
+          <h2 class="text-xl font-bold">{{ activeVisit ? subPageTitle : '全局设置' }}</h2>
+          <button
+            type="button"
+            :aria-label="activeVisit?.id === 'developer' ? '返回关于' : activeVisit ? '返回设置首页' : '关闭设置'"
+            @click="requestLeave"
+            class="min-h-11 min-w-11 p-2 transition-opacity flex items-center justify-center opacity-70 active:opacity-100"
           >
-            <path d="m15 18-6-6 6-6"/>
-          </svg>
-          <svg
-            v-else
-            width="22"
-            height="22"
-            viewBox="0 0 24 24"
-            fill="none"
-            stroke="currentColor"
-            stroke-width="2.5"
-            stroke-linecap="round"
-            stroke-linejoin="round"
-          >
-            <line x1="18" y1="6" x2="6" y2="18"></line>
-            <line x1="6" y1="6" x2="18" y2="18"></line>
-          </svg>
-        </button>
+            <svg
+              v-if="activeVisit"
+              width="22"
+              height="22"
+              viewBox="0 0 24 24"
+              fill="none"
+              stroke="currentColor"
+              stroke-width="2.5"
+              stroke-linecap="round"
+              stroke-linejoin="round"
+            >
+              <path d="m15 18-6-6 6-6"/>
+            </svg>
+            <svg
+              v-else
+              width="22"
+              height="22"
+              viewBox="0 0 24 24"
+              fill="none"
+              stroke="currentColor"
+              stroke-width="2.5"
+              stroke-linecap="round"
+              stroke-linejoin="round"
+            >
+              <line x1="18" y1="6" x2="6" y2="18"></line>
+              <line x1="6" y1="6" x2="18" y2="18"></line>
+            </svg>
+          </button>
+        </div>
       </header>
 
       <!-- Scrollable Area -->
-      <div
-        v-if="loading"
-        class="flex-1 flex items-center justify-center opacity-60 text-sm font-bold tracking-widest uppercase"
-      >
-        正在加载设置...
-      </div>
-      <!-- 子页层与主页滚动容器是兄弟：子页层若在滚动容器内，主页滚下去后点进的子页会贴在滚动内容顶部，可视区只剩空白 -->
-      <div v-else class="flex-1 relative min-h-0">
-        <div class="absolute inset-0 overflow-y-auto no-rubber-band" data-settings-scroller>
+      <div class="flex-1 min-h-0 relative overflow-hidden">
         <!-- 主页 -->
-        <div class="px-3 pt-6 pb-safe min-h-full flex flex-col gap-6">
-          <template v-for="group in SETTINGS_GROUPS" :key="group.id">
-            <!-- 低频分组整组折叠，默认收起 -->
-            <SettingsDisclosure
-              v-if="group.collapsed"
-              :title="group.title"
-              :description="group.description"
-              :data-settings-group="group.id"
-            >
-              <div class="divide-y divide-black/5 dark:divide-white/5">
-                <SettingsRow
-                  v-for="page in group.pages"
-                  :key="page.id"
-                  :title="page.title"
-                  :description="page.description"
-                  :data-settings-page="page.id"
-                  clickable
-                  @click="currentSubPage = page.id"
-                />
-              </div>
-            </SettingsDisclosure>
-            <SettingsSection
-              v-else
-              :title="group.title"
-              :description="group.description"
-              :data-settings-group="group.id"
-            >
-              <SettingsCard>
-                <div class="divide-y divide-black/5 dark:divide-white/5">
-                  <SettingsRow
-                    v-for="page in group.pages"
-                    :key="page.id"
-                    :title="page.title"
-                    :description="page.description"
-                    :data-settings-page="page.id"
-                    clickable
-                    @click="currentSubPage = page.id"
-                  />
-                </div>
-              </SettingsCard>
-            </SettingsSection>
-          </template>
+        <div :inert="!!displayedVisit || !props.isOpen"
+          class="h-full overflow-y-auto no-rubber-band">
+          <div class="mx-auto flex min-h-full w-full max-w-3xl min-w-0 flex-col px-3 pt-3 pb-[calc(16px+var(--vcp-safe-bottom,0px))] sm:px-5">
+            <p v-if="settingsStore.error" role="alert" class="shrink-0 px-1 text-sm text-red-500 break-words">
+              {{ settingsStore.error }}
+              <button type="button" class="ml-2 underline" :disabled="!homeActive || settingsStore.loading" @click="reloadSettings">重新加载</button>
+            </p>
+            <div class="shrink-0 divide-y divide-black/5 dark:divide-white/5">
+              <SettingsRow
+                v-for="cat in rootPages"
+                :key="cat.id"
+                :title="cat.title"
+                :description="cat.description"
+                clickable
+                @click="openPage(cat.id)"
+              />
+            </div>
 
-          <!-- Footer -->
-          <div class="mt-auto text-center opacity-15 text-[8px] py-8 pb-12 font-mono uppercase tracking-[0.25em] select-none">
-            VCP MOBILE // PROJECT AVATAR // 2026.04.07
+            <!-- Footer -->
+            <div class="mt-auto shrink-0 px-1 pt-6 text-center break-words opacity-15 text-[8px] font-mono uppercase tracking-[0.25em] select-none">
+              VCP MOBILE // PROJECT AVATAR // 2026.04.07
+            </div>
           </div>
-        </div>
         </div>
 
         <!-- 子页面层 -->
-        <Transition name="slide-subpage">
+        <Transition name="slide-subpage" @after-leave="finishSubpageTransition">
           <div
-            v-if="currentSubPage"
+            v-if="displayedVisit && displayedPage && displayedPage.frame !== 'immersive'"
+            v-show="pageVisible"
+            :key="displayedVisit.serial"
+            :data-settings-visit="displayedVisit.serial"
+            :inert="!pageActive"
             class="absolute inset-0 flex flex-col z-10 transition-colors duration-300 bg-[var(--primary-bg)]"
           >
-
+            <p v-if="navigationError" class="px-3 py-2 text-sm text-red-500" role="alert">{{ navigationError }}</p>
             <div
-              class="flex-1"
-              :class="currentSubPage === 'theme' || currentSubPage === 'rendering'
-                ? 'overflow-hidden flex flex-col min-h-0'
-                : 'overflow-y-auto px-3 pt-6 space-y-6 no-rubber-band pb-[calc(var(--vcp-safe-bottom,48px))]'"
+              class="flex-1 min-h-0"
+              :class="displayedPage.frame === 'viewport'
+                ? 'overflow-hidden flex flex-col'
+                : 'overflow-y-auto px-3 pt-3 no-rubber-band pb-[calc(var(--vcp-safe-bottom,0px)+32px)]'"
             >
-              <!-- 连接 · 服务器连接 -->
-              <template v-if="visibleSubPage === 'connection'">
-                <SettingsCard>
-                  <VcpCoreSettingsSection
-                    :settings="settings"
-                    @save-request="saveSettings"
-                  />
-                </SettingsCard>
-              </template>
-
-              <!-- 连接 · 配置串与备份 -->
-              <template v-if="visibleSubPage === 'configBackup'">
-                <SettingsCard>
-                  <ConfigBackupSection
-                    :settings="settings"
-                    @save-request="saveSettings"
-                    @config-imported="onConfigImported"
-                  />
-                </SettingsCard>
-              </template>
-
-              <!-- 同步 · 数据同步 -->
-              <template v-if="visibleSubPage === 'sync'">
-                <SettingsCard>
-                  <SyncSettingsSection
-                    :settings="settings"
-                    @save-request="saveSettings"
-                  />
-                </SettingsCard>
-              </template>
-
-              <!-- 聊天 · 用户身份 -->
-              <template v-if="visibleSubPage === 'identity'">
-                <UserProfileSection :settings="settings" />
-              </template>
-
-              <!-- 聊天 · 话题总结 -->
-              <template v-if="visibleSubPage === 'topicSummary'">
-                <SettingsCard>
-                  <TopicSummarySection
-                    :settings="settings"
-                    @open-model-selector="showSummaryModelSelector = true"
-                    @save-request="saveSettings"
-                  />
-                </SettingsCard>
-              </template>
-
-              <!-- [SUSPENDED BETA] 划词悬浮助手功能当前已暂停使用，相关组件与设置代码保留，入口已关闭；
-                   恢复时放入「聊天」组：
-              <template v-if="visibleSubPage === 'assistant'">
-                <SettingsCard>
-                  <AssistantSettingsSection :settings="settings" @save-request="saveSettings" />
-                </SettingsCard>
-              </template>
-              -->
-
-              <!-- 外观 · 主题切换 -->
-              <template v-if="visibleSubPage === 'theme'">
-                <ThemePicker key="theme" section="theme" />
-              </template>
-
-              <!-- 外观 · 消息渲染 -->
-              <template v-if="visibleSubPage === 'rendering'">
-                <ThemePicker key="rendering" section="rendering" />
-              </template>
-
-              <!-- 高级 · 数据维护 -->
-              <template v-if="visibleSubPage === 'maintenance'">
-                <SettingsCard>
-                  <MaintenanceSection />
-                </SettingsCard>
-              </template>
-
-              <!-- 高级 · 帮助与指引 -->
-              <template v-if="visibleSubPage === 'guide'">
-                <GuideCenterSection />
+              <div v-if="pageError" class="p-3 space-y-3">
+                <p role="alert" class="text-sm text-red-500">页面加载失败：{{ pageError }}</p>
+                <button type="button" class="min-h-11 px-3 border rounded-lg" @click="retryPage">重试</button>
+              </div>
+              <template v-else>
+                <p v-if="loading" class="p-3 text-sm opacity-60" role="status">正在加载设置…</p>
+                <PageLoadBoundary :key="`${displayedVisit.serial}:${attempt}`" :visit="displayedVisit.serial" @error="failPage">
+                  <component v-if="pageActive || loaded" :is="displayedPage.component" :ref="displayedVisit.setHandle"
+                    :active="pageActive" @back="requestLeave" />
+                </PageLoadBoundary>
               </template>
             </div>
           </div>
         </Transition>
-
-        <ModelSelector
-          v-if="summarySelectorMounted"
-          :model-value="showSummaryModelSelector"
-          @update:model-value="showSummaryModelSelector = $event"
-          :current-model="settings.topicSummaryModel"
-          title="选择总结专用模型"
-          @select="onSummaryModelSelect"
-        />
       </div>
 
       <!-- 关于页流体背景宿主：常驻保活（v-show），idle 预编译着色器，仅关于页可见时渲染 -->
       <FluidBackground
         ref="fluidBgRef"
-        v-show="aboutVisible"
+        v-show="aboutDisplayed"
         class="about-fluid z-20"
-        :class="{ 'about-fluid-active': aboutVisible }"
+        :class="{ 'about-fluid-active': aboutDisplayed && pageVisible }"
       />
 
       <!-- 关于页：独立全屏沉浸层，覆盖整个设置页（含头部），不套用子页面侧滑模板 -->
-      <Transition name="about-immersive">
-        <div v-if="aboutVisible" class="absolute inset-0 z-30">
-          <AboutSection @back="currentSubPage = null" />
+      <Transition name="about-immersive" @after-leave="finishSubpageTransition">
+        <div v-if="displayedVisit && displayedPage && aboutDisplayed" v-show="pageVisible"
+          :key="displayedVisit.serial" :data-settings-visit="displayedVisit.serial"
+          :inert="!pageActive" class="absolute inset-0 z-30">
+          <div v-if="pageError" class="p-4 pt-[calc(var(--vcp-safe-top,24px)+16px)] space-y-3">
+            <p role="alert" class="text-sm text-red-500">页面加载失败：{{ pageError }}</p>
+            <button type="button" class="min-h-11 px-3 border rounded-lg" @click="retryPage">重试</button>
+            <button type="button" class="min-h-11 px-3" @click="requestLeave">返回设置</button>
+          </div>
+          <template v-else>
+            <div v-if="loading" class="p-4 pt-[calc(var(--vcp-safe-top,24px)+16px)]">
+              <p role="status" class="text-sm opacity-60">正在加载设置…</p>
+              <button type="button" class="min-h-11" @click="requestLeave">返回设置</button>
+            </div>
+            <PageLoadBoundary :key="`${displayedVisit.serial}:${attempt}`" :visit="displayedVisit.serial" @error="failPage">
+              <component v-if="pageActive || loaded" :is="displayedPage.component" :ref="displayedVisit.setHandle"
+                :active="pageActive" @back="requestLeave" @open-developer="openDeveloper" />
+            </PageLoadBoundary>
+          </template>
         </div>
       </Transition>
     </div>
@@ -490,7 +295,7 @@ watch(() => props.isOpen, syncFluidActive);
   transform: translateX(100%);
 }
 
-/* 关于页流体背景：随 aboutVisible 淡入淡出（组件常驻保活，不受 Transition 卸载影响） */
+/* 关于页背景宿主常驻，退出期间保留画面而停止循环。 */
 .about-fluid {
   opacity: 0;
   transition: opacity 0.35s ease;

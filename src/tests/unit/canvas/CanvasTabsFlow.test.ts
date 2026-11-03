@@ -1,6 +1,7 @@
 import { describe, expect, it, vi, beforeEach } from "vitest";
 import { flushPromises } from "@vue/test-utils";
 import { mockInvoke, clearInvokeMocks } from "@/tests/mocks/tauri";
+import { mockChatNavigation } from "@/tests/helpers/chatNavigation";
 import { mountWithPinia } from "@/tests/utils/mount";
 
 vi.mock("@/features/chat/ChatView.vue", async () => {
@@ -62,6 +63,7 @@ function mockBackend() {
 describe("Canvas 标签流程", () => {
   beforeEach(() => {
     clearInvokeMocks();
+    mockChatNavigation();
     mockBackend();
   });
 

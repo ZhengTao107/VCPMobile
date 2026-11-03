@@ -11,9 +11,9 @@ import { getActivePinia } from "pinia";
  */
 
 export interface LocalMediaTargets {
-  /** settings.vcpServerUrl，端口 6005 的映射目标 */
+  /** settings.server.url，端口 6005 的映射目标 */
   vcpServerUrl?: string | null;
-  /** settings.syncHttpUrl，端口 5974 的映射目标 */
+  /** settings.sync.httpUrl，端口 5974 的映射目标 */
   syncHttpUrl?: string | null;
 }
 
@@ -73,12 +73,12 @@ const EMPTY_TARGETS: LocalMediaTargets = Object.freeze({});
 
 /**
  * 软读取当前设置：不 import settings store（避免循环依赖与测试 vi.mock 缺导出），
- * 直接读活跃 pinia 中 "settings" 的状态；无 pinia 或未加载设置时返回空目标（即不改写）。
+ * 直接读活跃 pinia 中 "settings" 的 snapshot 状态；无 pinia 或未加载设置时返回空目标（即不改写）。
  */
 export function currentLocalMediaTargets(): LocalMediaTargets {
   const pinia = getActivePinia();
-  const settings = (pinia?.state.value.settings as { settings?: LocalMediaTargets | null } | undefined)
-    ?.settings;
-  if (!settings) return EMPTY_TARGETS;
-  return { vcpServerUrl: settings.vcpServerUrl, syncHttpUrl: settings.syncHttpUrl };
+  type Snapshot = { data?: { server?: { url?: string }; sync?: { httpUrl?: string } } | null } | null;
+  const data = (pinia?.state.value.settings as { snapshot?: Snapshot } | undefined)?.snapshot?.data;
+  if (!data) return EMPTY_TARGETS;
+  return { vcpServerUrl: data.server?.url, syncHttpUrl: data.sync?.httpUrl };
 }

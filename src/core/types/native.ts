@@ -1,14 +1,16 @@
-export interface PermissionStatusDto {
-  notification: boolean;
+export const androidStartupPermissionIds = ['notification', 'battery', 'backgroundAllowed', 'notificationListener'] as const;
+export type AndroidStartupPermission = typeof androidStartupPermissionIds[number];
+
+// null means Android cannot evaluate this item on the current device/profile.
+export interface PermissionStatusDto extends Record<AndroidStartupPermission, boolean | null> {
   storage: boolean;
-  battery: boolean;
   microphone: boolean;
   camera: boolean;
   location: boolean;
 }
 
-export interface ListenerPermissionDto {
-  enabled: boolean;
+export function hasMissingStartupPermission(status: PermissionStatusDto): boolean {
+  return androidStartupPermissionIds.some(id => status[id] === false);
 }
 
 export interface DiskSpaceDto {
@@ -28,12 +30,18 @@ export interface BatteryStatusDto {
 }
 
 export interface NativeFileStartDetail {
+  operationId?: string;
+  selectionIndex?: number;
+  selectionCount?: number;
   name: string;
   size: number;
   mime: string;
 }
 
 export interface NativeFileProgressDetail {
+  operationId?: string;
+  selectionIndex?: number;
+  selectionCount?: number;
   name: string;
   mime: string;
   loaded: number;

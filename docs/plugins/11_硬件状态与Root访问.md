@@ -7,15 +7,15 @@ date: 2026-10-09
 related_files:
   - src-tauri/plugins/vcp-mobile/src/system.rs
   - src-tauri/plugins/vcp-mobile/android/src/main/java/com/vcp/mobile/VcpMobilePlugin.kt
-  - src-tauri/plugins/vcp-mobile/android/src/main/java/com/vcp/mobile/CpuStatusManager.kt
-  - src-tauri/plugins/vcp-mobile/android/src/main/java/com/vcp/mobile/GpuStatusManager.kt
-  - src-tauri/plugins/vcp-mobile/android/src/main/java/com/vcp/mobile/NetworkStatusManager.kt
+  - src-tauri/plugins/vcp-mobile/android/src/main/java/com/vcp/mobile/device/CpuStatusManager.kt
+  - src-tauri/plugins/vcp-mobile/android/src/main/java/com/vcp/mobile/device/GpuStatusManager.kt
+  - src-tauri/plugins/vcp-mobile/android/src/main/java/com/vcp/mobile/device/NetworkStatusManager.kt
   - src-tauri/plugins/vcp-mobile/android/src/main/AndroidManifest.xml
 ---
 
 # 硬件状态与 Root 访问
 
-> 当前 iOS 设备查询位于 [NativeDevice.swift](../../src-tauri/plugins/vcp-mobile/ios/Sources/NativeDevice.swift)，传感器请求位于 [NativeSensors.swift](../../src-tauri/plugins/vcp-mobile/ios/Sources/NativeSensors.swift)。前者提供 UIDevice/ProcessInfo/Mach 的设备、CPU/内存/热状态，Metal 设备名称及按次 NWPath/接口地址快照；后者持有串行 CoreLocation/CoreMotion 采样。`get_device_snapshot` 是 Rust 内部设备工具入口，不是前端能力查询。无法取得的字段由共享 DTO 的 `unavailable` 说明；下文 EGL、sysfs、ConnectivityManager 与 Root 流程描述 Android 实现，host fixture 不进入 iOS 分支。
+> 当前 iOS 设备查询位于 [NativeDevice.swift](../../src-tauri/plugins/vcp-mobile/ios/Sources/Device/NativeDevice.swift)，传感器请求位于 [NativeSensors.swift](../../src-tauri/plugins/vcp-mobile/ios/Sources/Device/NativeSensors.swift)。前者提供 UIDevice/ProcessInfo/Mach 的设备、CPU/内存/热状态，Metal 设备名称及按次 NWPath/接口地址快照；后者持有串行 CoreLocation/CoreMotion 采样。`get_device_snapshot` 是 Rust 内部设备工具入口，不是前端能力查询。无法取得的字段由共享 DTO 的 `unavailable` 说明；下文 EGL、sysfs、ConnectivityManager 与 Root 流程描述 Android 实现，host fixture 不进入 iOS 分支。
 
 ## 1. 功能概述
 
@@ -69,7 +69,7 @@ VcpMobilePlugin.kt（硬件状态与 Root 相关部分）
 
 ## 3. CpuStatusManager —— CPU 热状态分级
 
-> 源码：`src-tauri/plugins/vcp-mobile/android/src/main/java/com/vcp/mobile/CpuStatusManager.kt`（38 行）
+> 源码：`src-tauri/plugins/vcp-mobile/android/src/main/java/com/vcp/mobile/device/CpuStatusManager.kt`（38 行）
 
 ### 3.1 概述
 
@@ -152,7 +152,7 @@ Rust 解包 ThermalResponse { status } → Result<String, String>
 
 ## 4. GpuStatusManager —— GPU 硬件信息拉取
 
-> 源码：`src-tauri/plugins/vcp-mobile/android/src/main/java/com/vcp/mobile/GpuStatusManager.kt`（84 行）
+> 源码：`src-tauri/plugins/vcp-mobile/android/src/main/java/com/vcp/mobile/device/GpuStatusManager.kt`（84 行）
 
 ### 4.1 概述
 
@@ -243,7 +243,7 @@ fun getGpuRenderer(): String {
 
 ## 5. NetworkStatusManager —— 网络连接与带宽状态
 
-> 源码：`src-tauri/plugins/vcp-mobile/android/src/main/java/com/vcp/mobile/NetworkStatusManager.kt`（86 行）
+> 源码：`src-tauri/plugins/vcp-mobile/android/src/main/java/com/vcp/mobile/device/NetworkStatusManager.kt`（86 行）
 
 ### 5.1 概述
 

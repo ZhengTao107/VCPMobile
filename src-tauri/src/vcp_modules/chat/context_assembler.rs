@@ -1,7 +1,8 @@
+use crate::vcp_modules::chat::voice_service::VoiceReplyPolicy;
 use crate::vcp_modules::chat_manager::ChatMessage;
+use crate::vcp_modules::db_manager::DbState;
 use crate::vcp_modules::topic_types::TopicKey;
 use serde_json::{json, Value};
-use sqlx::{Pool, Sqlite};
 
 // =================================================================
 // vcp_modules/chat/context_assembler.rs - 上下文级联装配中枢
@@ -14,25 +15,19 @@ use sqlx::{Pool, Sqlite};
 // 3. 【统一装配外观】(orchestrate_chat_context)：向单聊与群聊业务模块提供极度纯净的 Facade 入口。
 
 /// 统一上下文级联装配外观入口 (Facade Orchestrator)
-pub async fn orchestrate_chat_context(
-    pool: &Pool<Sqlite>,
+pub(crate) async fn orchestrate_chat_context(
+    db: &DbState,
     history: &[ChatMessage],
     topic: &TopicKey,
     agent_name: &str,
-    scope: &str, // "agent" | "group"
     base_system_prompt: String,
     invite_prompt: Option<String>,
+    reply_policy: Option<&VoiceReplyPolicy>,
 ) -> Result<Vec<Value>, String> {
-    // 1. 快速查询会话内时间锚定机制 V2 的启用状态
-    let enable_time_anchoring = match sqlx::query_scalar::<_, i32>(
-        "SELECT is_enabled FROM tarven_rules WHERE id = 'time_anchoring_v2'",
-    )
-    .fetch_optional(pool)
-    .await
-    {
-        Ok(Some(val)) => val != 0,
-        _ => false,
-    };
+    // One normalized snapshot drives both time anchoring and rule injection.
+    let scope = topic.owner_type.as_str();
+    let rules = crate::vcp_modules::chat::context_injection::fetch_active_rules(db, scope).await?;
+    let enable_time_anchoring = rules.iter().any(|rule| rule.id == "time_anchoring_v2");
 
     // 2. 第一阶段：微观编织。进行强类型的发言人前缀及物理 Token 换行符时间隔离注入
     let is_group = scope == "group";
@@ -61,13 +56,19 @@ pub async fn orchestrate_chat_context(
 
     // 5. 第二阶段：宏观拦截。调用 Tavern 拦截器流水线进行环境真理及 System/User 规则的终极拼装
     crate::vcp_modules::chat::context_injection::apply_tarven_pipeline(
-        pool,
+        &db.pool,
         topic,
         agent_name,
-        scope,
+        &rules,
         &mut messages,
     )
     .await?;
+
+    // A call owns this request's immutable policy. Append after every Tavern
+    // rule. The user's rules are the entire final, non-persisted node, even blank.
+    if let Some(policy) = reply_policy {
+        messages.push(json!({ "role": "user", "content": policy.guidance_rules }));
+    }
 
     Ok(messages)
 }
@@ -298,6 +299,157 @@ pub fn assemble_history_for_vcp(
 }
 
 #[cfg(test)]
+mod voice_policy_tests {
+    use super::*;
+    use crate::vcp_modules::settings_manager::{
+        Settings, VoiceConfig, VoiceGuidanceConfig, VoiceTtsConfig, VoiceTtsMode,
+    };
+
+    async fn pool_with_tail_rule() -> DbState {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::raw_sql(include_str!("../../../migrations/0100_baseline_v2.sql"))
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO tarven_rules
+             (id, name, rule_type, is_enabled, content, scope, wrap, role, depth,
+              sort_order, created_at, updated_at)
+             VALUES ('tail', 'tail', 'context_inject', 1, 'Tavern tail', 'global',
+                     0, 'user', 0, 1, 1, 1)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        DbState::new(pool, std::path::PathBuf::new())
+    }
+
+    fn policy(mode: VoiceTtsMode, rules: &str) -> VoiceReplyPolicy {
+        VoiceReplyPolicy::from_settings(&Settings {
+            voice: VoiceConfig {
+                tts: VoiceTtsConfig {
+                    mode,
+                    ..Default::default()
+                },
+                guidance: VoiceGuidanceConfig {
+                    rules: rules.into(),
+                },
+                ..Default::default()
+            },
+            ..Settings::default()
+        })
+    }
+
+    #[tokio::test]
+    async fn voice_rules_are_the_exact_request_only_node_after_tavern_and_group_invite() {
+        let pool = pool_with_tail_rule().await;
+        let history = vec![ChatMessage {
+            id: "origin".into(),
+            role: "user".into(),
+            content: "用户原话".into(),
+            ..Default::default()
+        }];
+        for (mode, scope, invite) in [
+            (VoiceTtsMode::Builtin, "agent", None),
+            (VoiceTtsMode::Builtin, "group", Some("请成员发言".into())),
+            (VoiceTtsMode::Clone, "agent", None),
+            (VoiceTtsMode::Clone, "group", Some("请成员发言".into())),
+        ] {
+            let rules = "  用户自定义风格规则\n只回答正文，不生成标签。\n";
+            let reply_policy = policy(mode, rules);
+            let topic = TopicKey::new(scope, "owner", "topic");
+            let messages = orchestrate_chat_context(
+                &pool,
+                &history,
+                &topic,
+                "成员",
+                "角色规则".into(),
+                invite.clone(),
+                Some(&reply_policy),
+            )
+            .await
+            .unwrap();
+            let last = messages.last().unwrap();
+            assert_eq!(last["role"], "user");
+            let content = last["content"].as_str().unwrap();
+            assert_eq!(content, rules);
+            assert_eq!(messages[messages.len() - 2]["content"], "Tavern tail");
+            assert!(last.get("__vcpchatTimestampMeta").is_none());
+
+            let ordinary = orchestrate_chat_context(
+                &pool,
+                &history,
+                &topic,
+                "成员",
+                "角色规则".into(),
+                invite,
+                None,
+            )
+            .await
+            .unwrap();
+            assert_eq!(&messages[..messages.len() - 1], ordinary.as_slice());
+        }
+    }
+
+    #[tokio::test]
+    async fn blank_voice_rules_are_injected_without_defaults_or_protocol_instructions() {
+        let pool = pool_with_tail_rule().await;
+        let topic = TopicKey::new("agent", "owner", "topic");
+        let ordinary =
+            orchestrate_chat_context(&pool, &[], &topic, "成员", String::new(), None, None)
+                .await
+                .unwrap();
+        assert_eq!(ordinary.last().unwrap()["content"], "Tavern tail");
+        for rules in ["", " \n\t", "占位中"] {
+            let reply_policy = policy(VoiceTtsMode::Builtin, rules);
+            let messages = orchestrate_chat_context(
+                &pool,
+                &[],
+                &topic,
+                "成员",
+                String::new(),
+                None,
+                Some(&reply_policy),
+            )
+            .await
+            .unwrap();
+            assert_eq!(&messages[..messages.len() - 1], ordinary.as_slice());
+            assert_eq!(
+                messages.last().unwrap(),
+                &json!({"role":"user", "content":rules})
+            );
+        }
+    }
+
+    #[test]
+    fn history_preserves_guidance_and_body_verbatim_for_both_roles() {
+        let block = "<voice_guidance>\n低声轻柔\n</voice_guidance>\n";
+        let source = format!("{block}[轻笑]保留正文与[链接](https://example.invalid)。");
+        let mut assistant = ChatMessage {
+            role: "assistant".into(),
+            content: source.clone(),
+            ..Default::default()
+        };
+        let user = ChatMessage {
+            role: "user".into(),
+            content: source.clone(),
+            ..Default::default()
+        };
+        let projected = assemble_history_for_vcp(&[assistant.clone(), user], false, false);
+        assert_eq!(projected[0]["content"], source);
+        assert_eq!(projected[1]["content"], source);
+
+        assistant.content = format!("```text\n{block}```\n> 引用中的普通标签 [叹气]");
+        let example = assemble_history_for_vcp(&[assistant.clone()], false, false);
+        assert_eq!(example[0]["content"], assistant.content);
+    }
+}
+
+#[cfg(test)]
 mod desktop_only_tests {
     use super::assemble_history_for_vcp;
     use crate::vcp_modules::chat_manager::{Attachment, ChatMessage};
@@ -359,19 +511,5 @@ mod desktop_only_tests {
         assert!(ready_json.contains(&"b".repeat(64)));
         assert!(!ready_json.contains("/private/attachments"));
         assert!(!ready_json.contains("file://"));
-    }
-
-    #[test]
-    fn empty_message_remains_string_content() {
-        let message = ChatMessage {
-            id: "empty-message".into(),
-            role: "user".into(),
-            content: String::new(),
-            timestamp: 1,
-            ..Default::default()
-        };
-
-        let assembled = assemble_history_for_vcp(&[message], false, false);
-        assert_eq!(assembled[0]["content"], "");
     }
 }

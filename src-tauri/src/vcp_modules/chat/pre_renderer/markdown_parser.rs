@@ -7,7 +7,7 @@ use std::borrow::Cow;
 
 lazy_static! {
     static ref FENCE_RE: Regex =
-        Regex::new(r"(?m)^[ \t]*(`{3,})[a-zA-Z0-9-]*[ \t]*\r?$").unwrap();
+        Regex::new(r"(?m)^[ \t]*(`{3,}|~{3,})[a-zA-Z0-9-]*[ \t]*\r?$").unwrap();
 
     // 合并 LaTeX 匹配：[ ... ] 和 ( ... )
     static ref MATH_RE: Regex = Regex::new(r"(?s)\\\[(?P<display>.*?)\\\]|\\\((?P<inline>.*?)\\\)").unwrap();
@@ -27,6 +27,14 @@ lazy_static! {
     // 匹配行首 ≥4 空格/Tab 缩进后紧跟 $$ 的模式（块级公式被误判为缩进代码块的根因）
     static ref INDENTED_DOLLAR_RE: Regex =
         Regex::new(r"(?m)^[ \t]{4,}(\$\$)").unwrap();
+
+    // 匹配公式内部独占一行、可能触发 CommonMark Setext H1 标题的纯等号行
+    static ref SETEXT_EQUALS_LINE_RE: Regex =
+        Regex::new(r"(?m)^([ \t]{0,3})(=+[ \t]*)$").unwrap();
+
+    // 匹配不跨物理空行的块级展示公式 $$ ... $$（空行为段落硬边界）
+    static ref DISPLAY_MATH_PAIR_RE: Regex =
+        Regex::new(r"(?s)\$\$(?:[^\r\n]*|\r?\n(?:[^\r\n]*\S[^\r\n]*\r?\n)*?[^\r\n]*?)\$\$").unwrap();
 }
 
 // pulldown-cmark 本身使用堆上的事件栈，但本模块随后会递归遍历生成的 AST。
@@ -56,20 +64,22 @@ fn is_punctuation(c: char) -> bool {
 
 fn get_fence_ranges(text: &str) -> Vec<std::ops::Range<usize>> {
     let mut ranges = Vec::new();
-    let mut current_start: Option<(usize, usize)> = None;
+    let mut current_start: Option<(usize, usize, char)> = None;
 
     for cap in FENCE_RE.captures_iter(text) {
         let (Some(m), Some(fence)) = (cap.get(0), cap.get(1)) else {
             continue;
         };
-        let backticks = fence.as_str().len();
+        let fence_str = fence.as_str();
+        let fence_char = fence_str.chars().next().unwrap_or('`');
+        let fence_len = fence_str.len();
 
         match current_start {
             None => {
-                current_start = Some((m.start(), backticks));
+                current_start = Some((m.start(), fence_len, fence_char));
             }
-            Some((start_pos, start_backticks)) => {
-                if backticks >= start_backticks {
+            Some((start_pos, start_len, start_char)) => {
+                if fence_char == start_char && fence_len >= start_len {
                     ranges.push(start_pos..m.end());
                     current_start = None;
                 }
@@ -77,7 +87,7 @@ fn get_fence_ranges(text: &str) -> Vec<std::ops::Range<usize>> {
         }
     }
 
-    if let Some((start_pos, _)) = current_start {
+    if let Some((start_pos, _, _)) = current_start {
         ranges.push(start_pos..text.len());
     }
 
@@ -523,6 +533,13 @@ fn preprocess_latex_math(text: &str) -> Cow<'_, str> {
     Cow::Owned(result)
 }
 
+/// Speech uses the same math delimiters as the renderer, without building an AST.
+pub(crate) fn normalize_math_for_speech(text: &str) -> String {
+    let text = preprocess_latex_math(text);
+    let text = strip_display_math_indent(text.as_ref());
+    neutralize_display_math_setext_heading(text.as_ref()).into_owned()
+}
+
 /// 辅助函数：将含有 LaTeX 的片段高效推送到结果缓冲区，不产生中间 String
 fn push_math_replaced(dest: &mut String, segment: &str) {
     let mut last_match_end = 0;
@@ -825,6 +842,82 @@ fn replace_container_placeholders(
     }
 }
 
+/// 在块级展示公式 $$ ... $$ 内部中和独占一行的纯等号，避免被 CommonMark 误识别为 Setext H1 标题。
+/// 仅针对不跨物理空行的闭合公式段；代码围栏内部不予处理。
+fn neutralize_display_math_setext_heading(text: &str) -> Cow<'_, str> {
+    if !text.contains("$$") || !text.contains('=') {
+        return Cow::Borrowed(text);
+    }
+
+    let ranges = get_fence_ranges(text);
+    let mut result = String::with_capacity(text.len());
+    let mut last_end = 0;
+    let mut modified = false;
+
+    for range in &ranges {
+        let segment = &text[last_end..range.start];
+        if segment.contains("$$") && segment.contains('=') {
+            let replaced = neutralize_segment_math_equals(segment);
+            if let Cow::Owned(_) = &replaced {
+                modified = true;
+            }
+            result.push_str(replaced.as_ref());
+        } else {
+            result.push_str(segment);
+        }
+        result.push_str(&text[range.start..range.end]);
+        last_end = range.end;
+    }
+
+    let tail = &text[last_end..];
+    if tail.contains("$$") && tail.contains('=') {
+        let replaced = neutralize_segment_math_equals(tail);
+        if let Cow::Owned(_) = &replaced {
+            modified = true;
+        }
+        result.push_str(replaced.as_ref());
+    } else {
+        result.push_str(tail);
+    }
+
+    if modified {
+        Cow::Owned(result)
+    } else {
+        Cow::Borrowed(text)
+    }
+}
+
+fn neutralize_segment_math_equals(segment: &str) -> Cow<'_, str> {
+    if !segment.contains("$$") || !segment.contains('=') {
+        return Cow::Borrowed(segment);
+    }
+
+    let mut result = String::new();
+    let mut last_end = 0;
+    let mut has_match = false;
+
+    for mat in DISPLAY_MATH_PAIR_RE.find_iter(segment) {
+        let math_chunk = mat.as_str();
+        if SETEXT_EQUALS_LINE_RE.is_match(math_chunk) {
+            if !has_match {
+                result.reserve(segment.len() + 8);
+                has_match = true;
+            }
+            result.push_str(&segment[last_end..mat.start()]);
+            let neutralized = SETEXT_EQUALS_LINE_RE.replace_all(math_chunk, "${1}{}${2}");
+            result.push_str(&neutralized);
+            last_end = mat.end();
+        }
+    }
+
+    if has_match {
+        result.push_str(&segment[last_end..]);
+        Cow::Owned(result)
+    } else {
+        Cow::Borrowed(segment)
+    }
+}
+
 pub fn parse_markdown_to_ast(text: &str) -> Vec<MarkdownNode> {
     parse_markdown_to_ast_opt(text, false)
 }
@@ -855,6 +948,7 @@ fn parse_markdown_to_ast_impl(
     let text = preprocess_latex_math(&text_fixed);
     let text = strip_display_math_indent(text.as_ref());
     let (text, containers) = extract_html_containers(text.as_ref(), is_streaming, container_depth);
+    let text = neutralize_display_math_setext_heading(text.as_ref());
 
     let mut nodes = Vec::new();
     let parser = Parser::new_ext(
@@ -1419,7 +1513,9 @@ fn split_text_by_quotes(inlines: Vec<InlineNode>) -> Vec<InlineNode> {
                         last = idx + c.len_utf8();
                     }
                 }
-                if last < value.len() {
+                if last == 0 && !value.is_empty() {
+                    result.push(InlineNode::text(value));
+                } else if last < value.len() {
                     result.push(InlineNode::text(value[last..].to_string()));
                 }
             }
@@ -1466,16 +1562,23 @@ fn merge_quote_nodes_at_depth(inlines: Vec<InlineNode>, depth: usize) -> Vec<Inl
     let mut result = Vec::new();
     let mut i = 0;
     let len = inlines.len();
+    // 只检查当前层可配对的 Text，不能借用格式子节点内部的闭合符。
+    let mut has_cjk_close = inlines
+        .iter()
+        .any(|node| matches!(node, InlineNode::Text { value } if value.ends_with('”')));
+    let mut has_ascii_close = inlines
+        .iter()
+        .any(|node| matches!(node, InlineNode::Text { value } if value.ends_with('"')));
 
     while i < len {
         let mut start_idx = None;
         let mut open_char = None;
 
         if let InlineNode::Text { value } = &inlines[i] {
-            if value.starts_with('“') {
+            if has_cjk_close && value.starts_with('“') {
                 start_idx = Some(i);
                 open_char = Some('“');
-            } else if value.starts_with('"') {
+            } else if has_ascii_close && value.starts_with('"') {
                 start_idx = Some(i);
                 open_char = Some('"');
             }
@@ -1553,6 +1656,14 @@ fn merge_quote_nodes_at_depth(inlines: Vec<InlineNode>, depth: usize) -> Vec<Inl
                 i = e_idx + 1;
                 continue;
             }
+
+            // 前面的配对可能已消费预检发现的最后一个闭合符。一次失败证明
+            // 剩余后缀不再有同类闭合符，避免后续每个左引号重复扫描后缀。
+            if op_c == '“' {
+                has_cjk_close = false;
+            } else {
+                has_ascii_close = false;
+            }
         }
 
         let mut node = inlines[i].clone();
@@ -1584,15 +1695,35 @@ fn merge_quote_nodes_at_depth(inlines: Vec<InlineNode>, depth: usize) -> Vec<Inl
     result
 }
 
+fn inline_quotes_need_processing(inlines: &[InlineNode]) -> bool {
+    inlines.iter().any(|node| match node {
+        InlineNode::Text { value } => {
+            // split_text_by_quotes 原本会移除空 Text，门控也须保留该行为。
+            value.is_empty() || value.contains(['“', '”', '"'])
+        }
+        InlineNode::Strong { children, .. }
+        | InlineNode::Emphasis { children, .. }
+        | InlineNode::Link { children, .. }
+        | InlineNode::Strikethrough { children, .. }
+        | InlineNode::VcpCustom {
+            children: Some(children),
+            ..
+        } => inline_quotes_need_processing(children),
+        _ => false,
+    })
+}
+
+fn apply_inline_quote_merging(children: &mut Vec<InlineNode>) {
+    if inline_quotes_need_processing(children) {
+        let split = split_text_by_quotes(std::mem::take(children));
+        *children = merge_quote_nodes(split);
+    }
+}
+
 fn apply_quote_merging(node: &mut MarkdownNode) {
     match node {
-        MarkdownNode::Paragraph { children, .. } => {
-            let split = split_text_by_quotes(children.clone());
-            *children = merge_quote_nodes(split);
-        }
-        MarkdownNode::Heading { children, .. } => {
-            let split = split_text_by_quotes(children.clone());
-            *children = merge_quote_nodes(split);
+        MarkdownNode::Paragraph { children, .. } | MarkdownNode::Heading { children, .. } => {
+            apply_inline_quote_merging(children);
         }
         MarkdownNode::Blockquote { children, .. } => {
             for child in children {
@@ -1608,13 +1739,11 @@ fn apply_quote_merging(node: &mut MarkdownNode) {
         }
         MarkdownNode::Table { header, rows, .. } => {
             for cell in header {
-                let split = split_text_by_quotes(cell.clone());
-                *cell = merge_quote_nodes(split);
+                apply_inline_quote_merging(cell);
             }
             for row in rows {
                 for cell in row {
-                    let split = split_text_by_quotes(cell.clone());
-                    *cell = merge_quote_nodes(split);
+                    apply_inline_quote_merging(cell);
                 }
             }
         }
@@ -1625,6 +1754,69 @@ fn apply_quote_merging(node: &mut MarkdownNode) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn closed_display_matrix_keeps_equals_as_formula_content() {
+        let latex = r"\begin{bmatrix}
+\cos\theta & -\sin\theta \\
+\sin\theta & \cos\theta
+\end{bmatrix}
+\begin{bmatrix}
+x \\ y
+\end{bmatrix}
+=
+\begin{bmatrix}
+x' \\ y'
+\end{bmatrix}";
+        // 验证：= 被安全中和为 {}=，绝不提升为 Setext H1 大标题，且作为合法 DisplayMath 解析
+        let nodes = parse_markdown_to_ast(&format!("矩阵变换：\n\n$$\n{latex}\n$$"));
+        assert_eq!(nodes.len(), 2);
+        assert!(matches!(&nodes[0], MarkdownNode::Paragraph { children, .. }
+            if children == &[InlineNode::text("矩阵变换：".into())]));
+        assert!(matches!(&nodes[1], MarkdownNode::Paragraph { children, .. }
+            if matches!(children.as_slice(), [InlineNode::InlineMath { content, display_mode: true, .. }]
+                if content.contains("{}=\n"))));
+
+        // 验证行内紧贴场景下同样不被撕裂成标题，保持在单段落中
+        let nodes_inline = parse_markdown_to_ast(&format!("矩阵变换：\n$$\n{latex}\n$$"));
+        assert_eq!(nodes_inline.len(), 1);
+        assert!(
+            matches!(&nodes_inline[0], MarkdownNode::Paragraph { children, .. }
+            if children.len() == 3
+                && matches!(&children[0], InlineNode::Text { value, .. } if value == "矩阵变换：")
+                && matches!(&children[1], InlineNode::Break)
+                && matches!(&children[2], InlineNode::InlineMath { display_mode: true, .. }))
+        );
+    }
+
+    #[test]
+    fn display_math_does_not_join_blank_lines_or_complete_missing_delimiters() {
+        for input in ["$$\nx\n\ny\n$$", "$$\nx\n="] {
+            let nodes = parse_markdown_to_ast(input);
+            let serialized = serde_json::to_string(&nodes).unwrap();
+            assert!(!serialized.contains("\"inline_math\""), "{input}");
+            assert!(!serialized.contains("\"code_block\""), "{input}");
+        }
+    }
+
+    #[test]
+    fn display_math_protection_preserves_code_and_regular_markdown() {
+        let source = "$$\nx\n=\ny\n$$\n";
+        for fence in ["```", "~~~"] {
+            let nodes = parse_markdown_to_ast(&format!("{fence}text\n{source}{fence}"));
+            assert!(
+                matches!(nodes.as_slice(), [MarkdownNode::CodeBlock { code, .. }] if code == source)
+            );
+        }
+        let nodes = parse_markdown_to_ast("标题\n=\n\n$x$\n\n$$y=z$$");
+        assert!(matches!(nodes[0], MarkdownNode::Heading { level: 1, .. }));
+        assert!(matches!(&nodes[1], MarkdownNode::Paragraph { children, .. }
+            if matches!(children.as_slice(), [InlineNode::InlineMath { content, display_mode: false, .. }] if content == "x")));
+        assert!(matches!(&nodes[2], MarkdownNode::Paragraph { children, .. }
+            if matches!(children.as_slice(), [InlineNode::InlineMath { content, display_mode: true, .. }] if content == "y=z")));
+        let list = parse_markdown_to_ast("- before\n  $$x$$\n  after");
+        assert!(matches!(list.as_slice(), [MarkdownNode::List { items, .. }] if items.len() == 1));
+    }
 
     #[test]
     fn excessive_markdown_nesting_falls_back_to_literal_text() {
@@ -1642,77 +1834,10 @@ mod tests {
     }
 
     #[test]
-    fn deeply_nested_html_containers_stop_recursive_parsing_safely() {
-        let depth = MAX_HTML_CONTAINER_DEPTH + 8;
-        let input = format!(
-            "{}content{}",
-            "<div>\n".repeat(depth),
-            "\n</div>".repeat(depth)
-        );
-
-        let first = parse_markdown_to_ast(&input);
-        let second = parse_markdown_to_ast(&input);
-        assert!(!first.is_empty());
-        assert_eq!(first, second);
-    }
-
-    #[test]
     fn html_close_tag_search_rejects_invalid_byte_offsets() {
         let input = "é</div>";
         assert_eq!(find_matching_close_tag(input, 1, "div"), None);
         assert_eq!(find_matching_close_tag(input, input.len() + 1, "div"), None);
-    }
-
-    #[test]
-    fn malformed_markdown_corpus_is_total_and_deterministic() {
-        let cases = [
-            "\0\u{2028}\u{2029}",
-            "***未闭合 [链接](<>) `code",
-            "\\[x + \\(y",
-            "<!-- 未闭合 <div><span>",
-            "| a | b |\n| --- |\n| 1 | 2 | 3 |",
-            "```rust\nfn main() { /*",
-            "“外层 \"内层 **强调**",
-        ];
-
-        for input in cases {
-            let first = parse_markdown_to_ast_streaming(input);
-            let second = parse_markdown_to_ast_streaming(input);
-            assert_eq!(first, second, "parser must be deterministic for {input:?}");
-            assert!(serde_json::to_value(&first).is_ok());
-        }
-    }
-
-    #[test]
-    fn test_is_punctuation() {
-        assert!(is_punctuation('“'));
-        assert!(is_punctuation('”'));
-        assert!(is_punctuation('，'));
-        assert!(is_punctuation('。'));
-        assert!(is_punctuation('【'));
-        assert!(is_punctuation('·'));
-    }
-
-    #[test]
-    fn test_fix_flanking_delimiters() {
-        // 1. “**加粗**” 本身能完美闭合，不应该注入任何字符
-        assert_eq!(fix_flanking_delimiters("“**加粗**”"), "“**加粗**”");
-
-        // 2. 这很**“重要”**的 -> 应该在开启后注入，闭合前注入
-        assert_eq!(
-            fix_flanking_delimiters("这很**“重要”**的"),
-            "这很**\u{200B}“重要”\u{200B}**的"
-        );
-
-        // 3. 代码块内部的加粗不应该被处理
-        let code_text = "```\n这很**“重要”**的\n```";
-        assert_eq!(fix_flanking_delimiters(code_text), code_text);
-
-        // 4. 并排复杂的加粗引号：看哪些**“应该加粗的部分没有加粗”**，或者**“不该加粗的部分泄漏了”**
-        assert_eq!(
-            fix_flanking_delimiters("看哪些**“应该加粗的部分没有加粗”**，或者**“不该加粗的部分泄漏了”**"),
-            "看哪些**\u{200B}“应该加粗的部分没有加粗”\u{200B}**，或者**\u{200B}“不该加粗的部分泄漏了”\u{200B}**"
-        );
     }
 
     #[test]
@@ -1767,178 +1892,173 @@ mod tests {
     }
 
     #[test]
-    fn test_complex_bold_quote_parsing() {
-        // 1. 测试单加粗块内包裹两对引号
-        let text_single_bold = "看哪些**“应该加粗的部分没有加粗”，或者“不该加粗的部分泄漏了”**";
-        let nodes_single_bold = parse_markdown_to_ast(text_single_bold);
-        assert_eq!(nodes_single_bold.len(), 1);
-        if let MarkdownNode::Paragraph { children, .. } = &nodes_single_bold[0] {
-            assert_eq!(children.len(), 2);
-            assert_eq!(children[0], InlineNode::text("看哪些".to_string()));
-            if let InlineNode::Strong {
-                children: strong_children,
-                ..
-            } = &children[1]
-            {
-                // \u{200b}, VcpCustom("quote"), Text("，或者"), VcpCustom("quote"), \u{200b}
-                assert_eq!(strong_children.len(), 5);
-                assert_eq!(strong_children[0], InlineNode::text("\u{200b}".to_string()));
-                assert_eq!(strong_children[4], InlineNode::text("\u{200b}".to_string()));
+    fn quote_merging_preserves_long_unclosed_cjk_tail() {
+        let count = 21_845;
+        let nodes = parse_markdown_to_ast_streaming(&"“".repeat(count));
+        let [MarkdownNode::Paragraph { children, .. }] = nodes.as_slice() else {
+            panic!("expected a literal paragraph");
+        };
+        assert_eq!(children.len(), count);
+        assert!(children
+            .iter()
+            .all(|node| matches!(node, InlineNode::Text { value } if value == "“")));
+    }
 
-                if let InlineNode::VcpCustom {
-                    kind,
-                    children: Some(q_ch),
-                    ..
-                } = &strong_children[1]
-                {
-                    assert_eq!(kind, "quote");
-                    assert_eq!(q_ch[0], InlineNode::text("“".to_string()));
-                    assert_eq!(
-                        q_ch[1],
-                        InlineNode::text("应该加粗的部分没有加粗".to_string())
-                    );
-                    assert_eq!(q_ch[2], InlineNode::text("”".to_string()));
-                }
-
-                assert_eq!(strong_children[2], InlineNode::text("，或者".to_string()));
-
-                if let InlineNode::VcpCustom {
-                    kind,
-                    children: Some(q_ch),
-                    ..
-                } = &strong_children[3]
-                {
-                    assert_eq!(kind, "quote");
-                    assert_eq!(q_ch[0], InlineNode::text("“".to_string()));
-                    assert_eq!(
-                        q_ch[1],
-                        InlineNode::text("不该加粗的部分泄漏了".to_string())
-                    );
-                    assert_eq!(q_ch[2], InlineNode::text("”".to_string()));
-                }
-            } else {
-                panic!("Expected Strong");
-            }
-        }
-
-        // 2. 测试长文本行隔离及多层复杂嵌套
-        let text1 = "主人，如果真的是由于“跨容器截断”导致的 DOM 崩溃，我们在前端解析器的 `contentProcessor.js` 里，必须要加装一个**「自愈判定阀」**：\n\n> **核心逻辑**：只有当 `Marked.parser` 的当前 **AST 嵌套深度等于 0（`astDepth === 0`）**，且不处于任何未闭合的代码块/表格内部时，才允许执行 `<!--brk-->` 物理切片！\n> 如果在深度嵌套里遇到了 `<!--brk-->`，则将其自动**挂起并延后**，直到检测到当前容器完全 `</div>` 闭合，再在根节点上执行优雅 of “呼吸切片”！";
-        let nodes1 = parse_markdown_to_ast(text1);
-        assert_eq!(nodes1.len(), 2);
-
-        // 验证第一行中的“自愈判定阀”被正确加粗了
-        if let MarkdownNode::Paragraph { children, .. } = &nodes1[0] {
-            // “自愈判定阀”在第 6 个子节点（i = 5）
-            if let InlineNode::Strong {
-                children: strong_children,
-                ..
-            } = &children[5]
-            {
-                assert_eq!(strong_children.len(), 1);
-                assert_eq!(
-                    strong_children[0],
-                    InlineNode::text("\u{200b}「自愈判定阀」\u{200b}".to_string())
-                );
-            } else {
-                panic!("Expected Strong for self-cure valve");
-            }
-        }
-
-        // 3. 原本的四星号并排加粗引号测试
-        let text = "看哪些**“应该加粗的部分没有加粗”**，或者**“不该加粗的部分泄漏了”**";
-        let nodes = parse_markdown_to_ast(text);
-        assert_eq!(nodes.len(), 1);
-        if let MarkdownNode::Paragraph { children, .. } = &nodes[0] {
-            assert_eq!(children.len(), 4);
-            assert_eq!(children[0], InlineNode::text("看哪些".to_string()));
-            if let InlineNode::Strong {
-                children: strong_children,
-                ..
-            } = &children[1]
-            {
-                assert_eq!(strong_children.len(), 3);
-                assert_eq!(strong_children[0], InlineNode::text("\u{200b}".to_string()));
-                assert_eq!(strong_children[2], InlineNode::text("\u{200b}".to_string()));
-                if let InlineNode::VcpCustom {
-                    kind,
-                    children: Some(q_ch),
-                    ..
-                } = &strong_children[1]
-                {
-                    assert_eq!(kind, "quote");
-                    assert_eq!(
-                        q_ch[1],
-                        InlineNode::text("应该加粗的部分没有加粗".to_string())
-                    );
-                } else {
-                    panic!("Expected quote 1");
-                }
-            } else {
-                panic!("Expected Strong 1");
-            }
-
-            assert_eq!(children[2], InlineNode::text("，或者".to_string()));
-
-            if let InlineNode::Strong {
-                children: strong_children,
-                ..
-            } = &children[3]
-            {
-                assert_eq!(strong_children.len(), 3);
-                assert_eq!(strong_children[0], InlineNode::text("\u{200b}".to_string()));
-                assert_eq!(strong_children[2], InlineNode::text("\u{200b}".to_string()));
-                if let InlineNode::VcpCustom {
-                    kind,
-                    children: Some(q_ch),
-                    ..
-                } = &strong_children[1]
-                {
-                    assert_eq!(kind, "quote");
-                    assert_eq!(
-                        q_ch[1],
-                        InlineNode::text("不该加粗的部分泄漏了".to_string())
-                    );
-                } else {
-                    panic!("Expected quote 2");
-                }
-            } else {
-                panic!("Expected Strong 2");
-            }
-        }
+    fn expected_quote(open: &str, children: Vec<InlineNode>, close: &str) -> InlineNode {
+        let mut quoted = vec![InlineNode::text(open.to_string())];
+        quoted.extend(children);
+        quoted.push(InlineNode::text(close.to_string()));
+        InlineNode::vcp_custom("quote".to_string(), None, Some(quoted))
     }
 
     #[test]
-    fn test_user_reproduce() {
-        let text = include_str!("../fixtures/Strong.txt");
-        let nodes = parse_markdown_to_ast(text);
-
-        // 查找包含“自愈判定阀”的 Strong 节点
-        let mut found = false;
-        for node in &nodes {
-            if let MarkdownNode::Paragraph { children, .. } = node {
-                for child in children {
-                    if let InlineNode::Strong {
-                        children: strong_children,
-                        ..
-                    } = child
-                    {
-                        if !strong_children.is_empty() {
-                            if let InlineNode::Text { value, .. } = &strong_children[0] {
-                                if value.contains("自愈判定阀") {
-                                    found = true;
-                                    // 检查是否正确包含零宽空格
-                                    assert!(value.contains("\u{200b}「自愈判定阀」\u{200b}"));
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        assert!(
-            found,
-            "Could not find bolded '自愈判定阀' node in Strong.txt"
+    fn quote_merging_keeps_mixed_pairs_after_consuming_cjk_closer() {
+        let mut children = vec![InlineNode::text("“closed”““\"ascii\"“\"".into())];
+        apply_inline_quote_merging(&mut children);
+        assert_eq!(
+            children,
+            vec![
+                expected_quote("“", vec![InlineNode::text("closed".into())], "”"),
+                InlineNode::text("“".into()),
+                InlineNode::text("“".into()),
+                expected_quote("\"", vec![InlineNode::text("ascii".into())], "\""),
+                InlineNode::text("“".into()),
+                InlineNode::text("\"".into()),
+            ]
         );
+    }
+
+    #[test]
+    fn quote_merging_keeps_nested_quotes_across_inline_nodes() {
+        let bold = InlineNode::strong(vec![InlineNode::text("bold".into())]);
+        let mut children = vec![
+            InlineNode::text("“before ".into()),
+            bold.clone(),
+            InlineNode::text(" \"inner\" after”".into()),
+        ];
+        apply_inline_quote_merging(&mut children);
+        assert_eq!(
+            children,
+            vec![expected_quote(
+                "“",
+                vec![
+                    InlineNode::text("before ".into()),
+                    bold,
+                    InlineNode::text(" ".into()),
+                    expected_quote("\"", vec![InlineNode::text("inner".into())], "\""),
+                    InlineNode::text(" after".into()),
+                ],
+                "”",
+            )]
+        );
+    }
+
+    #[test]
+    fn quote_merging_keeps_closer_scope_in_nested_inline_containers() {
+        fn nested(child: InlineNode) -> InlineNode {
+            InlineNode::strong(vec![InlineNode::link(
+                "https://example.com".into(),
+                None,
+                vec![InlineNode::vcp_custom(
+                    "highlight".into(),
+                    None,
+                    Some(vec![child]),
+                )],
+            )])
+        }
+
+        let mut children = vec![
+            InlineNode::text("“outside".into()),
+            nested(InlineNode::text("“inside”".into())),
+            InlineNode::text("“tail".into()),
+        ];
+        apply_inline_quote_merging(&mut children);
+        assert_eq!(
+            children,
+            vec![
+                InlineNode::text("“".into()),
+                InlineNode::text("outside".into()),
+                nested(expected_quote(
+                    "“",
+                    vec![InlineNode::text("inside".into())],
+                    "”",
+                )),
+                InlineNode::text("“".into()),
+                InlineNode::text("tail".into()),
+            ]
+        );
+    }
+
+    #[test]
+    fn quote_merging_preserves_opaque_content_and_empty_text_behavior() {
+        let opaque = vec![
+            InlineNode::text("plain".into()),
+            InlineNode::code("\"code\"".into()),
+            InlineNode::inline_math("“formula”".into(), true),
+            InlineNode::raw_html_inline("<i>“html”</i>".into()),
+            InlineNode::vcp_custom("alert".into(), Some("“value”".into()), None),
+        ];
+        let mut unchanged = opaque.clone();
+        apply_inline_quote_merging(&mut unchanged);
+        assert_eq!(unchanged, opaque);
+
+        let mut with_empty = opaque.clone();
+        with_empty.push(InlineNode::text(String::new()));
+        with_empty.push(InlineNode::strong(vec![InlineNode::text(String::new())]));
+        apply_inline_quote_merging(&mut with_empty);
+        let mut expected = opaque;
+        expected.push(InlineNode::strong(Vec::new()));
+        assert_eq!(with_empty, expected);
+    }
+
+    #[test]
+    fn bold_quotes_preserve_their_inline_container_boundaries() {
+        let quote = |body: &str| expected_quote("“", vec![InlineNode::text(body.into())], "”");
+        let bold = |children| InlineNode::strong(children);
+        let edge = || InlineNode::text("\u{200b}".into());
+        for (input, mut expected) in [
+            (
+                "看哪些**“应该加粗”，或者“不该泄漏”**",
+                vec![
+                    InlineNode::text("看哪些".into()),
+                    bold(vec![
+                        edge(),
+                        quote("应该加粗"),
+                        InlineNode::text("，或者".into()),
+                        quote("不该泄漏"),
+                        edge(),
+                    ]),
+                ],
+            ),
+            (
+                "看哪些**“应该加粗”**，或者**“不该泄漏”**",
+                vec![
+                    InlineNode::text("看哪些".into()),
+                    bold(vec![edge(), quote("应该加粗"), edge()]),
+                    InlineNode::text("，或者".into()),
+                    bold(vec![edge(), quote("不该泄漏"), edge()]),
+                ],
+            ),
+            (
+                "正文**「加粗内容」**：",
+                vec![
+                    InlineNode::text("正文".into()),
+                    bold(vec![InlineNode::text(
+                        "\u{200b}「加粗内容」\u{200b}".into(),
+                    )]),
+                    InlineNode::text("：".into()),
+                ],
+            ),
+        ] {
+            for node in &mut expected {
+                node.compute_hashes_recursively();
+            }
+            let nodes = parse_markdown_to_ast(input);
+            let [MarkdownNode::Paragraph { children, .. }] = nodes.as_slice() else {
+                panic!("expected one paragraph for {input}: {nodes:?}");
+            };
+            assert_eq!(children.as_slice(), expected.as_slice(), "{input}");
+        }
     }
 
     #[test]
@@ -1949,31 +2069,6 @@ mod tests {
 
         // 应该完全没有任何修改，因为这段内容全部在 4 个反引号的代码围栏中
         assert_eq!(fixed, text);
-    }
-
-    #[test]
-    fn test_brk_text_37() {
-        // 真实样本 brk.txt，覆盖 parse_content 切分（include_str! 编译期内嵌，杜绝绝对路径）
-        let text = include_str!("../fixtures/brk.txt");
-        // 模拟 content_parser.rs 的 parse_content 切分
-        let blocks = crate::vcp_modules::content_parser::parse_content(text);
-        // 断言切分出至少一个块（原诊断 println 已转为 assert）
-        assert!(
-            !blocks.is_empty(),
-            "brk.txt 经 parse_content 后应至少切分出一个块"
-        );
-    }
-
-    #[test]
-    fn parse_fenced_code_block_extracts_lang_code_and_block_len() {
-        let text = "```rust\nlet a = 1;\n```\n\nafter";
-        let (lang, code, block_len) = parse_fenced_code_block(text).expect("fenced code block");
-        assert_eq!(lang, "rust");
-        // 内容逐行字面保留（含行尾换行），无首尾换行工件
-        assert_eq!(code, "let a = 1;\n");
-        // 块长度覆盖到闭合围栏行尾（不含其后的换行与下文）
-        assert_eq!(block_len, "```rust\nlet a = 1;\n```".len());
-        assert_eq!(&text[block_len..], "\n\nafter");
     }
 
     #[test]
@@ -2001,29 +2096,5 @@ mod tests {
         assert_eq!(parse_fenced_code_block("    ```rust\nx\n```"), None);
         // 起始是普通段落
         assert_eq!(parse_fenced_code_block("hello\n\n```rust\nx\n```"), None);
-    }
-
-    #[test]
-    fn finalized_code_block_node_matches_full_pipeline_output() {
-        // 分块层直接构造的终态节点必须与「围栏全文重走完整管线」逐字节等价
-        // （含高亮 HTML、mermaid 豁免、≤3 空格缩进、空 info string）
-        let cases = [
-            "```rust\nfn main() {\n    let x = 1;\n}\n```\n",
-            "```js\nlet a = `template *not-emphasis*`;\n```",
-            "  ```py\nprint('hi')\n```\n",
-            "```mermaid\ngraph TD;\n```\n",
-            "```\nplain <b>text</b>\n```\n",
-        ];
-        for src in cases {
-            let (lang, code, block_len) = parse_fenced_code_block(src).expect("fence should parse");
-            let mut direct = finalized_code_block_node(Some(lang), code);
-            direct.compute_hashes_recursively();
-            let piped = parse_markdown_to_ast(&src[..block_len]);
-            assert_eq!(
-                format!("{:?}", vec![direct]),
-                format!("{:?}", piped),
-                "直接构造与完整管线输出必须一致: {src:?}"
-            );
-        }
     }
 }

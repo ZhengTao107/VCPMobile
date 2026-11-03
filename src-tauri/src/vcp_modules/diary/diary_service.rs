@@ -1,5 +1,8 @@
 use super::diary_types::*;
-use crate::vcp_modules::settings_manager::{read_settings, Settings, SettingsState};
+use crate::vcp_modules::infra::vcp_http_endpoint::{
+    append_url_segments, resolve_service_base, HttpEndpointError,
+};
+use crate::vcp_modules::settings_manager::{read_config, Settings, SettingsState};
 use futures_util::StreamExt;
 use percent_encoding::percent_decode_str;
 use reqwest::{redirect::Policy, Client, Method, RequestBuilder, StatusCode, Url};
@@ -255,7 +258,10 @@ impl DiaryServiceState {
             let request_builder = self
                 .client
                 .get(url)
-                .basic_auth(&settings.admin_username, Some(&settings.admin_password))
+                .basic_auth(
+                    &settings.server.admin_username,
+                    Some(&settings.server.admin_password),
+                )
                 .header(reqwest::header::ACCEPT, "application/json");
             let response: SearchEnvelope = self
                 .request_json(
@@ -653,20 +659,25 @@ impl DiaryServiceState {
         Ok(self
             .client
             .request(method, url)
-            .basic_auth(&settings.admin_username, Some(&settings.admin_password))
+            .basic_auth(
+                &settings.server.admin_username,
+                Some(&settings.server.admin_password),
+            )
             .header(reqwest::header::ACCEPT, "application/json"))
     }
 
     fn admin_url(&self, settings: &Settings, suffix: &[&str]) -> Result<Url, DiaryError> {
-        let mut url = normalize_server_base(&settings.vcp_server_url)?;
-        append_url_segments(&mut url, &["admin_api", "dailynotes"])?;
-        append_url_segments(&mut url, suffix)?;
+        let mut url = resolve_service_base(&settings.server.url, settings.server.endpoint_mode)
+            .map_err(endpoint_error)?;
+        append_url_segments(&mut url, &["admin_api", "dailynotes"]).map_err(endpoint_error)?;
+        append_url_segments(&mut url, suffix).map_err(endpoint_error)?;
         Ok(url)
     }
 
     fn human_tool_url(&self, settings: &Settings) -> Result<Url, DiaryError> {
-        let mut url = normalize_server_base(&settings.vcp_server_url)?;
-        append_url_segments(&mut url, &["v1", "human", "tool"])?;
+        let mut url = resolve_service_base(&settings.server.url, settings.server.endpoint_mode)
+            .map_err(endpoint_error)?;
+        append_url_segments(&mut url, &["v1", "human", "tool"]).map_err(endpoint_error)?;
         Ok(url)
     }
 
@@ -681,7 +692,7 @@ impl DiaryServiceState {
         let request = self
             .client
             .post(url)
-            .bearer_auth(&settings.vcp_api_key)
+            .bearer_auth(&settings.server.api_key)
             .header(reqwest::header::CONTENT_TYPE, "text/plain;charset=UTF-8")
             .header(reqwest::header::ACCEPT, "application/json")
             .body(body);
@@ -901,64 +912,21 @@ fn error_summary(body: &[u8]) -> Option<String> {
     None
 }
 
-fn normalize_server_base(raw: &str) -> Result<Url, DiaryError> {
-    let trimmed = raw.trim();
-    if trimmed.is_empty() {
-        return Err(DiaryError::new(
-            DiaryErrorCode::ConfigMissing,
-            "尚未配置 VCP Server URL",
-        ));
-    }
-    if trimmed.chars().any(char::is_control) {
-        return Err(DiaryError::new(
-            DiaryErrorCode::InvalidRequest,
-            "VCP Server URL 含控制字符",
-        ));
-    }
-
-    let mut url = Url::parse(trimmed)
-        .map_err(|_| DiaryError::new(DiaryErrorCode::InvalidRequest, "VCP Server URL 格式无效"))?;
-    if !matches!(url.scheme(), "http" | "https")
-        || url.host_str().is_none()
-        || !url.username().is_empty()
-        || url.password().is_some()
-    {
-        return Err(DiaryError::new(
-            DiaryErrorCode::InvalidRequest,
-            "VCP Server URL 必须是无内嵌凭据的 HTTP(S) 地址",
-        ));
-    }
-    url.set_query(None);
-    url.set_fragment(None);
-
-    let path = url.path().trim_end_matches('/');
-    let base_path = path.strip_suffix("/v1/chat/completions").unwrap_or(path);
-    let normalized_path = if base_path.is_empty() {
-        "/".to_string()
-    } else {
-        format!("{}/", base_path.trim_end_matches('/'))
+fn endpoint_error(error: HttpEndpointError) -> DiaryError {
+    let code = match &error {
+        HttpEndpointError::Missing => DiaryErrorCode::ConfigMissing,
+        HttpEndpointError::Invalid(_) | HttpEndpointError::UnavailableRaw => {
+            DiaryErrorCode::InvalidRequest
+        }
     };
-    url.set_path(&normalized_path);
-    Ok(url)
-}
-
-fn append_url_segments(url: &mut Url, segments: &[&str]) -> Result<(), DiaryError> {
-    let mut path = url.path_segments_mut().map_err(|_| {
-        DiaryError::new(
-            DiaryErrorCode::InvalidRequest,
-            "VCP Server URL 不能作为分层 HTTP 地址",
-        )
-    })?;
-    path.pop_if_empty();
-    for segment in segments {
-        path.push(segment);
-    }
-    Ok(())
+    DiaryError::new(code, error.to_string())
 }
 
 fn ensure_admin_config(settings: &Settings) -> Result<(), DiaryError> {
-    normalize_server_base(&settings.vcp_server_url)?;
-    if settings.admin_username.trim().is_empty() || settings.admin_password.is_empty() {
+    resolve_service_base(&settings.server.url, settings.server.endpoint_mode)
+        .map_err(endpoint_error)?;
+    if settings.server.admin_username.trim().is_empty() || settings.server.admin_password.is_empty()
+    {
         return Err(DiaryError::new(
             DiaryErrorCode::ConfigMissing,
             "日记管理需要管理员用户名与密码",
@@ -968,8 +936,9 @@ fn ensure_admin_config(settings: &Settings) -> Result<(), DiaryError> {
 }
 
 fn ensure_bearer_config(settings: &Settings) -> Result<(), DiaryError> {
-    normalize_server_base(&settings.vcp_server_url)?;
-    if settings.vcp_api_key.trim().is_empty() {
+    resolve_service_base(&settings.server.url, settings.server.endpoint_mode)
+        .map_err(endpoint_error)?;
+    if settings.server.api_key.trim().is_empty() {
         return Err(DiaryError::new(
             DiaryErrorCode::ConfigMissing,
             "DailyNote 与 LightMemo 需要 VCP API Key",
@@ -1735,7 +1704,7 @@ fn normalize_delete_outcome(
 async fn settings_snapshot<R: Runtime>(
     app_handle: AppHandle<R>,
     settings_state: State<'_, SettingsState>,
-) -> Result<Settings, String> {
+) -> Result<std::sync::Arc<Settings>, String> {
     if app_handle
         .try_state::<crate::vcp_modules::db_manager::DbState>()
         .is_none()
@@ -1745,11 +1714,9 @@ async fn settings_snapshot<R: Runtime>(
                 .command_string(),
         );
     }
-    read_settings(app_handle, settings_state)
-        .await
-        .map_err(|_| {
-            DiaryError::new(DiaryErrorCode::ServiceUnavailable, "无法读取应用设置").command_string()
-        })
+    read_config(app_handle, settings_state).await.map_err(|_| {
+        DiaryError::new(DiaryErrorCode::ServiceUnavailable, "无法读取应用设置").command_string()
+    })
 }
 
 fn command_error(error: DiaryError) -> String {

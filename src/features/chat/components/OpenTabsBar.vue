@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, nextTick, onUnmounted, ref, watch } from "vue";
 import { useRouter } from "vue-router";
-import { Ellipsis, FileText, Loader2, Plus, X } from "lucide-vue-next";
+import { Ellipsis, FileText, Loader2, Plus, X } from "@lucide/vue";
 import VcpAvatar from "../../../components/ui/VcpAvatar.vue";
 import OpenTabsPanel from "./OpenTabsPanel.vue";
 import { buildTabMenuActions } from "./openTabsMenu";

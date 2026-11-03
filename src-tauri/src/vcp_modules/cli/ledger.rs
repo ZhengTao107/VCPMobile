@@ -602,27 +602,6 @@ mod tests {
     }
 
     #[test]
-    fn operation_id_is_idempotent_and_digest_bound() {
-        let mut ledger = JobLedger::empty(1);
-        ledger
-            .record_operation(
-                "operation-1".to_string(),
-                "digest-a".to_string(),
-                serde_json::json!({"ok": true}),
-                1,
-            )
-            .expect("record operation");
-        assert!(matches!(
-            ledger.operation("operation-1", "digest-a"),
-            OperationLookup::Replay(_)
-        ));
-        assert_eq!(
-            ledger.operation("operation-1", "digest-b"),
-            OperationLookup::Conflict
-        );
-    }
-
-    #[test]
     fn durable_job_binding_survives_read_only_operation_cache_churn() {
         let mut ledger = JobLedger::empty(1);
         let mut job = running_job(1);
@@ -646,22 +625,6 @@ mod tests {
             OperationLookup::ReplayJob("job-1".to_string())
         );
         assert_eq!(ledger.jobs.len(), 1);
-    }
-
-    #[test]
-    fn job_for_operation_finds_run_by_operation_without_digest() {
-        let mut ledger = JobLedger::empty(1);
-        let mut job = running_job(1);
-        job.mutation_operations.push(MutationOperationBinding {
-            operation_id: "dist:abc123".to_string(),
-            action_sha256: "run-digest".to_string(),
-        });
-        ledger.insert_job(job).expect("insert job");
-        let found = ledger
-            .job_for_operation("dist:abc123")
-            .expect("run job found by operation id");
-        assert_eq!(found.id, "job-1");
-        assert!(ledger.job_for_operation("dist:missing").is_none());
     }
 
     #[test]

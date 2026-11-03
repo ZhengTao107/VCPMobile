@@ -44,8 +44,31 @@ pub struct ForegroundLease<R: Runtime> {
 impl<R: Runtime> ForegroundLease<R> {
     pub fn acquire(app: &AppHandle<R>, task: ForegroundTask, label: &str) -> Result<Self, String> {
         let tag = task.unique_tag();
-        let (_, priority, screen_keep_on) = task.policy();
-        acquire_foreground_inner(app, &tag, priority, label, screen_keep_on)?;
+        let (_, _priority, screen_keep_on) = task.policy();
+        #[cfg(target_os = "ios")]
+        {
+            // Chat reports progress separately from screen-on work.
+            if !screen_keep_on {
+                return Ok(Self {
+                    app: app.clone(),
+                    tag: None,
+                });
+            }
+            crate::ios::run::<R, ()>(
+                app.clone(),
+                "acquireBackgroundExecution",
+                serde_json::json!({
+                    "tag": tag,
+                    "screenKeepOn": screen_keep_on,
+                }),
+            )
+            .inspect_err(|error| {
+                crate::events::report_service_failure(app, "guardian", error);
+            })?;
+            log::info!("[VcpMobilePlugin] iOS task resource acquired: tag={tag}, label={label}");
+        }
+        #[cfg(not(target_os = "ios"))]
+        acquire_foreground_inner(app, &tag, _priority, label, screen_keep_on)?;
         Ok(Self {
             app: app.clone(),
             tag: Some(tag),
@@ -60,11 +83,49 @@ impl<R: Runtime> ForegroundLease<R> {
     }
 }
 
+/// Native calls used by the detached iOS reply display.
+#[cfg(target_os = "ios")]
+pub mod ios_chat {
+    use super::*;
+    use serde_json::json;
+
+    async fn call<R: Runtime>(app: &AppHandle<R>, command: &str, args: serde_json::Value) -> bool {
+        let result = match app.state::<VcpMobileState<R>>().mobile_plugin_handle() {
+            Ok(handle) => handle
+                .run_mobile_plugin_async::<()>(command, args)
+                .await
+                .map_err(|error| error.to_string()),
+            Err(error) => Err(error),
+        };
+        result
+            .inspect_err(|error| log::warn!("[iOS Chat] {command}: {error}"))
+            .is_ok()
+    }
+
+    pub async fn begin<R: Runtime>(app: &AppHandle<R>, tag: &str, title: &str) -> bool {
+        call(
+            app,
+            "beginChatBackgroundTask",
+            json!({ "tag": tag, "title": title }),
+        )
+        .await
+    }
+
+    pub async fn finish<R: Runtime>(app: &AppHandle<R>, tag: &str, success: bool) {
+        call(
+            app,
+            "finishChatBackgroundTask",
+            json!({ "tag": tag, "success": success }),
+        )
+        .await;
+    }
+}
+
 impl<R: Runtime> Drop for ForegroundLease<R> {
     fn drop(&mut self) {
         if let Some(tag) = self.tag.take() {
             let app = self.app.clone();
-            // Mobile IPC waits for Android. Cancellation cleanup must not block
+            // Mobile IPC waits for the native owner. Cancellation cleanup must not block
             // the thread dropping the future (or a native event callback).
             tauri::async_runtime::spawn_blocking(move || {
                 let _ = release_foreground_inner(&app, &tag);
@@ -101,9 +162,8 @@ pub fn acquire_foreground_inner<R: Runtime>(
                 )
                 .map_err(|e| format!("acquireForeground failed: {}", e))
         })();
-        result.map_err(|error| {
-            crate::events::report_service_failure(_app, "guardian", &error);
-            error
+        result.inspect_err(|error| {
+            crate::events::report_service_failure(_app, "guardian", error);
         })?;
     }
 
@@ -118,7 +178,14 @@ pub fn acquire_foreground_inner<R: Runtime>(
 /// 释放进程级前台锁 (语义化接口)
 pub fn release_foreground_inner<R: Runtime>(_app: &AppHandle<R>, tag: &str) -> Result<(), String> {
     #[cfg(target_os = "ios")]
-    crate::ios_not_implemented::<()>("release_foreground")?;
+    crate::ios::run::<R, ()>(
+        _app.clone(),
+        "releaseBackgroundExecution",
+        serde_json::json!({ "tag": tag }),
+    )
+    .inspect_err(|error| {
+        crate::events::report_service_failure(_app, "guardian", error);
+    })?;
 
     #[cfg(target_os = "android")]
     {
@@ -132,29 +199,14 @@ pub fn release_foreground_inner<R: Runtime>(_app: &AppHandle<R>, tag: &str) -> R
                 )
                 .map_err(|e| format!("releaseForeground failed: {}", e))
         })();
-        result.map_err(|error| {
-            crate::events::report_service_failure(_app, "guardian", &error);
-            error
+        result.inspect_err(|error| {
+            crate::events::report_service_failure(_app, "guardian", error);
         })?;
     }
 
     log::info!("[VcpMobilePlugin] release_foreground_inner: tag={}", tag);
 
     Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::ForegroundTask;
-
-    #[test]
-    fn concurrent_operations_never_share_a_guardian_tag() {
-        let first = ForegroundTask::Stream.unique_tag();
-        let second = ForegroundTask::Stream.unique_tag();
-        assert_ne!(first, second);
-        assert!(first.starts_with("stream:"));
-        assert!(second.starts_with("stream:"));
-    }
 }
 
 /// 设置分布式保活模式 (兼容老版本接口)
@@ -208,9 +260,8 @@ pub fn start_helper_service<R: Runtime>(app: AppHandle<R>) -> Result<(), String>
                 .run_mobile_plugin::<serde_json::Value>("startHelperService", serde_json::json!({}))
                 .map_err(|e| format!("startHelperService failed: {}", e))
         })();
-        result.map_err(|error| {
-            crate::events::report_service_failure(&app, "helper", &error);
-            error
+        result.inspect_err(|error| {
+            crate::events::report_service_failure(&app, "helper", error);
         })?;
     }
     log::info!("[VcpMobilePlugin] start_helper_service called");

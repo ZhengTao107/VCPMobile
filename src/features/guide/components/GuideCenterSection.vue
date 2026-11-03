@@ -7,7 +7,7 @@
  * 视觉采用设置页一致的高密度线性列表风格。
  */
 import { computed } from 'vue';
-import { CircleCheck, Circle, Play, RotateCcw } from 'lucide-vue-next';
+import { CircleCheck, Circle, Play, RotateCcw } from '@lucide/vue';
 import { allGuides } from '../registry';
 import { useGuideStore } from '../stores/guideStore';
 import { useOverlayStore } from '../../../core/stores/overlay';
@@ -55,14 +55,14 @@ const resetAll = async () => {
 </script>
 
 <template>
-  <div class="space-y-6">
+  <div class="flex flex-col gap-6">
     <!-- 顶部说明 -->
     <div class="flex gap-3 p-3.5 rounded-xl bg-blue-500/10 border border-blue-500/20 text-blue-600 dark:text-blue-400">
       <Play class="w-5 h-5 shrink-0 mt-0.5" />
       <div class="space-y-1">
-        <h3 class="text-xs font-bold uppercase tracking-wider">交互教学指引</h3>
+        <h3 class="text-xs font-bold uppercase tracking-wider">使用说明与交互指引</h3>
         <p class="text-[11px] leading-relaxed opacity-80">
-          每场指引在满足条件时自动播放一次；可随时在这里重播。教学期间请跟随动画与说明操作。
+          使用说明和交互指引会在适当时机展示一次；可随时在这里重看。交互指引配有动画与操作说明。
         </p>
       </div>
     </div>

@@ -64,8 +64,8 @@ export function hintTargetFromSettings(
   foreground: boolean,
 ): HintTarget | null {
   if (!foreground || !isAutoSyncReady(settings)) return null;
-  const baseUrl = settings?.syncHttpUrl?.trim() ?? "";
-  const token = settings?.syncToken?.trim() ?? "";
+  const baseUrl = settings?.sync.httpUrl?.trim() ?? "";
+  const token = settings?.sync.token?.trim() ?? "";
   return baseUrl && token ? { baseUrl, token } : null;
 }
 

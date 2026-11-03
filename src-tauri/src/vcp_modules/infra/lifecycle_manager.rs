@@ -8,9 +8,9 @@ use crate::vcp_modules::emoticon_manager::{
     internal_load_library, refresh_emoticon_library_internal, EmoticonManagerState,
 };
 use crate::vcp_modules::model_manager::{init_model_manager, ModelManagerState};
-use crate::vcp_modules::settings_manager::{read_settings, SettingsState};
+use crate::vcp_modules::settings_manager::{read_config, SettingsState};
 use crate::vcp_modules::sync_service::init_sync_service;
-use crate::vcp_modules::vcp_log_service::init_vcp_log_connection_internal;
+use crate::vcp_modules::vcp_log_service::reconnect_log_connections;
 
 // Re-export submodules to preserve public API compatibility
 pub use crate::vcp_modules::infra::lifecycle_controller::is_app_in_foreground;
@@ -18,9 +18,7 @@ pub use crate::vcp_modules::infra::lifecycle_controller::is_app_in_foreground;
 pub use crate::vcp_modules::infra::lifecycle_controller::{
     reserve_lifecycle_transition, set_app_foreground_state_for_epoch,
 };
-pub use crate::vcp_modules::infra::lifecycle_reconciler::{
-    reconcile_distributed_node, reconcile_local_server,
-};
+pub use crate::vcp_modules::infra::lifecycle_reconciler::reconcile_distributed_node;
 pub use crate::vcp_modules::infra::lifecycle_state::{CoreStatus, LifecycleState};
 
 async fn persist_delete_cleanup_marker(db_state: &DbState, now: i64) -> Result<(), String> {
@@ -83,18 +81,22 @@ pub async fn bootstrap(app: &AppHandle) -> Result<(), String> {
 
     let db_state = handle.state::<DbState>();
     crate::vcp_modules::boot_trace::boot_mark(&handle, "rs:init_db_done");
-    match crate::vcp_modules::maintenance_manager::reclaim_orphaned_attachments(&handle, &db_state)
-        .await
-    {
+    let attachment_cleanup = async {
+        crate::vcp_modules::file_manager::reconcile_attachment_storage(&handle, &db_state).await?;
+        crate::vcp_modules::maintenance_manager::reclaim_orphaned_attachments(&handle, &db_state)
+            .await
+    }
+    .await;
+    match attachment_cleanup {
         Ok(report) if report.reclaimed > 0 || report.ghost_files > 0 => {
             info!(
-                "[Lifecycle] Attachment GC reclaimed {} indexed CAS entries and {} ghost files; retained {} live hashes.",
-                report.reclaimed, report.ghost_files, report.retained
+                "[Lifecycle] Rechecked attachment candidates and removed {} indexed CAS entries and {} orphan files.",
+                report.reclaimed, report.ghost_files
             );
         }
         Ok(_) => {}
         Err(error) => {
-            log::warn!("[Lifecycle] Attachment GC skipped after error: {error}");
+            log::warn!("[Lifecycle] Attachment path repair/GC skipped after error: {error}");
         }
     }
     crate::vcp_modules::boot_trace::boot_mark(&handle, "rs:attachment_gc_done");
@@ -104,7 +106,7 @@ pub async fn bootstrap(app: &AppHandle) -> Result<(), String> {
     // 3. 配置预加载 (P1 - 前端强依赖)
     // 将配置读取前置，确保前端 Ready 后 fetchSettings 必然成功
     let settings_state = handle.state::<SettingsState>();
-    let settings = match read_settings(handle.clone(), settings_state).await {
+    let settings = match read_config(handle.clone(), settings_state).await {
         Ok(s) => s,
         Err(e) => {
             let err_msg = format!("基础配置读取失败: {}", e);
@@ -145,7 +147,7 @@ pub async fn bootstrap(app: &AppHandle) -> Result<(), String> {
 
     // 3.6 根据设置决定是否启动分布式节点 (自动重连)
     {
-        let enable_dist = settings.distributed_enabled;
+        let enable_dist = settings.distributed.enabled;
         log::info!(
             "[Lifecycle] distributedEnabled={}, reconciling distributed node...",
             enable_dist
@@ -180,27 +182,24 @@ pub async fn bootstrap(app: &AppHandle) -> Result<(), String> {
                 ),
                 Err(e) => info!("[Lifecycle] Emoticon auto-refresh skipped: {}", e),
             }
+        });
+    }
 
+    // 通知连接独立启动，表情库的网络刷新不能延迟实时通道。
+    {
+        let h = handle.clone();
+
+        tokio::spawn(async move {
             // 自动连接 VCP Log。执行前在 Settings runtime owner 下重读，避免启动
             // 后台任务用旧快照覆盖用户刚保存的新连接参数。
             let settings_state = h.state::<SettingsState>();
             let _runtime_guard = settings_state.lock_runtime_reconcile().await;
-            if let Ok(latest) = read_settings(h.clone(), h.state()).await {
-                if !latest.vcp_log_url.is_empty() && !latest.vcp_log_key.is_empty() {
-                    info!("[Lifecycle] Auto-connecting VCP Log...");
-                    let _ = init_vcp_log_connection_internal(
-                        h.clone(),
-                        latest.vcp_log_url.clone(),
-                        latest.vcp_log_key.clone(),
-                    )
-                    .await;
-                    info!("[Lifecycle] Auto-connecting VCP Info...");
-                    let _ = crate::vcp_modules::vcp_info_service::init_vcp_info_connection(
-                        h.clone(),
-                        latest.vcp_log_url,
-                        latest.vcp_log_key,
-                    )
-                    .await;
+            if let Ok(latest) = read_config(h.clone(), h.state()).await {
+                if let Err(error) =
+                    reconnect_log_connections(&h, latest.log.url.clone(), latest.log.key.clone())
+                        .await
+                {
+                    log::warn!("[Lifecycle] Cannot restore VCPLog/Info connections: {error}");
                 }
             }
         });
@@ -312,15 +311,17 @@ pub async fn bootstrap(app: &AppHandle) -> Result<(), String> {
                             );
                         }
                         NativeEvent::Network { connected } => {
-                            #[cfg(target_os = "ios")]
-                            {
-                                // Vue reuses its existing READY/active/in-flight recovery gate.
-                                // This is an observed path fact, not a guarantee of Internet reachability.
-                                let _ = event_handle.emit(
-                                    "vcp-network-changed",
-                                    serde_json::json!({ "connected": connected }),
-                                );
+                            if connected {
+                                // The socket owners decide whether to resume a parked retry
+                                // or probe an existing connection after a path change.
+                                event_handle.state::<LifecycleState>().ws_activity.network_available();
                             }
+                            // Both mobile platforms feed Vue's existing READY/active/in-flight recovery gate.
+                            // This is an observed path fact, not a guarantee of Internet reachability.
+                            let _ = event_handle.emit(
+                                "vcp-network-changed",
+                                serde_json::json!({ "connected": connected }),
+                            );
                             #[cfg(target_os = "android")]
                             if connected {
                                 let app = event_handle.clone();
@@ -333,8 +334,18 @@ pub async fn bootstrap(app: &AppHandle) -> Result<(), String> {
                                 });
                             }
                         }
-                        NativeEvent::NotificationClick(payload) => {
-                            let _ = event_handle.emit("vcp-notification-click", payload);
+                        NativeEvent::VoiceAudio(event) => {
+                            if let Some(event) = tauri_plugin_vcp_mobile::voice::handle_native_event(&event_handle, event) {
+                                crate::vcp_modules::chat::voice_service::handle_audio_event(&event_handle, &event);
+                            }
+                        }
+                        NativeEvent::VoiceDocument { document_id } => {
+                            crate::vcp_modules::chat::voice_service::invalidate_document(
+                                &event_handle, Some(&document_id),
+                            );
+                        }
+                        NativeEvent::VoicePlayback(event) => {
+                            crate::vcp_modules::chat::voice_service::handle_playback_event(&event_handle, event);
                         }
                         NativeEvent::Other {} => {}
                     }
@@ -358,6 +369,8 @@ pub struct SystemSnapshot {
     pub core: CoreStatus,
     pub message: String,
     pub log: String,
+    #[serde(rename = "logConfigurationError")]
+    pub log_configuration_error: Option<String>,
     pub sync: String,
     pub lifecycle: Option<crate::vcp_modules::infra::lifecycle_state::LifecycleSnapshot>,
     #[serde(rename = "databaseRecovery")]
@@ -378,6 +391,23 @@ pub async fn get_system_snapshot(
 
     // 获取 VCPLog 状态
     let log = crate::vcp_modules::vcp_log_service::get_vcp_log_status_internal().await;
+    // Startup can finish before the WebView subscribes to events. Diagnose
+    // persisted endpoint errors in its existing hydration snapshot as well.
+    // Earlier phases must not touch configuration before database registration.
+    let log_configuration_error = if core == CoreStatus::Ready {
+        let settings_state = app
+            .try_state::<SettingsState>()
+            .ok_or_else(|| "核心已就绪但配置状态尚未注册".to_string())?;
+        let db_state = app
+            .try_state::<DbState>()
+            .ok_or_else(|| "核心已就绪但数据库状态尚未注册".to_string())?;
+        let settings = settings_state.read_config(db_state.inner()).await?;
+        super::vcp_ws_endpoint::compile_log_connection(&settings.log.url, &settings.log.key)
+            .err()
+            .map(|issue| issue.to_string())
+    } else {
+        None
+    };
 
     // 获取 Sync 状态
     let sync = match app.try_state::<crate::vcp_modules::sync_service::SyncState>() {
@@ -389,6 +419,7 @@ pub async fn get_system_snapshot(
         core,
         message,
         log,
+        log_configuration_error,
         sync,
         lifecycle: state
             .lifecycle_snapshot
@@ -401,36 +432,31 @@ pub async fn get_system_snapshot(
     })
 }
 
-/// 前端保存设置后调用，即时生效启用/停用划词助手本地服务器 - 暂时停用该功能
-#[tauri::command]
-#[allow(dead_code)] // DORMANT ASSET: implementation is retained but absent from generate_handler!.
-pub async fn reconcile_local_server_cmd(
-    app_handle: AppHandle,
-    state: State<'_, LifecycleState>,
-    enable: bool,
-) -> Result<bool, String> {
-    log::info!(
-        "[Lifecycle] reconcile_local_server_cmd called (temporarily disabled): enable={}",
-        enable
-    );
-    let lifecycle = &*state;
-    reconcile_local_server(&app_handle, lifecycle, false).await;
-    Ok(false)
-}
-
 #[tauri::command]
 pub async fn reconcile_distributed_node_cmd(app_handle: AppHandle) -> Result<bool, String> {
     let settings_state = app_handle.state::<SettingsState>();
     let _runtime_guard = settings_state.lock_runtime_reconcile().await;
-    let settings = read_settings(app_handle.clone(), app_handle.state())
+    let settings = read_config(app_handle.clone(), app_handle.state())
         .await
         .map_err(|e| e.to_string())?;
     log::info!(
         "[Lifecycle] reconcile_distributed_node_cmd called: enable={}",
-        settings.distributed_enabled
+        settings.distributed.enabled
     );
-    reconcile_distributed_node(&app_handle, true).await;
-    Ok(settings.distributed_enabled)
+    // A changed configuration already schedules its own replacement. Explicit
+    // Connect also admits an unchanged offline node without restarting a fresh
+    // connection that the post-commit owner has just created.
+    reconcile_distributed_node(&app_handle, false).await;
+    if settings.distributed.enabled {
+        if let Some(distributed) = app_handle.try_state::<crate::distributed::DistributedState>() {
+            let client = distributed.client.read().await;
+            let status = client.get_status().await;
+            if !status.connected && status.last_error.is_some() {
+                client.trigger_reconnect().await;
+            }
+        }
+    }
+    Ok(settings.distributed.enabled)
 }
 
 #[tauri::command]
@@ -459,7 +485,7 @@ pub async fn restart_or_exit_app(
             .ok_or("main window not found")?;
         let res = window.as_ref().with_webview(move |webview| {
             webview.jni_handle().exec(move |env, activity, _webview| {
-                match restart_android_app(env, &activity) {
+                match restart_android_app(env, activity) {
                     Ok(_) => {
                         let _ = tx.send(());
                     }
@@ -477,7 +503,7 @@ pub async fn restart_or_exit_app(
         }
 
         // 等待 JNI 线程成功调用并完成 startActivity Binder IPC
-        if let Ok(_) = rx.await {
+        if rx.await.is_ok() {
             // 给系统 Binder 一点时间刷盘并调度拉起新进程，然后自杀
             tokio::time::sleep(std::time::Duration::from_millis(150)).await;
         }

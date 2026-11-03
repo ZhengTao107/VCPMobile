@@ -51,7 +51,6 @@ function getPhysicalIps() {
 }
 
 const physicalIps = getPhysicalIps();
-// @ts-expect-error process is a nodejs global
 const detectedHost = process.env.TAURI_DEV_HOST;
 
 // USB 模式（localhost）直接信任；WiFi 模式校验是否在物理 IP 列表中，防止 TUN 劫持
@@ -68,10 +67,6 @@ export default defineConfig(async () => ({
     vue(),
     UnoCSS(),
   ],
-
-  esbuild: {
-    pure: process.env.NODE_ENV === "production" ? ["console.log", "console.debug", "console.info"] : [],
-  },
 
   // 本地 Tauri 插件会随源码同步增加 Guest JS 导出。排除依赖预打包，避免
   // node_modules/.vite 继续提供缺少新导出的旧快照，导致异步页面在首次加载时失败。
@@ -102,42 +97,38 @@ export default defineConfig(async () => ({
   },
 
   build: {
-    // Android WebView compatibility baseline. This freezes the current Vite 6
-    // default-era behavior so dependency upgrades cannot silently raise the
-    // emitted JS/CSS syntax floor. It is a build contract, not a substitute
-    // for the tracked real-device/WebView acceptance matrix.
-    target: "chrome87",
-    cssTarget: "chrome87",
-    // Mermaid 的冷门图表包按需加载，原始体积偏大但不进入首屏；其余常驻依赖显式拆包，
-    // 让主应用 chunk 保持在默认 500KB 门槛以内。
+    // Shared mobile bundle: Android WebView and the minimum iOS WKWebView.
+    // Syntax targets do not replace runtime API or native interaction checks.
+    target: ["chrome117", "safari26.0"],
+    cssTarget: ["chrome117", "safari26.0"],
+    // Mermaid 图表与 ELK 布局引擎按需加载，原始体积偏大但不进入首屏；其余常驻依赖显式拆包，
+    // 让主应用 chunk 保持在配置的 700KB 门槛以内。
     chunkSizeWarningLimit: 700,
-    rollupOptions: {
+    rolldownOptions: {
       input: {
         main: "index.html",
       },
+      treeshake: {
+        manualPureFunctions: process.env.NODE_ENV === "production"
+          ? ["console.log", "console.debug", "console.info"]
+          : [],
+      },
       output: {
-        manualChunks(id) {
-          if (!id.includes("node_modules")) return undefined;
-          if (
-            id.includes("/vue/") ||
-            id.includes("/@vue/") ||
-            id.includes("/pinia/") ||
-            id.includes("/pinia-plugin-persistedstate/") ||
-            id.includes("/vue-router/")
-          ) {
-            return "vue-vendor";
-          }
-          if (
-            id.includes("/marked/") ||
-            id.includes("/morphdom/") ||
-            id.includes("/dompurify/")
-          ) {
-            return "render-vendor";
-          }
-          if (id.includes("/@tauri-apps/")) {
-            return "tauri-vendor";
-          }
-          return undefined;
+        codeSplitting: {
+          groups: [
+            {
+              name: "vue-vendor",
+              test: /[\\/]node_modules[\\/](?:@vue[\\/]|(?:vue|pinia|pinia-plugin-persistedstate|vue-router)[\\/])/,
+            },
+            {
+              name: "render-vendor",
+              test: /[\\/]node_modules[\\/](?:marked|morphdom|dompurify)[\\/]/,
+            },
+            {
+              name: "tauri-vendor",
+              test: /[\\/]node_modules[\\/]@tauri-apps[\\/]/,
+            },
+          ],
         },
       },
     },

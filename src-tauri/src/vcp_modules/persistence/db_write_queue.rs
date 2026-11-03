@@ -114,7 +114,7 @@ mod tests {
         .await
         .expect("seed queue parents");
         let db_state = DbState::new(pool.clone(), db_path);
-        let queue = DbWriteQueue::new(&db_state, 77);
+        let queue = DbWriteQueue::new(&db_state, 77, temp_dir.path().join("attachments"));
         (temp_dir, pool, db_state, queue)
     }
 
@@ -680,8 +680,13 @@ mod tests {
         let tx = conn.transaction().expect("begin message transaction");
         match tasks.pop().expect("coalesced task") {
             DbWriteTask::TopicMessages { key, writes } => {
-                DbWriteQueue::rusqlite_upsert_messages_batch(&tx, &key, writes)
-                    .expect("write coalesced messages");
+                DbWriteQueue::rusqlite_upsert_messages_batch(
+                    &tx,
+                    &key,
+                    writes,
+                    std::path::Path::new("attachments"),
+                )
+                .expect("write coalesced messages");
             }
             task => panic!("unexpected coalesced task: {task:?}"),
         }
@@ -700,6 +705,50 @@ mod tests {
                 })
                 .expect("count side table rows");
             assert_eq!(count, 4, "unexpected row count in {table}");
+        }
+    }
+
+    #[test]
+    fn sync_message_batch_rejects_overflow_before_writing_any_rows() {
+        let mut conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch(include_str!("../../../migrations/0100_baseline_v2.sql"))
+            .unwrap();
+        conn.execute_batch("INSERT INTO agents(owner_type,agent_id,name,model,updated_at) VALUES ('agent','owner','Owner','',1); INSERT INTO topics(owner_type,owner_id,topic_id,title,created_at,updated_at) VALUES ('agent','owner','topic','Topic',1,1);").unwrap();
+        for bad_timestamp in [false, true] {
+            let DbWriteTask::TopicMessages { key, mut writes } = rich_message_task("topic", 0, 2)
+            else {
+                unreachable!()
+            };
+            if bad_timestamp {
+                writes[1].message.timestamp = u64::MAX;
+            } else {
+                writes[1].message.attachments.as_mut().unwrap()[0].size = u64::MAX;
+            }
+            let tx = conn.transaction().unwrap();
+            let error = DbWriteQueue::rusqlite_upsert_messages_batch(
+                &tx,
+                &key,
+                writes,
+                std::path::Path::new("attachments"),
+            )
+            .unwrap_err();
+            assert!(error.to_string().contains("SQLite integer range"));
+            // All metadata is checked before the batch can mutate any side table.
+            tx.commit().unwrap();
+            for table in [
+                "messages",
+                "attachments",
+                "message_attachments",
+                "render_cache",
+                "messages_fts",
+            ] {
+                let count: i64 = conn
+                    .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                        row.get(0)
+                    })
+                    .unwrap();
+                assert_eq!(count, 0, "{table}");
+            }
         }
     }
 
@@ -782,6 +831,99 @@ mod tests {
     #[test]
     fn queued_owner_root_hashes_include_default_topics() {
         assert_queued_owner_root_includes_default("agent");
+    }
+
+    #[test]
+    fn sync_group_upsert_preserves_local_mode_and_parameters() {
+        let mut connection =
+            rusqlite::Connection::open_in_memory().expect("open group sync database");
+        connection
+            .execute_batch(include_str!("../../../migrations/0100_baseline_v2.sql"))
+            .expect("create shared schema");
+        connection
+            .execute_batch(include_str!(
+                "../../../migrations/0104_group_local_settings.sql"
+            ))
+            .expect("create local settings schema");
+        let mut local = crate::vcp_modules::group_types::GroupLocalSettings {
+            chat_mode: crate::vcp_modules::group_types::GroupChatMode::Jev,
+            ..Default::default()
+        };
+        local.mode_settings.sequential.speaker_order = vec!["b".into(), "a".into()];
+        local.mode_settings.jev.history_window = 23;
+        let raw = serde_json::to_string(&local).expect("encode local settings");
+        connection
+            .execute(
+                "INSERT INTO group_local_settings VALUES('group',?1,7)",
+                [&raw],
+            )
+            .expect("import preferences before remote owner exists");
+        let dto: GroupSyncDTO = serde_json::from_value(serde_json::json!({
+            "name":"Remote group","members":["a","b"],"mode":"sequential",
+            "useUnifiedModel":false,"createdAt":1
+        }))
+        .expect("decode existing sync DTO");
+        let transaction = connection.transaction().expect("begin sync write");
+        DbWriteQueue::rusqlite_upsert_group(&transaction, "group", &dto)
+            .expect("actual sync group writer");
+        transaction.commit().expect("commit sync group");
+        let stored: (String, i64) = connection
+            .query_row(
+                "SELECT settings_json,updated_at FROM group_local_settings WHERE group_id='group'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("read preserved local state");
+        assert_eq!(stored, (raw, 7));
+        let (mode, hash): (String, String) = connection
+            .query_row(
+                "SELECT mode,config_hash FROM groups WHERE group_id='group'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("read remote shared state");
+        assert_eq!(mode, "sequential");
+        assert_eq!(hash, HashAggregator::compute_group_config_hash(&dto));
+    }
+
+    #[test]
+    fn sync_agent_upsert_preserves_device_voice_and_excludes_it_from_the_dto() {
+        let mut connection = rusqlite::Connection::open_in_memory().expect("database");
+        connection
+            .execute_batch(include_str!("../../../migrations/0100_baseline_v2.sql"))
+            .expect("shared schema");
+        connection
+            .execute_batch(include_str!(
+                "../../../migrations/0105_agent_voice_config.sql"
+            ))
+            .expect("local voice schema");
+        let mut agent = crate::vcp_modules::agent_service::create_default_config("a");
+        agent.voice.enabled = true;
+        agent.voice.clone_sample_id = "local-sample".into();
+        let voice = serde_json::to_string(&agent.voice).expect("encode voice");
+        connection.execute(
+            "INSERT INTO agents(owner_type,agent_id,name,model,voice_config,updated_at) VALUES('agent','a','old','old',?,1)",
+            [&voice],
+        ).expect("seed local voice");
+        agent.name = "remote name".into();
+        agent.model = "remote model".into();
+        let dto = AgentSyncDTO::from(&agent);
+        assert!(serde_json::to_value(&dto)
+            .expect("DTO")
+            .get("voice")
+            .is_none());
+        let tx = connection.transaction().expect("transaction");
+        DbWriteQueue::rusqlite_upsert_agent(&tx, "a", &dto).expect("production sync writer");
+        tx.commit().expect("commit");
+        let (stored, name): (String, String) = connection
+            .query_row(
+                "SELECT voice_config,name FROM agents WHERE agent_id='a'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("read");
+        assert_eq!(stored, voice);
+        assert_eq!(name, "remote name");
     }
 
     #[test]
@@ -987,6 +1129,7 @@ mod tests {
                 render_bytes: vec![1, 2, 3],
                 content_hash: "stale-hash".into(),
             }],
+            std::path::Path::new("attachments"),
         )
         .expect("guarded message batch");
 
@@ -1054,6 +1197,7 @@ mod tests {
             &tx,
             &TopicKey::new("agent", "agent-a", "missing-topic"),
             Vec::new(),
+            std::path::Path::new("attachments"),
         )
         .expect_err("even an empty message batch requires its live topic");
         assert!(missing_parent.to_string().contains("parent topic"));
@@ -1179,7 +1323,7 @@ impl DbWriteQueue {
         coalesced
     }
 
-    pub fn new(db_state: &DbState, session_id: u64) -> Self {
+    pub fn new(db_state: &DbState, session_id: u64, attachments_root: std::path::PathBuf) -> Self {
         let db_path = db_state.path.clone();
         let write_coordinator = db_state.write_coordinator().clone();
         // Keep bounded lookahead ahead of the single writer while preserving Pull's upstream
@@ -1231,6 +1375,7 @@ impl DbWriteQueue {
                     .await;
 
                 let db_path = db_path_for_worker.clone();
+                let attachments_root = attachments_root.clone();
                 let ch = conn_holder.clone();
                 let transaction_started = std::time::Instant::now();
 
@@ -1238,9 +1383,12 @@ impl DbWriteQueue {
                 let result = tokio::task::spawn_blocking(move || {
                     let mut write_lease = write_lease;
                     write_lease.mark_outcome("transaction_failed");
+                    let _database_scope = super::db_health::MainRusqliteScope::enter();
+                    super::db_health::ensure_writable().map_err(Self::sync_contract_error)?;
                     let mut guard = ch.lock().unwrap();
                     if guard.is_none() {
                         let conn = rusqlite::Connection::open(&db_path)?;
+                        super::db_health::protect_rusqlite(&conn)?;
                         let journal_mode: String =
                             conn.pragma_query_value(None, "journal_mode", |row| row.get(0))?;
                         if !journal_mode.eq_ignore_ascii_case("wal") {
@@ -1291,7 +1439,7 @@ impl DbWriteQueue {
                                 }
                             }
                             DbWriteTask::TopicMessages { key, writes } => {
-                                Self::rusqlite_upsert_messages_batch(&tx, &key, writes)?;
+                                Self::rusqlite_upsert_messages_batch(&tx, &key, writes, &attachments_root)?;
                             }
                             DbWriteTask::Flush { .. } => unreachable!(),
                         }
@@ -1825,6 +1973,7 @@ impl DbWriteQueue {
         tx: &rusqlite::Transaction,
         key: &TopicKey,
         mut writes: Vec<PreparedMessageWrite>,
+        attachments_root: &std::path::Path,
     ) -> rusqlite::Result<()> {
         let topic_is_live: bool = tx.query_row(
             "SELECT EXISTS(
@@ -1857,6 +2006,20 @@ impl DbWriteQueue {
         }
 
         for write in &writes {
+            i64::try_from(write.message.timestamp).map_err(|_| {
+                Self::sync_contract_error(format!(
+                    "Message {}/{} timestamp exceeds the SQLite integer range",
+                    key.topic_id, write.message.id,
+                ))
+            })?;
+            for attachment in write.message.attachments.iter().flatten() {
+                i64::try_from(attachment.size).map_err(|_| {
+                    Self::sync_contract_error(format!(
+                        "Attachment on message {}/{} exceeds the SQLite integer range",
+                        key.topic_id, write.message.id,
+                    ))
+                })?;
+            }
             let updated_at = write.message.updated_at.unwrap_or(write.message.timestamp);
             if updated_at > (1_u64 << 53) - 1 {
                 return Err(Self::sync_contract_error(format!(
@@ -2171,37 +2334,48 @@ impl DbWriteQueue {
                     {
                         readiness.clone()
                     } else {
-                        let current_path: String = tx.query_row(
-                            "SELECT internal_path FROM attachments WHERE hash = ?",
+                        let (stored_path, size): (String, i64) = tx.query_row(
+                            "SELECT internal_path, size FROM attachments WHERE hash = ?",
                             [&hash],
-                            |row| row.get(0),
+                            |row| Ok((row.get(0)?, row.get(1)?)),
                         )?;
-                        let clean_path = current_path.trim_start_matches("file://");
-                        let verified_path = if clean_path.is_empty() {
-                            None
-                        } else {
-                            match std::fs::metadata(clean_path) {
-                                Ok(metadata) if metadata.is_file() => Some(clean_path),
-                                Ok(_) => None,
-                                Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                        let size = u64::try_from(size)
+                            .map_err(|_| Self::sync_contract_error("Attachment size is invalid"))?;
+                        let (current_path, verified_path) =
+                            match crate::vcp_modules::file_manager::current_attachment_path(
+                                attachments_root,
+                                &hash,
+                                &stored_path,
+                            ) {
+                                Ok(path) => {
+                                    let current_path = path
+                                        .map(|path| path.to_string_lossy().into_owned())
+                                        .unwrap_or_default();
+                                    let verified = crate::vcp_modules::file_manager::resolve_existing_attachment_path(
+                                    attachments_root, &hash, &stored_path, size,
+                                ).unwrap_or_else(|error| {
+                                    log::warn!("[DbWriteQueue] Local attachment {hash} remains unavailable: {error}");
+                                    None
+                                });
+                                    (current_path, verified)
+                                }
                                 Err(error) => {
-                                    return Err(Self::sync_contract_error(format!(
-                                        "Failed to inspect local attachment {hash}: {error}"
-                                    )));
+                                    log::warn!("[DbWriteQueue] Keeping unresolved local attachment identity {hash}: {error}");
+                                    (stored_path.clone(), None)
                                 }
-                            }
-                        };
+                            };
+                        if current_path != stored_path {
+                            tx.execute(
+                                "UPDATE attachments SET internal_path = ? WHERE hash = ?",
+                                [&current_path, &hash],
+                            )?;
+                        }
                         let readiness = match verified_path {
-                            Some(path) => (format!("file://{path}"), "ready".to_string()),
-                            None => {
-                                if !current_path.trim().is_empty() {
-                                    tx.execute(
-                                        "UPDATE attachments SET internal_path = '' WHERE hash = ?",
-                                        [&hash],
-                                    )?;
-                                }
-                                (String::new(), "desktop_only".to_string())
-                            }
+                            Some(path) => (
+                                format!("file://{}", path.to_string_lossy()),
+                                "ready".to_string(),
+                            ),
+                            None => (String::new(), "desktop_only".to_string()),
                         };
                         readiness_by_hash.insert(hash.clone(), readiness.clone());
                         readiness
@@ -2364,6 +2538,9 @@ impl DbWriteQueue {
         att: &crate::vcp_modules::chat_manager::Attachment,
         timestamp: i64,
     ) -> rusqlite::Result<()> {
+        let size = i64::try_from(att.size).map_err(|_| {
+            Self::sync_contract_error("Attachment size exceeds the SQLite integer range")
+        })?;
         let image_frames = att
             .image_frames
             .as_ref()
@@ -2394,7 +2571,7 @@ impl DbWriteQueue {
             rusqlite::params![
                 hash,
                 &att.r#type,
-                att.size as i64,
+                size,
                 &att.internal_path,
                 &att.extracted_text,
                 image_frames,

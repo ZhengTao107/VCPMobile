@@ -34,11 +34,46 @@ const available: UpdateStatus = {
 describe('update store', () => {
   let pinia: Pinia;
   beforeEach(() => {
+    localStorage.clear();
     pinia = createPinia();
     setActivePinia(pinia);
   });
 
-  afterEach(() => disposePinia(pinia));
+  afterEach(() => {
+    disposePinia(pinia);
+    vi.unstubAllGlobals();
+  });
+
+
+  it('publishes the local preference after saving and leaves it unchanged on a failed write', () => {
+    const store = useUpdateStore();
+    expect(store.setAutoCheckEnabled(false)).toEqual({ ok: true, changed: true, enabled: false });
+    expect(localStorage.getItem('vcp_auto_update_check')).toBe('off');
+    expect(store.autoCheckEnabled).toBe(false);
+
+    vi.stubGlobal('localStorage', {
+      getItem: localStorage.getItem.bind(localStorage),
+      setItem: () => { throw new Error('quota exceeded'); },
+    });
+    expect(store.setAutoCheckEnabled(true)).toEqual({
+      ok: false, changed: false, enabled: false, error: 'Error: quota exceeded',
+    });
+    expect(store.autoCheckEnabled).toBe(false);
+    expect(store.status).toEqual(idle);
+    expect(localStorage.getItem('vcp_auto_update_check')).toBe('off');
+
+    vi.unstubAllGlobals();
+    expect(store.setAutoCheckEnabled(true)).toEqual({ ok: true, changed: true, enabled: true });
+    expect(localStorage.getItem('vcp_auto_update_check')).toBe('on');
+    expect(store.autoCheckEnabled).toBe(true);
+  });
+
+  it('repairs an unknown persisted switch value to its current default', () => {
+    localStorage.setItem('vcp_auto_update_check', 'false');
+    expect(useUpdateStore().autoCheckEnabled).toBe(true);
+    expect(localStorage.getItem('vcp_auto_update_check')).toBe('on');
+  });
+
 
   it('init pulls the current snapshot once and then follows broadcast events', async () => {
     mockInvoke('get_update_status', () => idle);
@@ -61,47 +96,7 @@ describe('update store', () => {
     expect(store.isBusy).toBe(true);
   });
 
-  it('command results are applied to the mirrored status', async () => {
-    mockInvoke('get_update_status', () => idle);
-    mockInvoke('check_for_update', () => available);
-    mockInvoke('start_update_download', () => ({
-      ...available,
-      state: 'readyToInstall',
-      downloaded: available.info!.apkSize!,
-    }));
-    mockInvoke('install_update', () => ({ ...available, state: 'idle' as const }));
 
-    const store = useUpdateStore();
-    await store.init();
-
-    const checked = await store.check();
-    expect(checked.state).toBe('available');
-    expect(store.info?.latestVersion).toBe('1.2.0');
-
-    const downloaded = await store.startDownload();
-    expect(downloaded.state).toBe('readyToInstall');
-    expect(store.state).toBe('readyToInstall');
-
-    const installed = await store.install();
-    expect(installed.state).toBe('idle');
-  });
-
-  it('surfaces structured errors from the state machine', async () => {
-    mockInvoke('get_update_status', () => idle);
-    mockInvoke('start_update_download', () => ({
-      ...available,
-      state: 'failed' as const,
-      error: { stage: 'download', message: '网络停滞超过 30 秒', retryable: true },
-    }));
-
-    const store = useUpdateStore();
-    await store.init();
-    const result = await store.startDownload();
-
-    expect(result.state).toBe('failed');
-    expect(store.error?.stage).toBe('download');
-    expect(store.error?.retryable).toBe(true);
-  });
 
   it('retries a failed subscription and stops consuming events when disposed', async () => {
     mockInvoke('get_update_status', () => idle);

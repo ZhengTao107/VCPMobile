@@ -2,16 +2,49 @@ import { onMounted, onUnmounted, type Ref } from "vue";
 import { openUrl as openExternal } from "@tauri-apps/plugin-opener";
 import { useChatHistoryStore } from "../stores/chatHistoryStore";
 import { openRenderedImageViewer } from "./useRenderedImageViewer";
-import { scrollToMessageById } from "../utils/scrollToMessage";
+import { findRenderedImagePayload } from '../utils/renderedImage';
+import { useNotificationStore } from '../stores/notification';
+import { MERMAID_CONTENT_SELECTOR } from '../utils/astRenderer';
 
-export function useMessageEvents(containerRef: Ref<HTMLElement | null>) {
+export function useMessageEvents(
+  containerRef: Ref<HTMLElement | null>,
+  openMermaid: (svgHtml: string, sourceCode: string) => void,
+) {
   const historyStore = useChatHistoryStore();
+  const notification = useNotificationStore();
+  let imageController: AbortController | null = null;
+  let eventContainer: HTMLElement | null = null;
 
-  const handleClick = (e: MouseEvent) => {
-    const target = e.target as HTMLElement;
+  const contentForTarget = (target: EventTarget | null): HTMLElement | null => {
+    if (!(target instanceof Element)) return null;
+    const content = target.closest<HTMLElement>('[data-message-content]');
+    return content && containerRef.value?.contains(content) ? content : null;
+  };
+
+  const handleClick = async (e: MouseEvent) => {
+    const target = e.target;
+    const content = contentForTarget(target);
+    if (!(target instanceof Element) || !content) return;
+    // 只解释生成内容；组件自身的复制、展开和工具栏图标仍由各组件处理。
+    const closestContent = <T extends Element = Element>(selector: string): T | null => {
+      const match = target.closest<T>(selector);
+      return match && content.contains(match) ? match : null;
+    };
+
+    // 图表身份先于按钮、链接和图片；交互不依赖异步渲染是否安装了 wrapper。
+    const diagram = closestContent<HTMLElement>(MERMAID_CONTENT_SELECTOR);
+    if (diagram) {
+      e.preventDefault();
+      e.stopPropagation();
+      const svg = diagram.querySelector('svg');
+      if (svg && diagram.closest('[data-message-render-region]')?.getAttribute('data-message-render-region') === 'stable') {
+        openMermaid(svg.outerHTML, diagram.dataset.mermaidSource ?? '');
+      }
+      return;
+    }
 
     // 1. VCP 按钮点击 (e.g., [[点击按钮:xxx]])
-    const vcpButton = target.closest('[data-vcp-button]');
+    const vcpButton = closestContent('[data-vcp-button]');
     if (vcpButton) {
       const text = vcpButton.getAttribute('data-vcp-button');
       if (text) historyStore.sendMessage(text);
@@ -19,7 +52,7 @@ export function useMessageEvents(containerRef: Ref<HTMLElement | null>) {
     }
 
     // 1.5 拦截 AI 回复中生成的内嵌 <button> 元素
-    const aiButton = target.closest('button') as HTMLButtonElement | null;
+    const aiButton = closestContent<HTMLButtonElement>('button');
     if (aiButton) {
       e.preventDefault();
       e.stopPropagation();
@@ -55,7 +88,7 @@ export function useMessageEvents(containerRef: Ref<HTMLElement | null>) {
     }
 
     // 2. 外部链接
-    const externalLink = target.closest('a[href^="http"]');
+    const externalLink = closestContent('a[href^="http"]');
     if (externalLink) {
       e.preventDefault();
       const href = externalLink.getAttribute('href');
@@ -64,49 +97,62 @@ export function useMessageEvents(containerRef: Ref<HTMLElement | null>) {
     }
 
     // 3. 内部锚点（消息引用跳转）：仅当消息在当前已加载窗口内时可定位
-    const messageRef = target.closest('a[href^="#msg-"]');
+    const messageRef = closestContent('a[href^="#msg-"]');
     if (messageRef) {
       e.preventDefault();
       const msgId = messageRef.getAttribute('href')?.replace('#msg-', '');
       if (msgId) {
-        scrollToMessageById(msgId);
+        await historyStore.openLoadedReference(msgId);
       }
       return;
     }
 
     // 4. 气泡内普通图片点击劫持 (排除带有 vcp-emoticon 的表情包以及消息附件缩略图)
-    if (target.tagName.toLowerCase() === "img") {
-      const isEmoticon = target.classList.contains("vcp-emoticon");
+    const imageElement = closestContent('img, image, svg, canvas');
+    if (imageElement) {
+      const isEmoticon = imageElement.classList.contains("vcp-emoticon");
       const isAttachment = target.closest(".vcp-attachment-preview") !== null;
 
       if (!isEmoticon && !isAttachment) {
         e.preventDefault();
         e.stopPropagation();
 
-        const src = target.getAttribute("src") || "";
-        const alt = target.getAttribute("alt") || "";
-        const title = target.getAttribute("title") || "";
-
-        openRenderedImageViewer({
-          src,
-          alt,
-          title,
-          sourceLabel: "聊天图片",
-        });
+        imageController?.abort();
+        const controller = new AbortController();
+        imageController = controller;
+        try {
+          const payload = await findRenderedImagePayload(target, content, controller.signal);
+          if (payload) {
+            if (controller.signal.aborted || !containerRef.value?.contains(content) || !content.contains(imageElement)) {
+              if (payload.ownedObjectUrl) URL.revokeObjectURL(payload.src);
+            } else openRenderedImageViewer({ ...payload, sourceLabel: '聊天图片' });
+          }
+        } catch (error) {
+          if (!controller.signal.aborted) notification.addNotification({ type: 'error', title: '图片预览失败', message: String(error), toastOnly: true });
+        }
         return;
       }
     }
   };
 
-  onMounted(() => {
-    if (containerRef.value) {
-      containerRef.value.addEventListener("click", handleClick);
+  const handleDoubleClick = (e: MouseEvent) => {
+    const content = contentForTarget(e.target);
+    const diagram = e.target instanceof Element ? e.target.closest(MERMAID_CONTENT_SELECTOR) : null;
+    if (diagram && content?.contains(diagram)) {
+      e.stopPropagation();
     }
+  };
+
+  onMounted(() => {
+    eventContainer = containerRef.value;
+    eventContainer?.addEventListener("click", handleClick);
+    eventContainer?.addEventListener("dblclick", handleDoubleClick);
   });
 
   onUnmounted(() => {
-    if (containerRef.value) {
-      containerRef.value.removeEventListener("click", handleClick);
-    }
+    imageController?.abort();
+    eventContainer?.removeEventListener("click", handleClick);
+    eventContainer?.removeEventListener("dblclick", handleDoubleClick);
+    eventContainer = null;
   });
 }

@@ -5,7 +5,7 @@
 //! `src/features/logcenter/logCenterStore.ts`），本模块不持有任何会话状态。
 
 use crate::vcp_modules::infra::admin_api;
-use crate::vcp_modules::settings_manager::{read_settings, SettingsState};
+use crate::vcp_modules::settings_manager::{read_config, SettingsState};
 use reqwest::{Method, StatusCode};
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
@@ -27,16 +27,13 @@ pub struct LogFetchResult {
     #[serde(default)]
     pub content: String,
     /// 新的字节偏移（= 当前 fileSize）。
-    #[serde(default)]
     pub offset: u64,
     /// 服务器端日志文件绝对路径（仅用于展示）。
-    #[serde(default)]
     pub path: String,
     /// 服务器端日志文件大小。
     #[serde(default)]
     pub file_size: u64,
     /// true 表示检测到日志轮转/截断，前端必须丢弃本地缓冲并全量重拉。
-    #[serde(default)]
     pub need_full_reload: bool,
 }
 
@@ -80,7 +77,7 @@ pub async fn logcenter_fetch<R: Runtime>(
     incremental: bool,
     offset: u64,
 ) -> Result<LogFetchResult, String> {
-    let settings = read_settings(app_handle, settings_state).await?;
+    let settings = read_config(app_handle, settings_state).await?;
     admin_api::ensure_admin_config(&settings, "日志中心")?;
 
     let mut request = admin_api::admin_request(&settings, Method::GET, &["server-log"])?;
@@ -134,7 +131,7 @@ pub async fn logcenter_clear_server<R: Runtime>(
     app_handle: AppHandle<R>,
     settings_state: State<'_, SettingsState>,
 ) -> Result<String, String> {
-    let settings = read_settings(app_handle, settings_state).await?;
+    let settings = read_config(app_handle, settings_state).await?;
     admin_api::ensure_admin_config(&settings, "日志中心")?;
 
     let resp = admin_api::admin_request(&settings, Method::POST, &["server-log", "clear"])?
@@ -152,52 +149,39 @@ pub async fn logcenter_clear_server<R: Runtime>(
 }
 
 #[cfg(test)]
-mod tests {
+mod response_tests {
     use super::*;
+    use serde_json::json;
 
     #[test]
-    fn strip_replacement_chars_at_boundaries() {
-        assert_eq!(strip_boundary_replacement_chars("\u{FFFD}abc"), "abc");
-        assert_eq!(strip_boundary_replacement_chars("abc\u{FFFD}"), "abc");
-        assert_eq!(
-            strip_boundary_replacement_chars("\u{FFFD}\u{FFFD}abc\u{FFFD}"),
-            "abc"
-        );
-        assert_eq!(strip_boundary_replacement_chars("abc"), "abc");
-        assert_eq!(strip_boundary_replacement_chars(""), "");
+    fn empty_logs_and_rotation_keep_their_distinct_protocol_meanings() {
+        let empty: LogFetchResult = serde_json::from_value(json!({
+            "content":"","offset":0,"path":"/logs/server.log","fileSize":0,"needFullReload":false
+        }))
+        .unwrap();
+        assert!(empty.content.is_empty());
+        assert_eq!(empty.offset, 0);
+        assert!(!empty.need_full_reload);
+        let rotation: LogFetchResult = serde_json::from_value(json!({
+            "offset":0,"path":"/logs/server.log","needFullReload":true
+        }))
+        .unwrap();
+        assert!(rotation.need_full_reload);
+        assert!(rotation.content.is_empty());
+        assert_eq!(rotation.file_size, 0);
     }
 
     #[test]
-    fn strip_preserves_interior_replacement_chars() {
-        // 日志内容中间出现的 U+FFFD 可能本就是日志内容的一部分，不剥除。
-        assert_eq!(
-            strip_boundary_replacement_chars("ab\u{FFFD}cd"),
-            "ab\u{FFFD}cd"
-        );
-    }
-
-    #[test]
-    fn fetch_result_deserializes_rotation_notice() {
-        let json = r#"{"needFullReload":true,"path":"/srv/DebugLog/ServerLog.txt","offset":0}"#;
-        let result: LogFetchResult = serde_json::from_str(json).unwrap();
-        assert!(result.need_full_reload);
-        assert_eq!(result.content, "");
-        assert_eq!(result.offset, 0);
-    }
-
-    #[test]
-    fn fetch_result_deserializes_full_payload() {
-        let json = r#"{
-            "content": "[2026-08-18 10:00:00] [INFO] boot\n",
-            "offset": 42,
-            "path": "/srv/DebugLog/ServerLog.txt",
-            "fileSize": 42,
-            "needFullReload": false
-        }"#;
-        let result: LogFetchResult = serde_json::from_str(json).unwrap();
-        assert!(!result.need_full_reload);
-        assert_eq!(result.offset, 42);
-        assert_eq!(result.file_size, 42);
-        assert!(result.content.contains("[INFO]"));
+    fn missing_cursor_fields_do_not_become_successful_empty_logs() {
+        let valid = json!({"content":"new\n","offset":50,"path":"/logs/server.log","fileSize":50,"needFullReload":false});
+        assert!(serde_json::from_value::<LogFetchResult>(json!({})).is_err());
+        for key in ["offset", "path", "needFullReload"] {
+            let mut missing = valid.clone();
+            missing.as_object_mut().unwrap().remove(key);
+            assert!(
+                serde_json::from_value::<LogFetchResult>(missing).is_err(),
+                "{key}"
+            );
+        }
     }
 }

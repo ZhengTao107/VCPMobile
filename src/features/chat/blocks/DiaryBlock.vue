@@ -76,11 +76,14 @@ const replaceHtml = computed(() => {
       </template>
     </div>
 
+    <!-- eslint-disable vue/no-v-html -- renderMarkdownNodes escapes generated fields, filters URLs, and guards embedded HTML. -->
     <div
       v-if="hasNodes(block.nodes)"
       class="vcp-diary-content vcp-markdown-block"
+      data-message-content
       v-html="diaryHtml"
     />
+    <!-- eslint-enable vue/no-v-html -->
     <div v-else class="vcp-diary-content vcp-markdown-block">
       <p>{{ block.content || "[日记内容解析失败]" }}</p>
     </div>
@@ -105,11 +108,14 @@ const replaceHtml = computed(() => {
     <div class="vcp-diary-update-body">
       <div class="vcp-diary-update-side vcp-diary-update-before">
         <div class="vcp-diary-update-label">A</div>
+        <!-- eslint-disable vue/no-v-html -- renderMarkdownNodes escapes generated fields, filters URLs, and guards embedded HTML. -->
         <div
           v-if="block.target?.trim() && hasNodes(block.target_nodes)"
           class="vcp-diary-update-content vcp-markdown-block"
+          data-message-content
           v-html="targetHtml"
         />
+        <!-- eslint-enable vue/no-v-html -->
         <div v-else-if="block.target?.trim()" class="vcp-diary-update-content vcp-markdown-block">
           <p>{{ block.target }}</p>
         </div>
@@ -120,11 +126,14 @@ const replaceHtml = computed(() => {
 
       <div class="vcp-diary-update-side vcp-diary-update-after">
         <div class="vcp-diary-update-label">B</div>
+        <!-- eslint-disable vue/no-v-html -- renderMarkdownNodes escapes generated fields, filters URLs, and guards embedded HTML. -->
         <div
           v-if="block.replace?.trim() && hasNodes(block.replace_nodes)"
           class="vcp-diary-update-content vcp-markdown-block"
+          data-message-content
           v-html="replaceHtml"
         />
+        <!-- eslint-enable vue/no-v-html -->
         <div v-else-if="block.replace?.trim()" class="vcp-diary-update-content vcp-markdown-block">
           <p>{{ block.replace }}</p>
         </div>

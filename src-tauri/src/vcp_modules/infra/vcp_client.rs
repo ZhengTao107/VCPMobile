@@ -4,7 +4,7 @@ use dashmap::DashMap;
 use futures_util::StreamExt;
 #[cfg(not(target_os = "android"))]
 use futures_util::TryStreamExt;
-use reqwest::header::{AUTHORIZATION, CONTENT_TYPE};
+use reqwest::header::{AUTHORIZATION, CONTENT_LENGTH, CONTENT_TYPE};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -12,21 +12,27 @@ use serde_json::{json, Value};
 use std::sync::Arc;
 use std::time::Duration;
 use tauri::{ipc::Channel, AppHandle, Manager, Runtime};
+use tokio::sync::{futures::OwnedNotified, Notify};
 use tokio_util::codec::FramedRead;
 #[cfg(target_os = "android")]
 use tokio_util::codec::LengthDelimitedCodec;
 #[cfg(not(target_os = "android"))]
 use tokio_util::io::StreamReader;
 use tokio_util::sync::CancellationToken;
-use url::Url;
 
+use super::lifecycle_state::LifecycleState;
+use super::vcp_http_endpoint::{
+    resolve_chat_endpoint, resolve_model_discovery_endpoint, ChatRequestPurpose,
+};
+use super::vcp_ws_activity::{ChatActivityGuard, WsActivityPolicy};
 use crate::vcp_modules::aurora_pipeline::{AuroraBuffer, AuroraUpdate, AuroraUpdateKind};
 use crate::vcp_modules::content_parser::ContentBlock;
 use crate::vcp_modules::db_manager::DbState;
-use crate::vcp_modules::settings_manager::{
-    read_settings, ChatEndpointMode, Settings, SettingsState,
-};
+use crate::vcp_modules::settings_manager::{ChatEndpointMode, Settings};
 use crate::vcp_modules::topic_types::{MessageKey, TopicKey};
+
+mod request_body;
+use request_body::PreparedBody;
 
 #[cfg(target_os = "android")]
 const HELPER_CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
@@ -81,17 +87,6 @@ pub struct VcpRequestPayload {
     pub transport_request_id: Option<String>,
 }
 
-const STANDARD_CHAT_SUFFIX: &str = "/v1/chat/completions";
-const VCP_TOOLS_CHAT_SUFFIX: &str = "/v1/chatvcp/completions";
-const MODELS_SUFFIX: &str = "/v1/models";
-pub const MODEL_DISCOVERY_UNAVAILABLE: &str = "MODEL_DISCOVERY_UNAVAILABLE";
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ChatRequestPurpose {
-    Interactive,
-    Auxiliary,
-}
-
 #[derive(Debug, Clone)]
 pub struct ChatConnectionSnapshot {
     pub endpoint_url: String,
@@ -105,125 +100,20 @@ pub struct ChatEndpointPreview {
     pub model_discovery_url: Option<String>,
 }
 
-struct ValidatedHttpEndpoint {
-    url: Url,
-    explicit_default_port: Option<u16>,
-}
-
-fn explicit_port_from_raw(raw_url: &str) -> Option<u16> {
-    let (_, after_scheme) = raw_url.split_once("://")?;
-    let authority = after_scheme
-        .split(['/', '?', '#'])
-        .next()
-        .unwrap_or_default();
-    let port = if authority.starts_with('[') {
-        let closing_bracket = authority.find(']')?;
-        authority.get(closing_bracket + 1..)?.strip_prefix(':')?
-    } else {
-        authority.rsplit_once(':')?.1
-    };
-    port.parse().ok()
-}
-
-fn validate_http_endpoint(raw_url: &str) -> Result<ValidatedHttpEndpoint, String> {
-    if raw_url.chars().any(char::is_control) {
-        return Err("URL 不能包含控制字符".to_string());
-    }
-
-    let url = Url::parse(raw_url).map_err(|error| format!("URL 解析失败: {error}"))?;
-    if url.scheme() != "http" && url.scheme() != "https" {
-        return Err("URL 仅支持 HTTP 或 HTTPS".to_string());
-    }
-    if url.host_str().is_none() {
-        return Err("URL 必须包含主机名".to_string());
-    }
-    if !url.username().is_empty() || url.password().is_some() {
-        return Err("URL 不能包含用户名或密码".to_string());
-    }
-    if url.fragment().is_some() {
-        return Err("URL 不能包含 fragment".to_string());
-    }
-    let explicit_default_port = explicit_port_from_raw(raw_url)
-        .filter(|port| url.port().is_none() && url.port_or_known_default() == Some(*port));
-    Ok(ValidatedHttpEndpoint {
-        url,
-        explicit_default_port,
-    })
-}
-
-fn strip_known_chat_suffix(path: &str) -> Option<&str> {
-    let path = path.trim_end_matches('/');
-    [STANDARD_CHAT_SUFFIX, VCP_TOOLS_CHAT_SUFFIX]
-        .into_iter()
-        .find_map(|suffix| path.strip_suffix(suffix))
-}
-
-fn derive_known_api_endpoint(endpoint: ValidatedHttpEndpoint, suffix: &str) -> String {
-    let ValidatedHttpEndpoint {
-        mut url,
-        explicit_default_port,
-    } = endpoint;
-    let path = url.path().trim_end_matches('/');
-    let prefix = strip_known_chat_suffix(path)
-        .or_else(|| path.strip_suffix("/v1"))
-        .unwrap_or(path)
-        .trim_end_matches('/');
-    url.set_path(&format!("{prefix}{suffix}"));
-    let mut derived = url.to_string();
-    if let Some(port) = explicit_default_port {
-        if let Some(after_scheme) = derived.find("://").map(|index| index + 3) {
-            let authority_len = derived[after_scheme..]
-                .find(['/', '?', '#'])
-                .unwrap_or(derived.len() - after_scheme);
-            derived.insert_str(after_scheme + authority_len, &format!(":{port}"));
-        }
-    }
-    derived
-}
-
-pub fn resolve_chat_endpoint(
-    raw_url: &str,
-    mode: ChatEndpointMode,
-    purpose: ChatRequestPurpose,
-) -> Result<String, String> {
-    let endpoint = validate_http_endpoint(raw_url)?;
-    if mode == ChatEndpointMode::Raw {
-        // Raw 模式只做安全校验，正式请求必须逐字复用用户输入。
-        return Ok(raw_url.to_string());
-    }
-
-    let suffix = match (mode, purpose) {
-        (ChatEndpointMode::VcpTools, ChatRequestPurpose::Interactive) => VCP_TOOLS_CHAT_SUFFIX,
-        _ => STANDARD_CHAT_SUFFIX,
-    };
-    Ok(derive_known_api_endpoint(endpoint, suffix))
-}
-
-pub fn resolve_model_discovery_endpoint(
-    raw_url: &str,
-    mode: ChatEndpointMode,
-) -> Result<Option<String>, String> {
-    let endpoint = validate_http_endpoint(raw_url)?;
-    if mode == ChatEndpointMode::Raw && strip_known_chat_suffix(endpoint.url.path()).is_none() {
-        return Ok(None);
-    }
-    Ok(Some(derive_known_api_endpoint(endpoint, MODELS_SUFFIX)))
-}
-
 pub fn freeze_chat_connection(
     settings: &Settings,
     purpose: ChatRequestPurpose,
 ) -> Result<ChatConnectionSnapshot, String> {
-    if settings.vcp_server_url.is_empty() {
+    if settings.server.url.is_empty() {
         return Err("VCP Server URL is not configured.".to_string());
     }
     Ok(ChatConnectionSnapshot {
         endpoint_url: resolve_chat_endpoint(
-            &settings.vcp_server_url,
-            settings.chat_endpoint_mode,
+            &settings.server.url,
+            settings.server.endpoint_mode,
             purpose,
         )?,
-        api_key: settings.vcp_api_key.clone(),
+        api_key: settings.server.api_key.clone(),
     })
 }
 
@@ -336,6 +226,25 @@ impl StreamEvent {
     }
 }
 
+/// Transport-owned text is moved into the durable finalizer. Internal callers
+/// consume these fields directly instead of serializing a second JSON response.
+#[derive(Debug)]
+pub struct VcpResponse {
+    pub full_content: String,
+    pub finish_reason: Option<String>,
+    pub is_aborted: bool,
+}
+
+impl VcpResponse {
+    pub(crate) fn cancelled() -> Self {
+        Self {
+            full_content: String::new(),
+            finish_reason: Some("cancelled_by_user".to_string()),
+            is_aborted: true,
+        }
+    }
+}
+
 /// VCP 请求失败的内部类型。流式路径显式携带已经接收的完整 partial，
 /// 防止上层只能从尚未写入正文的 pending 数据库行猜测内容。
 #[derive(Debug, Clone)]
@@ -343,14 +252,16 @@ pub struct VcpRequestFailure {
     message: String,
     partial_content: Option<String>,
     recovery_pending: bool,
+    stop_pending: bool,
 }
 
 impl VcpRequestFailure {
-    fn streaming(message: impl Into<String>, partial_content: String) -> Self {
+    pub(crate) fn streaming(message: impl Into<String>, partial_content: String) -> Self {
         Self {
             message: message.into(),
             partial_content: Some(partial_content),
             recovery_pending: false,
+            stop_pending: false,
         }
     }
 
@@ -360,11 +271,32 @@ impl VcpRequestFailure {
             message: message.into(),
             partial_content,
             recovery_pending: true,
+            stop_pending: false,
         }
     }
 
     pub(crate) fn is_recovery_pending(&self) -> bool {
         self.recovery_pending
+    }
+
+    pub(crate) fn is_stop_pending(&self) -> bool {
+        self.stop_pending
+    }
+
+    fn preparation(message: String) -> Self {
+        Self::from(format!(
+            "附件准备失败，本次请求未发送。原消息与附件仍保留，可重试或移除问题附件。\n{message}"
+        ))
+    }
+
+    #[cfg(target_os = "android")]
+    fn stopping(message: impl Into<String>, partial_content: Option<String>) -> Self {
+        Self {
+            message: message.into(),
+            partial_content,
+            recovery_pending: true,
+            stop_pending: true,
+        }
     }
 
     pub fn into_parts(self) -> (String, Option<String>) {
@@ -386,6 +318,7 @@ impl From<String> for VcpRequestFailure {
             message,
             partial_content: None,
             recovery_pending: false,
+            stop_pending: false,
         }
     }
 }
@@ -411,12 +344,21 @@ pub struct ActiveRequestEntry {
     released: CancellationToken,
 }
 
+type ChatEventFeed = Arc<dyn Fn(&StreamEvent) + Send + Sync>;
+type ChatListenerLookup = Arc<dyn Fn(&str) -> bool + Send + Sync>;
+
 #[derive(Default)]
 struct RequestOutputState {
     channel: Option<Channel<StreamEvent>>,
     snapshot_pending: bool,
     closed: bool,
     consumer_revision: u64,
+    owner_released: bool,
+    origin_user_message_id: Option<String>,
+    chat_feed: Option<ChatEventFeed>,
+    has_chat_listener: Option<ChatListenerLookup>,
+    pending_terminal: Option<Arc<crate::vcp_modules::chat::message_service::PendingStreamTerminal>>,
+    discarded: bool,
 }
 
 static NEXT_CONSUMER_REVISION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
@@ -425,9 +367,9 @@ fn next_consumer_revision() -> u64 {
     NEXT_CONSUMER_REVISION.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }
 
-/// The request retains one output consumer, not another copy of its content.
-/// AuroraBuffer remains in the producer; a replacement consumer starts with a
-/// snapshot from that buffer before any subsequent delta is committed.
+/// AuroraBuffer owns live content. Once a transport without a helper finishes,
+/// this owner retains its terminal result until SQLite accepts it or history is
+/// explicitly discarded. A failed commit must not become a lost generation.
 #[derive(Default)]
 struct RequestOutput {
     state: std::sync::Mutex<RequestOutputState>,
@@ -443,9 +385,71 @@ struct HelperHandoff {
     transport_request_id: String,
     generation: String,
     _stream: Option<tokio::net::TcpStream>,
+    completed_file: Option<std::path::PathBuf>,
 }
 
 impl RequestOutput {
+    fn pending_terminal(
+        &self,
+    ) -> Option<Arc<crate::vcp_modules::chat::message_service::PendingStreamTerminal>> {
+        self.state.lock().ok()?.pending_terminal.clone()
+    }
+
+    fn settle_terminal(&self, discarded: bool) {
+        if let Ok(mut state) = self.state.lock() {
+            state.pending_terminal = None;
+            state.discarded |= discarded;
+        }
+    }
+
+    fn reopen_for_terminal_retry(&self) -> Result<(), String> {
+        let mut state = self.state.lock().map_err(|error| error.to_string())?;
+        state.closed = state.discarded;
+        state.owner_released = false;
+        state.channel = None;
+        Ok(())
+    }
+
+    fn bind_chat_feed<R: Runtime>(&self, app: &AppHandle<R>) {
+        if let Ok(mut state) = self.state.lock() {
+            if state.chat_feed.is_none() {
+                let feed_app = app.clone();
+                let check_app = app.clone();
+                state.chat_feed = Some(Arc::new(move |event| {
+                    crate::vcp_modules::chat::voice_service::feed_chat_event(&feed_app, event)
+                }));
+                state.has_chat_listener = Some(Arc::new(move |origin| {
+                    crate::vcp_modules::chat::voice_service::has_chat_listener(&check_app, origin)
+                }));
+            }
+        }
+    }
+
+    fn send_activity(&self, key: &MessageKey, request_id: uuid::Uuid, active: bool) -> bool {
+        let Ok(mut state) = self.state.lock() else {
+            return false;
+        };
+        if state.owner_released {
+            return false;
+        }
+        if !active {
+            state.owner_released = true;
+        }
+        // Owner metadata survives a content end/error so the lease can always
+        // release its preparation/busy indicator after durable settlement.
+        Self::send_locked(
+            &state,
+            StreamEvent {
+                r#type: "request_activity".to_string(),
+                context: Some(json!({
+                    "ownerType": key.topic.owner_type, "ownerId": key.topic.owner_id,
+                    "topicId": key.topic.topic_id, "requestId": request_id,
+                })),
+                chunk: Some(json!({ "active": active })),
+                ..Default::default()
+            },
+        )
+    }
     #[cfg(target_os = "android")]
     fn retain_helper_handoff(
         &self,
@@ -458,6 +462,19 @@ impl RequestOutput {
                 transport_request_id,
                 generation,
                 _stream: stream,
+                completed_file: None,
+            });
+        }
+    }
+
+    #[cfg(target_os = "android")]
+    fn retain_completed_file(&self, file: &OfflineCompletedFile) {
+        if let Ok(mut handoff) = self.helper_handoff.lock() {
+            *handoff = Some(HelperHandoff {
+                transport_request_id: file.metadata.request_id.clone(),
+                generation: file.metadata.generation.clone(),
+                _stream: None,
+                completed_file: Some(file.path.clone()),
             });
         }
     }
@@ -472,14 +489,23 @@ impl RequestOutput {
     }
 
     fn attach(&self, channel: Channel<StreamEvent>) -> Result<bool, String> {
+        self.attach_connection(channel, false)
+    }
+
+    fn attach_connection(
+        &self,
+        channel: Channel<StreamEvent>,
+        replace_connection: bool,
+    ) -> Result<bool, String> {
         let mut state = self.state.lock().map_err(|error| error.to_string())?;
-        if state.closed {
+        if state.closed || state.owner_released {
             return Ok(false);
         }
-        if state
-            .channel
-            .as_ref()
-            .is_some_and(|current| current.id() == channel.id())
+        if !replace_connection
+            && state
+                .channel
+                .as_ref()
+                .is_some_and(|current| current.id() == channel.id())
         {
             return Ok(true);
         }
@@ -515,6 +541,15 @@ impl RequestOutput {
 
     fn send_locked(state: &RequestOutputState, mut event: StreamEvent) -> bool {
         event.consumer_revision = state.consumer_revision;
+        if let Some(origin) = &state.origin_user_message_id {
+            let context = event.context.get_or_insert_with(|| json!({}));
+            if let Some(context) = context.as_object_mut() {
+                context.insert("originUserMessageId".into(), json!(origin));
+            }
+        }
+        if let Some(feed) = &state.chat_feed {
+            feed(&event);
+        }
         match &state.channel {
             Some(channel) => channel
                 .send(event)
@@ -540,7 +575,13 @@ impl RequestOutput {
         if state.closed {
             return;
         }
-        if state.channel.is_none() {
+        let feeds_tts = state.origin_user_message_id.as_ref().is_some_and(|origin| {
+            state
+                .has_chat_listener
+                .as_ref()
+                .is_some_and(|listener| listener(origin))
+        });
+        if state.channel.is_none() && !feeds_tts {
             buffer.discard_pending_delivery();
             state.snapshot_pending = true;
             return;
@@ -569,6 +610,8 @@ impl RequestOutput {
         if let Ok(mut state) = self.state.lock() {
             state.closed = true;
             state.channel = None;
+            state.chat_feed = None;
+            state.has_chat_listener = None;
         }
     }
 }
@@ -578,13 +621,31 @@ fn request_output<R: Runtime>(
     key: &MessageKey,
     channel: Option<Channel<StreamEvent>>,
 ) -> Arc<RequestOutput> {
+    // A reconnect can finish discovery after another WebView has connected.
+    // New owners always take the current consumer, never that stale caller's.
+    let requests = app.try_state::<ActiveRequests>();
+    let connection = requests
+        .as_ref()
+        .and_then(|requests| requests.1.lock().ok());
+    let channel = connection
+        .as_ref()
+        .and_then(|connection| {
+            connection
+                .as_ref()
+                .map(|connection| connection.channel.clone())
+        })
+        .or(channel);
     let output = app
         .try_state::<ActiveRequests>()
         .and_then(|requests| requests.0.get(key).map(|entry| entry.output.clone()))
         .unwrap_or_default();
-    let group = app
-        .try_state::<ActiveGroupTurns>()
-        .and_then(|turns| turns.0.get(&key.topic).map(|entry| entry.value().clone()));
+    output.bind_chat_feed(app);
+    let group = app.try_state::<ActiveGroupTurns>().and_then(|turns| {
+        turns
+            .active
+            .get(&key.topic)
+            .map(|entry| entry.value().clone())
+    });
     if let Some(group) = group {
         if let Ok(mut current) = group.channel.lock() {
             if current.is_none() {
@@ -608,6 +669,34 @@ pub(crate) fn deliver_request_event<R: Runtime>(
     request_output(app, key, channel).send(event);
 }
 
+pub(crate) fn retain_request_terminal<R: Runtime>(
+    app: &AppHandle<R>,
+    key: &MessageKey,
+    terminal: Arc<crate::vcp_modules::chat::message_service::PendingStreamTerminal>,
+) {
+    let Some(output) = app
+        .try_state::<ActiveRequests>()
+        .and_then(|requests| requests.0.get(key).map(|entry| entry.output.clone()))
+    else {
+        return;
+    };
+    // Android already retains these results through its helper handoff. Do not
+    // keep a second resident owner beside a live helper or its completed file.
+    #[cfg(target_os = "android")]
+    if output
+        .helper_handoff
+        .lock()
+        .is_ok_and(|handoff| handoff.is_some())
+    {
+        return;
+    }
+    if let Ok(mut state) = output.state.lock() {
+        if !state.discarded && state.pending_terminal.is_none() {
+            state.pending_terminal = Some(terminal);
+        }
+    };
+}
+
 /// Only the durable owner can acknowledge a helper result. Delivery to a
 /// WebView is deliberately unrelated to this resource handoff.
 pub(crate) async fn release_committed_helper<R: Runtime>(app: &AppHandle<R>, key: &MessageKey) {
@@ -622,7 +711,17 @@ pub(crate) async fn discard_request_helper<R: Runtime>(app: &AppHandle<R>, key: 
 /// process has restarted and no local request lease exists anymore.
 pub(crate) async fn discard_deleted_generation<R: Runtime>(app: &AppHandle<R>, key: &MessageKey) {
     if let Some(requests) = app.try_state::<ActiveRequests>() {
-        let _ = requests.cancel(key);
+        if let Some(request) = requests.0.get(key).map(|entry| entry.value().clone()) {
+            request.output.settle_terminal(true);
+            request.output.send_activity(key, request.attempt_id, false);
+            request.output.close();
+            let _ = requests.cancel(key);
+            if request.released.is_cancelled() {
+                requests
+                    .0
+                    .remove_if(key, |_, current| current.attempt_id == request.attempt_id);
+            }
+        }
     }
     #[cfg(target_os = "android")]
     {
@@ -679,11 +778,14 @@ pub(crate) async fn discard_deleted_generation<R: Runtime>(app: &AppHandle<R>, k
 }
 
 async fn settle_helper_handoff<R: Runtime>(app: &AppHandle<R>, key: &MessageKey, committed: bool) {
+    let output = app
+        .try_state::<ActiveRequests>()
+        .and_then(|requests| requests.0.get(key).map(|entry| entry.output.clone()));
+    if let Some(output) = &output {
+        output.settle_terminal(!committed);
+    }
     #[cfg(target_os = "android")]
     {
-        let output = app
-            .try_state::<ActiveRequests>()
-            .and_then(|requests| requests.0.get(key).map(|entry| entry.output.clone()));
         let handoff = output.and_then(|output| {
             output
                 .helper_handoff
@@ -703,6 +805,11 @@ async fn settle_helper_handoff<R: Runtime>(app: &AppHandle<R>, key: &MessageKey,
                 // socket lets the helper publish an orphan for later cleanup.
                 log::warn!("[VCPClient] Helper terminal handoff failed: {error}");
             }
+            if let Some(path) = handoff.completed_file {
+                if let Err(error) = remove_offline_completed(&path).await {
+                    log::warn!("[VCPClient] Settled helper file cleanup failed: {error}");
+                }
+            }
         }
     }
     #[cfg(not(target_os = "android"))]
@@ -712,12 +819,20 @@ async fn settle_helper_handoff<R: Runtime>(app: &AppHandle<R>, key: &MessageKey,
 pub type ActiveRequestMap = Arc<DashMap<MessageKey, Arc<ActiveRequestEntry>>>;
 
 /// 全局活跃请求管理器。相同 message id 只允许一个 live attempt。
-pub struct ActiveRequests(pub ActiveRequestMap);
+pub struct ActiveRequests(
+    pub ActiveRequestMap,
+    std::sync::Mutex<Option<ChatOutputConnection>>,
+);
+
+struct ChatOutputConnection {
+    id: String,
+    channel: Channel<StreamEvent>,
+}
 
 impl Default for ActiveRequests {
     fn default() -> Self {
         log::info!("[VCPClient] Initialized ActiveRequests successfully.");
-        Self(Arc::new(DashMap::new()))
+        Self(Arc::new(DashMap::new()), std::sync::Mutex::new(None))
     }
 }
 
@@ -740,45 +855,112 @@ pub struct ActiveRequestLease {
 }
 
 impl ActiveRequestLease {
+    pub(crate) fn set_origin_user_message(&self, id: &str) -> Result<(), String> {
+        self.entry
+            .output
+            .state
+            .lock()
+            .map_err(|error| error.to_string())?
+            .origin_user_message_id = Some(id.to_string());
+        Ok(())
+    }
+
+    pub(crate) fn bind_output<R: Runtime>(
+        &self,
+        app: &AppHandle<R>,
+        channel: Option<Channel<StreamEvent>>,
+    ) -> Result<(), String> {
+        let output = request_output(app, &self.key, channel);
+        output.send_activity(&self.key, self.entry.attempt_id, true);
+        Ok(())
+    }
+
+    #[cfg(test)]
     pub fn try_acquire(
         requests: ActiveRequestMap,
         key: MessageKey,
     ) -> Result<(Self, CancellationToken), String> {
-        let attempt_id = uuid::Uuid::new_v4();
-        let cancellation_token = CancellationToken::new();
-        let entry = Arc::new(ActiveRequestEntry {
-            attempt_id,
-            cancellation_token: cancellation_token.clone(),
-            output: Arc::default(),
-            released: CancellationToken::new(),
-        });
+        Self::try_acquire_with_cancellation(requests, key, CancellationToken::new())
+    }
 
-        match requests.entry(key.clone()) {
+    pub(crate) fn try_acquire_with_cancellation(
+        requests: ActiveRequestMap,
+        key: MessageKey,
+        cancellation_token: CancellationToken,
+    ) -> Result<(Self, CancellationToken), String> {
+        Self::try_acquire_inner(requests, key, cancellation_token, false)
+    }
+
+    fn try_acquire_recovery(
+        requests: ActiveRequestMap,
+        key: MessageKey,
+    ) -> Result<(Self, CancellationToken), String> {
+        Self::try_acquire_inner(requests, key, CancellationToken::new(), true)
+    }
+
+    fn try_acquire_inner(
+        requests: ActiveRequestMap,
+        key: MessageKey,
+        cancellation_token: CancellationToken,
+        recovering: bool,
+    ) -> Result<(Self, CancellationToken), String> {
+        let attempt_id = uuid::Uuid::new_v4();
+        let make_entry = |output| {
+            Arc::new(ActiveRequestEntry {
+                attempt_id,
+                cancellation_token: cancellation_token.clone(),
+                output,
+                released: CancellationToken::new(),
+            })
+        };
+
+        let entry = match requests.entry(key.clone()) {
             Entry::Vacant(slot) => {
+                let entry = make_entry(Arc::default());
                 slot.insert(entry.clone());
-                Ok((
-                    Self {
-                        requests: requests.clone(),
-                        key,
-                        entry,
-                    },
-                    cancellation_token,
+                entry
+            }
+            Entry::Occupied(mut slot) if recovering && slot.get().released.is_cancelled() => {
+                // The producer finished, but its terminal result still belongs
+                // to this output. Only one recovery may take the next lease.
+                let output = slot.get().output.clone();
+                output.reopen_for_terminal_retry()?;
+                let entry = make_entry(output);
+                slot.insert(entry.clone());
+                entry
+            }
+            Entry::Occupied(_) => {
+                return Err(format!(
+                    "Request {} is already active for {}/{}/{}; duplicate attempt rejected",
+                    key.msg_id, key.topic.owner_type, key.topic.owner_id, key.topic.topic_id
                 ))
             }
-            Entry::Occupied(_) => Err(format!(
-                "Request {} is already active for {}/{}/{}; duplicate attempt rejected",
-                key.msg_id, key.topic.owner_type, key.topic.owner_id, key.topic.topic_id
-            )),
-        }
+        };
+        Ok((
+            Self {
+                requests,
+                key,
+                entry,
+            },
+            cancellation_token,
+        ))
     }
 }
 
 impl Drop for ActiveRequestLease {
     fn drop(&mut self) {
+        self.entry
+            .output
+            .send_activity(&self.key, self.entry.attempt_id, false);
         self.entry.output.close();
         if let Entry::Occupied(entry) = self.requests.entry(self.key.clone()) {
             if entry.get().attempt_id == self.entry.attempt_id {
-                entry.remove();
+                // Publish release under the map guard so deletion cannot miss
+                // both this cleanup and the retained-entry cleanup path.
+                self.entry.released.cancel();
+                if self.entry.output.pending_terminal().is_none() {
+                    entry.remove();
+                }
             }
         }
         self.entry.released.cancel();
@@ -786,52 +968,194 @@ impl Drop for ActiveRequestLease {
 }
 
 struct ActiveGroupTurnEntry {
+    turn_id: uuid::Uuid,
     cancellation_token: CancellationToken,
+    released: Arc<Notify>,
     channel: std::sync::Mutex<Option<Channel<StreamEvent>>>,
+    origin_user_message_id: std::sync::Mutex<Option<String>>,
+    chat_feed: std::sync::Mutex<Option<ChatEventFeed>>,
+    session: std::sync::Mutex<Option<Arc<crate::vcp_modules::group::group_session::GroupSession>>>,
 }
 
 type ActiveGroupTurnMap = Arc<DashMap<TopicKey, Arc<ActiveGroupTurnEntry>>>;
 
 /// 每个 Topic 同时只允许一个群组回合，并由同一所有者承载回合取消状态。
-pub struct ActiveGroupTurns(ActiveGroupTurnMap);
+pub struct ActiveGroupTurns {
+    active: ActiveGroupTurnMap,
+    recent_continues: std::sync::Mutex<std::collections::VecDeque<(TopicKey, std::time::Instant)>>,
+    ws_activity: WsActivityPolicy,
+}
 
+#[cfg(test)]
 impl Default for ActiveGroupTurns {
     fn default() -> Self {
-        log::info!("[VCPClient] Initialized ActiveGroupTurns successfully.");
-        Self(Arc::new(DashMap::new()))
+        Self::new(&LifecycleState::new())
     }
 }
 
 impl ActiveGroupTurns {
-    pub(crate) fn try_acquire(&self, key: TopicKey) -> Result<ActiveGroupTurnLease, String> {
-        let cancellation_token = CancellationToken::new();
-
-        match self.0.entry(key.clone()) {
-            Entry::Vacant(slot) => {
-                slot.insert(Arc::new(ActiveGroupTurnEntry {
-                    cancellation_token: cancellation_token.clone(),
-                    channel: std::sync::Mutex::new(None),
-                }));
-                Ok(ActiveGroupTurnLease {
-                    turns: self.0.clone(),
-                    key,
-                    cancellation_token,
-                })
-            }
-            Entry::Occupied(_) => Err(format!(
-                "Group turn is already active for {}/{}/{}",
-                key.owner_type, key.owner_id, key.topic_id
-            )),
+    pub(crate) fn new(lifecycle: &LifecycleState) -> Self {
+        log::info!("[VCPClient] Initialized ActiveGroupTurns successfully.");
+        Self {
+            active: Arc::new(DashMap::new()),
+            recent_continues: Default::default(),
+            ws_activity: lifecycle.ws_activity.clone(),
         }
     }
 
-    fn cancel(&self, key: &TopicKey) -> bool {
-        let Some(entry) = self.0.get(key) else {
+    pub(crate) fn accept_continue(&self, key: &TopicKey, debounce_ms: u32) -> Result<(), String> {
+        let mut recent = self.recent_continues.lock().map_err(|e| e.to_string())?;
+        recent.retain(|(_, time)| time.elapsed() < Duration::from_secs(10));
+        if recent.iter().any(|(topic, time)| {
+            topic == key && time.elapsed() < Duration::from_millis(debounce_ms as u64)
+        }) {
+            return Err("继续操作过于频繁，请稍后重试。".into());
+        }
+        recent.retain(|(topic, _)| topic != key);
+        while recent.len() >= 128 {
+            recent.pop_front();
+        }
+        recent.push_back((key.clone(), std::time::Instant::now()));
+        Ok(())
+    }
+
+    pub(crate) fn try_acquire(&self, key: TopicKey) -> Result<ActiveGroupTurnLease, String> {
+        self.try_acquire_or_wait(key.clone()).map_err(|_| {
+            format!(
+                "Group turn is already active for {}/{}/{}",
+                key.owner_type, key.owner_id, key.topic_id
+            )
+        })
+    }
+
+    /// Atomically acquire the slot or subscribe to its current owner's release.
+    pub(crate) fn try_acquire_or_wait(
+        &self,
+        key: TopicKey,
+    ) -> Result<ActiveGroupTurnLease, OwnedNotified> {
+        match self.active.entry(key.clone()) {
+            Entry::Vacant(slot) => {
+                let cancellation_token = CancellationToken::new();
+                slot.insert(Arc::new(ActiveGroupTurnEntry {
+                    turn_id: uuid::Uuid::new_v4(),
+                    cancellation_token: cancellation_token.clone(),
+                    released: Arc::new(Notify::new()),
+                    channel: std::sync::Mutex::new(None),
+                    origin_user_message_id: std::sync::Mutex::new(None),
+                    chat_feed: std::sync::Mutex::new(None),
+                    session: std::sync::Mutex::new(None),
+                }));
+                Ok(ActiveGroupTurnLease {
+                    turns: self.active.clone(),
+                    key,
+                    cancellation_token,
+                    _activity: self.ws_activity.acquire_chat(),
+                })
+            }
+            // Construct the future under the map guard. notify_waiters also
+            // reaches futures created before release but first polled afterward.
+            Entry::Occupied(slot) => Err(slot.get().released.clone().notified_owned()),
+        }
+    }
+
+    pub(crate) fn cancel(&self, key: &TopicKey) -> bool {
+        let Some(entry) = self.active.get(key) else {
             return false;
         };
         entry.cancellation_token.cancel();
+        if let Ok(session) = entry.session.lock() {
+            if let Some(session) = session.as_ref() {
+                session.cancel_scopes();
+                session.invalidate();
+            }
+        }
+        let event = group_turn_event(key, &entry, true);
+        if let Ok(channel) = entry.channel.lock() {
+            if let Some(channel) = channel.as_ref() {
+                let _ = channel.send(event);
+            }
+        }
         drop(entry);
         true
+    }
+
+    pub(crate) fn cancel_owner(&self, owner_type: &str, owner_id: &str) {
+        let keys = self
+            .active
+            .iter()
+            .filter(|entry| {
+                entry.key().owner_type == owner_type && entry.key().owner_id == owner_id
+            })
+            .map(|entry| entry.key().clone())
+            .collect::<Vec<_>>();
+        for key in keys {
+            self.cancel(&key);
+        }
+    }
+
+    pub(crate) fn notify_history_changed(&self, key: &TopicKey) {
+        if let Some(session) = self.session(key) {
+            session.invalidate();
+            self.publish(key);
+        }
+    }
+
+    pub(crate) fn notify_group_changed(&self, group_id: &str) {
+        let keys = self
+            .active
+            .iter()
+            .filter(|entry| entry.key().owner_type == "group" && entry.key().owner_id == group_id)
+            .map(|entry| entry.key().clone())
+            .collect::<Vec<_>>();
+        for key in keys {
+            self.notify_history_changed(&key);
+        }
+    }
+
+    pub(crate) fn notify_all_groups_changed(&self) {
+        let keys = self
+            .active
+            .iter()
+            .map(|entry| entry.key().clone())
+            .collect::<Vec<_>>();
+        for key in keys {
+            self.notify_history_changed(&key);
+        }
+    }
+
+    pub(crate) fn topic_for_session(
+        &self,
+        session: &Arc<crate::vcp_modules::group::group_session::GroupSession>,
+    ) -> Option<TopicKey> {
+        self.active.iter().find_map(|entry| {
+            entry
+                .session
+                .lock()
+                .ok()?
+                .as_ref()
+                .filter(|current| Arc::ptr_eq(current, session))
+                .map(|_| entry.key().clone())
+        })
+    }
+
+    pub(crate) fn session(
+        &self,
+        key: &TopicKey,
+    ) -> Option<Arc<crate::vcp_modules::group::group_session::GroupSession>> {
+        self.active
+            .get(key)
+            .and_then(|entry| entry.session.lock().ok()?.clone())
+    }
+
+    pub(crate) fn publish(&self, key: &TopicKey) {
+        if let Some(entry) = self.active.get(key) {
+            let event = group_turn_event(key, &entry, true);
+            if let Ok(channel) = entry.channel.lock() {
+                if let Some(channel) = channel.as_ref() {
+                    let _ = channel.send(event);
+                }
+            }
+        }
     }
 
     fn attach_output(
@@ -839,9 +1163,9 @@ impl ActiveGroupTurns {
         requests: &ActiveRequests,
         key: &TopicKey,
         channel: Channel<StreamEvent>,
-    ) -> Result<(), String> {
-        let Some(turn) = self.0.get(key).map(|entry| entry.value().clone()) else {
-            return Ok(());
+    ) -> Result<Option<Value>, String> {
+        let Some(turn) = self.active.get(key) else {
+            return Ok(None);
         };
         let mut current = turn.channel.lock().map_err(|error| error.to_string())?;
         *current = Some(channel.clone());
@@ -852,7 +1176,30 @@ impl ActiveGroupTurns {
         {
             request.output.attach(channel.clone())?;
         }
-        Ok(())
+        let event = group_turn_event(key, &turn, true);
+        if let Ok(feed) = turn.chat_feed.lock() {
+            if let Some(feed) = feed.as_ref() {
+                feed(&event);
+            }
+        }
+        let _ = channel.send(event);
+        let mut snapshot = json!({
+            "ownerType": key.owner_type, "ownerId": key.owner_id,
+            "topicId": key.topic_id, "turnId": turn.turn_id,
+        });
+        if let Ok(session) = turn.session.lock() {
+            if let Some(session) = session.as_ref() {
+                if let Ok(Value::Object(extra)) = session
+                    .snapshot()
+                    .and_then(|snapshot| serde_json::to_value(snapshot).map_err(|e| e.to_string()))
+                {
+                    if let Some(snapshot) = snapshot.as_object_mut() {
+                        snapshot.extend(extra);
+                    }
+                }
+            }
+        }
+        Ok(Some(snapshot))
     }
 }
 
@@ -860,24 +1207,156 @@ pub(crate) struct ActiveGroupTurnLease {
     turns: ActiveGroupTurnMap,
     key: TopicKey,
     cancellation_token: CancellationToken,
+    // The same owner moves into the JEV worker and outlives individual speaker requests.
+    _activity: ChatActivityGuard,
 }
 
 impl ActiveGroupTurnLease {
+    pub(crate) fn start_session(
+        &self,
+        trigger: &'static str,
+        force_continue: bool,
+    ) -> Result<Arc<crate::vcp_modules::group::group_session::GroupSession>, String> {
+        let turn = self.turns.get(&self.key).ok_or("群聊执行租约已经释放")?;
+        let mut slot = turn.session.lock().map_err(|e| e.to_string())?;
+        if slot.is_some() {
+            return Err("群聊会话已经启动".into());
+        }
+        let session = crate::vcp_modules::group::group_session::GroupSession::new(
+            turn.turn_id.to_string(),
+            self.cancellation_token.clone(),
+            trigger,
+            force_continue,
+        );
+        *slot = Some(session.clone());
+        Ok(session)
+    }
+
+    pub(crate) fn set_origin_user_message(&self, id: &str) -> Result<(), String> {
+        if let Some(turn) = self.turns.get(&self.key) {
+            *turn
+                .origin_user_message_id
+                .lock()
+                .map_err(|error| error.to_string())? = Some(id.to_string());
+        }
+        Ok(())
+    }
+
+    pub(crate) fn origin_user_message(&self) -> Option<String> {
+        self.turns
+            .get(&self.key)
+            .and_then(|turn| turn.origin_user_message_id.lock().ok()?.clone())
+    }
+
     pub(crate) fn is_cancelled(&self) -> bool {
         self.cancellation_token.is_cancelled()
+    }
+
+    pub(crate) fn child_token(&self) -> CancellationToken {
+        self.cancellation_token.child_token()
+    }
+
+    pub(crate) fn cancel(&self) {
+        self.cancellation_token.cancel();
+    }
+
+    pub(crate) fn bind_output<R: Runtime>(
+        &self,
+        app: &AppHandle<R>,
+        channel: Channel<StreamEvent>,
+    ) -> Result<(), String> {
+        self.bind_optional_output(app, Some(channel))
+    }
+
+    pub(crate) fn bind_optional_output<R: Runtime>(
+        &self,
+        app: &AppHandle<R>,
+        channel: Option<Channel<StreamEvent>>,
+    ) -> Result<(), String> {
+        let requests = app.state::<ActiveRequests>();
+        let connection = requests.1.lock().map_err(|error| error.to_string())?;
+        let channel = connection
+            .as_ref()
+            .map(|connection| connection.channel.clone())
+            .or(channel);
+        if let Some(turn) = self.turns.get(&self.key) {
+            let feed_app = app.clone();
+            *turn.chat_feed.lock().map_err(|error| error.to_string())? =
+                Some(Arc::new(move |event| {
+                    crate::vcp_modules::chat::voice_service::feed_chat_event(&feed_app, event)
+                }));
+            let mut current = turn.channel.lock().map_err(|error| error.to_string())?;
+            *current = channel.clone();
+            let event = group_turn_event(&self.key, &turn, true);
+            if let Ok(feed) = turn.chat_feed.lock() {
+                if let Some(feed) = feed.as_ref() {
+                    feed(&event);
+                }
+            }
+            if let Some(channel) = channel {
+                let _ = channel.send(event);
+            }
+        }
+        Ok(())
     }
 }
 
 impl Drop for ActiveGroupTurnLease {
     fn drop(&mut self) {
-        self.turns.remove(&self.key);
+        if let Some((_, turn)) = self.turns.remove(&self.key) {
+            if let Ok(session) = turn.session.lock() {
+                if let Some(session) = session.as_ref() {
+                    session.close(None);
+                }
+            }
+            let event = group_turn_event(&self.key, &turn, false);
+            if let Ok(feed) = turn.chat_feed.lock() {
+                if let Some(feed) = feed.as_ref() {
+                    feed(&event);
+                }
+            }
+            if let Ok(channel) = turn.channel.lock() {
+                if let Some(channel) = channel.as_ref() {
+                    let _ = channel.send(event);
+                }
+            }
+            turn.released.notify_waiters();
+        }
+    }
+}
+
+fn group_turn_event(key: &TopicKey, turn: &ActiveGroupTurnEntry, active: bool) -> StreamEvent {
+    let mut chunk = json!({ "active": active });
+    if let Ok(session) = turn.session.lock() {
+        if let Some(session) = session.as_ref() {
+            if let Ok(Value::Object(extra)) = session
+                .snapshot()
+                .and_then(|snapshot| serde_json::to_value(snapshot).map_err(|e| e.to_string()))
+            {
+                if let Some(chunk) = chunk.as_object_mut() {
+                    chunk.extend(extra);
+                }
+            }
+        }
+    }
+    StreamEvent {
+        r#type: "group_turn".to_string(),
+        context: Some(json!({
+            "ownerType": key.owner_type, "ownerId": key.owner_id,
+            "topicId": key.topic_id, "turnId": turn.turn_id,
+            "originUserMessageId": turn.origin_user_message_id.lock().ok().and_then(|id| id.clone()),
+        })),
+        chunk: Some(chunk),
+        consumer_revision: next_consumer_revision(),
+        ..Default::default()
     }
 }
 
 /// 中止群组的整个接力赛回合
 #[tauri::command]
 #[allow(non_snake_case)]
-pub fn interruptGroupTurn(
+pub async fn interruptGroupTurn(
+    app: AppHandle,
     state: tauri::State<'_, ActiveGroupTurns>,
     owner_id: String,
     owner_type: String,
@@ -888,12 +1367,95 @@ pub fn interruptGroupTurn(
         topic_id
     );
     let key = TopicKey::new(owner_type, owner_id, topic_id);
+    let origin = state
+        .active
+        .get(&key)
+        .and_then(|turn| turn.origin_user_message_id.lock().ok()?.clone());
+    if let Some(origin) = origin {
+        let speech_app = app.clone();
+        tauri::async_runtime::spawn(async move {
+            if let Err(error) = crate::vcp_modules::chat::voice_service::stop_chat_reply_by_origin(
+                &speech_app,
+                &origin,
+            )
+            .await
+            {
+                log::warn!("[VCPClient] Could not stop reply speech: {error}");
+            }
+        });
+    }
+    let db = app.state::<DbState>();
+    let pending = sqlx::query_scalar::<_, String>(
+        "UPDATE active_generations SET stop_requested = 1
+         WHERE owner_type = ? AND owner_id = ? AND topic_id = ? RETURNING msg_id",
+    )
+    .bind(&key.owner_type)
+    .bind(&key.owner_id)
+    .bind(&key.topic_id)
+    .fetch_all(&db.pool)
+    .await
+    .map_err(|error| error.to_string())?;
     let cancelled = state.cancel(&key);
-    Ok(json!({"status": if cancelled { "cancelled" } else { "not_running" }}))
+    let requests = app.state::<ActiveRequests>();
+    for message_id in &pending {
+        schedule_pending_stop(&app, &requests, MessageKey::new(key.clone(), message_id));
+    }
+    Ok(
+        json!({"status": if cancelled || !pending.is_empty() { "cancelling" } else { "not_running" }}),
+    )
 }
 
-/// 核心请求函数：sendToVCP
-/// 对应 JS 版的 sendToVCP。处理逻辑：
+fn schedule_pending_stop<R: Runtime>(
+    app: &AppHandle<R>,
+    requests: &ActiveRequests,
+    key: MessageKey,
+) {
+    let producer = requests
+        .0
+        .get(&key)
+        .filter(|entry| !entry.released.is_cancelled())
+        .map(|entry| entry.value().clone());
+    if let Some(entry) = &producer {
+        entry.cancellation_token.cancel();
+    }
+    let channel = requests
+        .1
+        .lock()
+        .ok()
+        .and_then(|connection| {
+            connection
+                .as_ref()
+                .map(|connection| connection.channel.clone())
+        })
+        .unwrap_or_else(|| Channel::new(|_| Ok(())));
+    let app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        if let Some(entry) = producer {
+            entry.released.cancelled().await;
+            // Successful cancellation or deletion already settled the owner.
+            // Only a received terminal whose commit failed needs this retry.
+            if entry.output.pending_terminal().is_none() {
+                return;
+            }
+        }
+        if let Err(error) = recover_active_generation(
+            app.clone(),
+            app.state::<ActiveRequests>(),
+            key.topic.owner_id,
+            key.topic.owner_type,
+            key.topic.topic_id,
+            key.msg_id,
+            channel,
+        )
+        .await
+        {
+            log::warn!("[VCPClient] Stop remains pending: {error}");
+        }
+    });
+}
+
+/// 从正式应用服务冻结的请求上下文取得完整消息身份。
+/// 请求入口负责以下步骤：
 /// 1. 数据验证与规范化 (通过 Rust 类型系统自动处理部分)
 /// 2. 按 turn 起点冻结的 typed route 选择普通 completions 或 /v1/chatvcp/completions
 /// 3. 上下文注入 (音乐信息、UI 规范要求)
@@ -922,100 +1484,6 @@ fn message_key_from_context(
         TopicKey::new(owner_type, owner_id, topic_id),
         message_id,
     ))
-}
-
-#[tauri::command]
-#[allow(non_snake_case)]
-pub async fn sendToVCP<R: Runtime>(
-    app: AppHandle<R>,
-    state: tauri::State<'_, ActiveRequests>,
-    settings_state: tauri::State<'_, SettingsState>,
-    mut payload: VcpRequestPayload,
-    stream_channel: Channel<StreamEvent>,
-) -> Result<Value, String> {
-    let settings = read_settings(app.clone(), settings_state).await?;
-    let connection = freeze_chat_connection(&settings, ChatRequestPurpose::Interactive)?;
-    payload.vcp_url = connection.endpoint_url;
-    payload.vcp_api_key = connection.api_key;
-
-    let message_id = payload.message_id.clone();
-    let context = payload.context.clone();
-    let is_stream = payload.model_config["stream"].as_bool().unwrap_or(false);
-    let request_key = message_key_from_context(&context, &message_id)?;
-    if payload.transport_request_id.is_none() {
-        payload.transport_request_id = Some(message_transport_request_id(&request_key));
-    }
-
-    let (lease, cancellation_token) =
-        ActiveRequestLease::try_acquire(state.0.clone(), request_key.clone())?;
-    let (res, is_aborted) = match perform_vcp_request_registered(
-        &app,
-        payload,
-        Some(stream_channel.clone()),
-        cancellation_token,
-    )
-    .await
-    {
-        Ok(val) => val,
-        Err(failure) => {
-            let recovery_pending = failure.is_recovery_pending();
-            let (error, partial_content) = failure.into_parts();
-            if recovery_pending {
-                let notice = format!("后台生成连接中断，稍后返回前台可继续接管：{error}");
-                let mut event =
-                    StreamEvent::error(message_id.clone(), context.clone(), notice.clone());
-                event.content = partial_content;
-                deliver_request_event(&app, &request_key, Some(stream_channel.clone()), event);
-                return Err(notice);
-            }
-            if is_stream {
-                let pool = app
-                    .state::<crate::vcp_modules::db_manager::DbState>()
-                    .pool
-                    .clone();
-                let _ = finalize_stream_error(
-                    &app,
-                    &pool,
-                    &request_key,
-                    partial_content.unwrap_or_default(),
-                    error.clone(),
-                    Some(stream_channel.clone()),
-                )
-                .await?;
-            }
-            return Err(error);
-        }
-    };
-
-    if is_stream {
-        let finish_reason = if is_aborted {
-            Some("cancelled_by_user".to_string())
-        } else {
-            res["finishReason"].as_str().map(|s| s.to_string())
-        };
-
-        let agent_id = context.as_ref().and_then(|value| value["agentId"].as_str());
-
-        let pool = app
-            .state::<crate::vcp_modules::db_manager::DbState>()
-            .pool
-            .clone();
-
-        crate::vcp_modules::chat::message_service::finalize_stream_message(
-            app.clone(),
-            &pool,
-            &request_key,
-            res["fullContent"].as_str().unwrap_or("").to_string(),
-            is_aborted,
-            finish_reason,
-            Some(stream_channel),
-            agent_id.map(|s| s.to_string()),
-        )
-        .await?;
-    }
-
-    drop(lease);
-    Ok(res)
 }
 
 fn extract_text_for_hash(content: &Value) -> String {
@@ -1047,52 +1515,13 @@ fn get_or_calculate_message_hash(content: &Value) -> String {
     format!("sha256:{}", hash)
 }
 
-/// 核心请求实现函数，可供 Tauri Command 或 内部 Rust 模块(如 GroupOrchestrator) 调用
-/// 返回 Result<(全量内容/响应体, 是否被中止), 错误信息>
-#[allow(dead_code)] // DORMANT ASSET: only the unregistered floating-assistant bridge uses this API.
-pub async fn perform_vcp_request<R: Runtime>(
-    app: &AppHandle<R>,
-    active_requests: ActiveRequestMap,
-    request_key: MessageKey,
-    payload: VcpRequestPayload,
-    stream_channel: Option<Channel<StreamEvent>>,
-) -> Result<(Value, bool), VcpRequestFailure> {
-    #[cfg(target_os = "android")]
-    let transport_request_id = payload.effective_transport_request_id().to_string();
-    let (lease, cancellation_token) =
-        ActiveRequestLease::try_acquire(active_requests, request_key.clone())
-            .map_err(VcpRequestFailure::from)?;
-    let result =
-        perform_vcp_request_registered(app, payload, stream_channel, cancellation_token).await;
-    // This entry point serves the ephemeral assistant, which has no database
-    // finalizer and must not leave an unclaimable offline result behind.
-    discard_request_helper(app, &request_key).await;
-    #[cfg(target_os = "android")]
-    if result
-        .as_ref()
-        .is_err_and(|failure| failure.is_recovery_pending())
-    {
-        // A broken local socket intentionally leaves no handoff for normal
-        // chat recovery. This ephemeral caller has no such recovery owner.
-        if let Ok(generation) = query_helper_generation(app, &transport_request_id).await {
-            if let Err(error) =
-                discard_helper_session(app, &transport_request_id, &generation).await
-            {
-                log::warn!("[VCPClient] Ephemeral helper cleanup failed: {error}");
-            }
-        }
-    }
-    drop(lease);
-    result
-}
-
 /// 执行一个已经注册的请求。调用方持有 lease，决定请求在 finalizer 提交后才退出 live 状态。
-pub async fn perform_vcp_request_registered<R: Runtime>(
+pub(crate) async fn perform_vcp_request_registered<R: Runtime>(
     app: &AppHandle<R>,
     payload: VcpRequestPayload,
     stream_channel: Option<Channel<StreamEvent>>,
     cancellation_token: CancellationToken,
-) -> Result<(Value, bool), VcpRequestFailure> {
+) -> Result<VcpResponse, VcpRequestFailure> {
     log::info!(
         "[VCPClient] perform_vcp_request called for messageId: {}, context: {:?}",
         payload.message_id,
@@ -1112,9 +1541,22 @@ pub async fn perform_vcp_request_registered<R: Runtime>(
     };
 
     // === 1. 数据验证和多模态资产转换 ===
-    let mut messages = preprocess_multimodal_messages(app, payload.messages)
-        .await
-        .map_err(VcpRequestFailure::from)?;
+    if cancellation_token.is_cancelled() {
+        return Ok(VcpResponse::cancelled());
+    }
+    let preparation_permit = tokio::select! {
+        biased;
+        _ = cancellation_token.cancelled() => return Ok(VcpResponse::cancelled()),
+        permit = request_body::PREPARATION_SLOT.acquire() =>
+            permit.map_err(|error| VcpRequestFailure::preparation(error.to_string()))?,
+    };
+    let prepared = preprocess_multimodal_messages(app, payload.messages, &cancellation_token).await;
+    // Cancellation wins a simultaneous native failure, and no request reaches
+    // either transport after the user stopped during attachment preparation.
+    if cancellation_token.is_cancelled() {
+        return Ok(VcpResponse::cancelled());
+    }
+    let mut messages = prepared.map_err(VcpRequestFailure::preparation)?;
 
     // === 2. 使用 turn 起点冻结的最终端点；重试与 Android Helper 始终复用此值 ===
     let final_url = payload.vcp_url.clone();
@@ -1130,9 +1572,9 @@ pub async fn perform_vcp_request_registered<R: Runtime>(
 
     // === 5. 准备请求体 ===
     let is_stream = payload.model_config["stream"].as_bool().unwrap_or(false);
-    let mut request_body = payload.model_config.clone();
+    let mut request_body = payload.model_config;
     if let Some(obj) = request_body.as_object_mut() {
-        obj.insert("messages".to_string(), json!(messages));
+        obj.insert("messages".to_string(), Value::Array(messages));
         obj.insert("requestId".to_string(), json!(transport_request_id.clone()));
         obj.insert("stream".to_string(), json!(is_stream));
         if !timestamp_bindings.is_empty() {
@@ -1147,17 +1589,38 @@ pub async fn perform_vcp_request_registered<R: Runtime>(
         }
     }
 
+    let attachment_tokens = crate::vcp_modules::chat::context_metrics::estimate_attachment_tokens(
+        &request_body["messages"],
+    );
+    let prepared_body = request_body::prepare(
+        app.path()
+            .app_cache_dir()
+            .map_err(|error| VcpRequestFailure::preparation(error.to_string()))?,
+        request_body,
+        cancellation_token.clone(),
+        preparation_permit,
+    )
+    .await;
+    if cancellation_token.is_cancelled() {
+        return Ok(VcpResponse::cancelled());
+    }
+    let request_body = prepared_body.map_err(VcpRequestFailure::preparation)?;
+
     // === 6. 配置网络请求（共享 ChatStream 画像 Client，克隆仅复制 Arc 句柄、共享连接池） ===
     let client = super::http_clients::client(super::http_clients::HttpProfile::ChatStream).clone();
 
     // === 7. 分发至专职处理器执行请求 ===
+    if cancellation_token.is_cancelled() {
+        return Ok(VcpResponse::cancelled());
+    }
     if is_stream {
         handle_streaming_request(
             app,
             client,
             &final_url,
             &payload.vcp_api_key,
-            request_body,
+            Some(request_body),
+            attachment_tokens,
             message_id,
             transport_request_id,
             context,
@@ -1213,26 +1676,46 @@ fn remove_internal_local_attachment_metadata(message: &mut Value) {
     }
 }
 
-/// 1. 抽离多模态消息预处理逻辑
+// Count all audio data URLs, including historical/prepared context, separately
+// from the existing image budget. This bounds the actual outbound payload.
+const MODEL_REQUEST_AUDIO_DATA_MAX_BYTES: usize = 24 * 1024 * 1024;
+
+fn account_audio_data(total: &mut usize, bytes: usize) -> Result<(), String> {
+    *total = total.checked_add(bytes).ok_or("模型音频请求大小溢出")?;
+    if *total > MODEL_REQUEST_AUDIO_DATA_MAX_BYTES {
+        return Err("本次请求音频超过 24 MiB 编码预算，请减少音频数量或缩短包含音频的历史".into());
+    }
+    Ok(())
+}
+
+/// Resolve CAS attachments and normalize their model payload before transport.
 async fn preprocess_multimodal_messages<R: Runtime>(
     app: &AppHandle<R>,
     raw_messages: Vec<Value>,
+    cancellation: &CancellationToken,
 ) -> Result<Vec<Value>, String> {
     let mut messages: Vec<Value> = Vec::new();
-    for msg_val in raw_messages.into_iter() {
-        if !msg_val.is_object() {
+    let mut image_data_bytes = 0usize;
+    let mut audio_data_bytes = 0usize;
+    for mut msg in raw_messages {
+        crate::vcp_modules::media_processor::check_media_cancelled(cancellation)?;
+        if !msg.is_object() {
             messages.push(json!({"role": "system", "content": "[Invalid message]"}));
             continue;
         }
 
-        let mut msg = msg_val.clone();
         remove_internal_local_attachment_metadata(&mut msg);
-        let content = msg.get("content").cloned().unwrap_or(Value::Null);
+        let had_content = msg.get("content").is_some();
+        let content = msg
+            .get_mut("content")
+            .map(Value::take)
+            .unwrap_or(Value::Null);
 
         // 处理多模态或复杂内容数组
-        if let Some(content_array) = content.as_array() {
+        if let Value::Array(content_array) = content {
             let mut new_parts = Vec::new();
             for part in content_array {
+                crate::vcp_modules::media_processor::check_media_cancelled(cancellation)?;
                 if let Some(obj) = part.as_object() {
                     // local_file 只携带 CAS hash；host path 不进入模型消息。
                     if obj.get("type").and_then(|t| t.as_str()) == Some("local_file") {
@@ -1268,7 +1751,7 @@ async fn preprocess_multimodal_messages<R: Runtime>(
                         if let Ok(record) = resolved {
                             let path_buf = record.path;
                             if media_kind == "image" {
-                                // 图片类型：长边 > 1120px 时缩放，避免多模态 payload 过大
+                                // 静态用途派生：保留原件，单图与整个请求分别执行预算。
                                 let path_buf_clone = path_buf.clone();
                                 let app_clone = app.clone();
                                 match tokio::task::spawn_blocking(move || {
@@ -1277,6 +1760,12 @@ async fn preprocess_multimodal_messages<R: Runtime>(
                                 .await
                                 {
                                     Ok(Ok(data_url)) => {
+                                        image_data_bytes = image_data_bytes
+                                            .checked_add(data_url.len())
+                                            .ok_or("模型图片请求大小溢出")?;
+                                        if image_data_bytes > crate::vcp_modules::media_processor::image_extractor::MODEL_REQUEST_IMAGE_DATA_MAX_BYTES {
+                                            return Err("本次请求图片超过 16 MiB 编码预算，请减少图片数量或缩短包含图片的历史".into());
+                                        }
                                         new_parts.push(json!({
                                             "type": "image_url",
                                             "image_url": { "url": data_url }
@@ -1284,10 +1773,7 @@ async fn preprocess_multimodal_messages<R: Runtime>(
                                         converted = true;
                                     }
                                     Ok(Err(e)) => {
-                                        log::warn!(
-                                                "[VCPClient] Image conversion failed for attachment CAS {}: {}",
-                                                short_hash(hash), e
-                                            );
+                                        return Err(format!("图片 {label} 处理失败：{e}"))
                                     }
                                     Err(e) => {
                                         log::warn!(
@@ -1297,55 +1783,45 @@ async fn preprocess_multimodal_messages<R: Runtime>(
                                     }
                                 }
                             } else if media_kind == "video" {
-                                // 视频：抽帧 → 每张帧作为 image_url
-                                let path_clone = path_buf.clone();
-                                let app_clone = app.clone();
-                                match tokio::task::spawn_blocking(move || {
-                                        crate::vcp_modules::media_processor::process_video_for_multimodal(&app_clone, &path_clone)
-                                    }).await {
-                                        Ok(Ok(frames)) => {
-                                            for frame_url in frames {
-                                                new_parts.push(json!({
-                                                    "type": "image_url",
-                                                    "image_url": { "url": frame_url }
-                                                }));
-                                            }
-                                            converted = true;
-                                        }
-                                        Ok(Err(e)) => {
-                                            log::warn!("[VCPClient] Video frame extraction failed for attachment CAS {}: {}", short_hash(hash), e);
-                                        }
-                                        Err(e) => {
-                                            log::warn!("[VCPClient] Video processing task panicked: {}", e);
-                                        }
+                                let frames = crate::vcp_modules::media_processor::process_video_for_multimodal(
+                                    app, &path_buf, cancellation,
+                                )
+                                .await
+                                .map_err(|error| format!("视频附件 {label} 处理失败：{error}"))?;
+                                for frame_url in frames {
+                                    image_data_bytes = image_data_bytes
+                                        .checked_add(frame_url.len())
+                                        .ok_or("模型图片请求大小溢出")?;
+                                    if image_data_bytes > crate::vcp_modules::media_processor::image_extractor::MODEL_REQUEST_IMAGE_DATA_MAX_BYTES {
+                                        return Err("本次请求图片超过 16 MiB 编码预算，请减少图片或视频数量".into());
                                     }
+                                    new_parts.push(json!({
+                                        "type": "image_url",
+                                        "image_url": { "url": frame_url }
+                                    }));
+                                }
+                                converted = true;
                             } else if media_kind == "audio" {
-                                // 音频：提取为 MP3 (32kbps) 或 AAC (32kbps) -> input_audio
-                                let path_clone = path_buf.clone();
-                                let app_clone = app.clone();
-                                match tokio::task::spawn_blocking(move || {
-                                        crate::vcp_modules::media_processor::process_audio_for_multimodal(&app_clone, &path_clone)
-                                    }).await {
-                                        Ok(Ok(audio_url)) => {
-                                            let format_str = if audio_url.starts_with("data:audio/aac") { "aac" } else { "mp3" };
-                                            new_parts.push(json!({
-                                                "type": "input_audio",
-                                                "input_audio": { 
-                                                    "data": audio_url, 
-                                                    "format": format_str
-                                                }
-                                            }));
-                                            converted = true;
-                                        }
-                                        Ok(Err(e)) => {
-                                            log::warn!("[VCPClient] Audio extraction failed for attachment CAS {}: {}", short_hash(hash), e);
-                                        }
-                                        Err(e) => {
-                                            log::warn!("[VCPClient] Audio processing task panicked: {}", e);
-                                        }
-                                    }
+                                let audio_url = crate::vcp_modules::media_processor::process_audio_for_multimodal(
+                                    app, &path_buf, cancellation,
+                                )
+                                .await
+                                .map_err(|error| format!("音频附件 {label} 处理失败：{error}"))?;
+                                account_audio_data(&mut audio_data_bytes, audio_url.len())?;
+                                // VCP's multimodal proxy reads MIME-bearing data
+                                // URLs in image_url, including audio/mp4 payloads.
+                                new_parts.push(json!({
+                                    "type": "image_url",
+                                    "image_url": { "url": audio_url }
+                                }));
+                                converted = true;
                             }
                         } else {
+                            if matches!(media_kind, "audio" | "video") {
+                                return Err(format!(
+                                    "音视频附件 {label} 的本地文件不可用，请重新导入后重试"
+                                ));
+                            }
                             log::warn!(
                                 "[VCPClient] Attachment CAS {} is unavailable for multimodal preprocessing",
                                 short_hash(hash)
@@ -1364,21 +1840,42 @@ async fn preprocess_multimodal_messages<R: Runtime>(
                             }));
                         }
                     } else {
-                        new_parts.push(part.clone());
+                        if obj.get("type").and_then(Value::as_str) == Some("image_url") {
+                            if let Some(url) = obj
+                                .get("image_url")
+                                .and_then(|image| image.get("url"))
+                                .and_then(Value::as_str)
+                                .filter(|url| url.starts_with("data:"))
+                            {
+                                if url.starts_with("data:audio/") {
+                                    account_audio_data(&mut audio_data_bytes, url.len())?;
+                                } else {
+                                    image_data_bytes = image_data_bytes
+                                        .checked_add(url.len())
+                                        .ok_or("模型图片请求大小溢出")?;
+                                    if image_data_bytes > crate::vcp_modules::media_processor::image_extractor::MODEL_REQUEST_IMAGE_DATA_MAX_BYTES {
+                                        return Err("本次请求图片超过 16 MiB 编码预算，请减少图片数量".into());
+                                    }
+                                }
+                            }
+                        }
+                        new_parts.push(part);
                     }
                 } else {
-                    new_parts.push(part.clone());
+                    new_parts.push(part);
                 }
             }
-            msg["content"] = json!(new_parts);
-        } else if content.is_object() {
-            if let Some(text) = content.get("text") {
-                msg["content"] = text.clone();
+            msg["content"] = Value::Array(new_parts);
+        } else if let Value::Object(mut object) = content {
+            if let Some(text) = object.remove("text") {
+                msg["content"] = text;
             } else {
-                msg["content"] = json!(content.to_string());
+                msg["content"] = json!(Value::Object(object).to_string());
             }
         } else if !content.is_string() && !content.is_null() {
             msg["content"] = json!(content.to_string());
+        } else if had_content {
+            msg["content"] = content;
         }
 
         messages.push(msg);
@@ -1542,10 +2039,10 @@ async fn send_command_to_stream(
         "action": action,
         "requestId": msg_id
     });
-    if let Some(params) = extra_params {
-        if let (Some(obj), Some(params)) = (cmd.as_object_mut(), params.as_object()) {
+    if let Some(Value::Object(params)) = extra_params {
+        if let Some(obj) = cmd.as_object_mut() {
             for (k, v) in params {
-                obj.insert(k.clone(), v.clone());
+                obj.insert(k, v);
             }
         }
     }
@@ -1572,6 +2069,50 @@ async fn send_command_to_stream(
     .await
     .map_err(|_| "Helper command write timed out".to_string())??;
     Ok(stream)
+}
+
+#[cfg(target_os = "android")]
+async fn observe_detached_helper<R: Runtime>(
+    app: &AppHandle<R>,
+    request_id: &str,
+    generation: Option<&str>,
+) {
+    // Only an already-running helper can own a detached upstream. A pending
+    // database row, a completed mailbox file or an empty port creates no lease.
+    let observation = async {
+        let stream = connect_helper_port(get_helper_port(app).await?).await?;
+        let stream = send_command_to_stream(
+            stream,
+            "observe_activity",
+            request_id,
+            generation.map(|id| json!({ "generation": id })),
+        )
+        .await?;
+        let mut reader = FramedRead::new(stream, helper_frame_codec());
+        let Some(frame) = reader.next().await else {
+            return Ok(None);
+        };
+        let response: Value = serde_json::from_slice(&frame.map_err(|error| error.to_string())?)
+            .map_err(|error| error.to_string())?;
+        let observed = response["generation"].as_str();
+        if response["requestId"].as_str() != Some(request_id)
+            || response["eventType"].as_str() != Some("observing")
+            || observed.is_none()
+            || (generation.is_some() && generation != observed)
+        {
+            return Err("Invalid helper activity confirmation".to_string());
+        }
+        Ok::<_, String>(Some(reader))
+    };
+    if let Ok(Ok(Some(mut reader))) = tokio::time::timeout(HELPER_IO_TIMEOUT, observation).await {
+        let guard = super::vcp_ws_activity::ChatActivityGuard::acquire(app);
+        tokio::spawn(async move {
+            // Completion, discard, a replacement observer and helper process
+            // death all close the socket. No timer or result ACK is necessary.
+            let _ = reader.next().await;
+            drop(guard);
+        });
+    }
 }
 
 #[cfg(target_os = "android")]
@@ -1627,7 +2168,7 @@ async fn helper_session_control<R: Runtime>(
     validate_helper_control_ack(&ack, action, request_id, generation)
 }
 
-#[cfg(any(target_os = "android", test))]
+#[cfg(target_os = "android")]
 fn validate_helper_control_ack(
     ack: &Value,
     action: &str,
@@ -1762,7 +2303,8 @@ fn absorb_sse_data(
             .unwrap_or("Upstream SSE request failed");
         return Err(message.to_string());
     }
-    if let Some(round) = crate::vcp_modules::chat::context_metrics::extract_from_sse_payload(&value) {
+    if let Some(round) = crate::vcp_modules::chat::context_metrics::extract_from_sse_payload(&value)
+    {
         metrics.record(round);
         return Ok(false);
     }
@@ -1777,6 +2319,14 @@ fn absorb_sse_data(
             .filter(|reason| !reason.is_empty())
         {
             *last_finish_reason = Some(reason.to_string());
+        } else if choice
+            .get("delta")
+            .and_then(Value::as_object)
+            .is_some_and(|delta| !delta.is_empty())
+        {
+            // VCP can start another model round on the same HTTP response.
+            // A previous round's finish reason cannot complete the new round.
+            *last_finish_reason = None;
         }
         if let Some(content) = choice
             .get("delta")
@@ -1810,14 +2360,18 @@ async fn handle_streaming_request<R: Runtime>(
     client: Client,
     final_url: &str,
     api_key: &str,
-    request_body: Value,
+    request_body: Option<PreparedBody>,
+    attachment_tokens: u64,
     message_id: String,
     transport_request_id: String,
     context: Option<Value>,
     cancellation_token: CancellationToken,
     output: Arc<RequestOutput>,
     is_resume: bool,
-) -> Result<(Value, bool), VcpRequestFailure> {
+) -> Result<VcpResponse, VcpRequestFailure> {
+    if !is_resume && cancellation_token.is_cancelled() {
+        return Ok(VcpResponse::cancelled());
+    }
     let _transport_slot = CHAT_TRANSPORT_SLOTS
         .try_acquire()
         .map_err(|_| VcpRequestFailure::from(STREAM_CAPACITY_EXHAUSTED.to_string()))?;
@@ -1825,8 +2379,6 @@ async fn handle_streaming_request<R: Runtime>(
     let mut pending_chunk = String::new();
     let mut last_finish_reason = None;
     let mut metrics_rounds = crate::vcp_modules::chat::context_metrics::RoundCollector::default();
-    let attachment_tokens =
-        crate::vcp_modules::chat::context_metrics::estimate_attachment_tokens(&request_body["messages"]);
     let send_update = |buffer: &mut AuroraBuffer| {
         output.send_aurora(buffer, &message_id, &context, None, false);
     };
@@ -1836,6 +2388,9 @@ async fn handle_streaming_request<R: Runtime>(
         let (action, params) = if is_resume {
             ("resume", None)
         } else {
+            let body = request_body
+                .as_ref()
+                .ok_or_else(|| VcpRequestFailure::preparation("模型请求正文未准备".into()))?;
             let mut helper_context = context.clone().unwrap_or_else(|| json!({}));
             helper_context["messageId"] = json!(message_id);
             (
@@ -1846,14 +2401,25 @@ async fn handle_streaming_request<R: Runtime>(
                         "Authorization": format!("Bearer {api_key}"),
                         "Content-Type": "application/json",
                     }).to_string(),
-                    "body": request_body.to_string(),
+                    "bodyToken": body.token,
+                    "bodyLength": body.length,
                     "context": helper_context,
                 })),
             )
         };
-        let stream = connect_to_helper(app, action, &transport_request_id, params)
-            .await
-            .map_err(|error| VcpRequestFailure::recoverable_helper(error, None))?;
+        let stream = match connect_to_helper(app, action, &transport_request_id, params).await {
+            Ok(stream) => stream,
+            Err(error) => {
+                // A failed local write/attach does not prove the helper never
+                // admitted this request. Observe only if it confirms ownership.
+                observe_detached_helper(app, &transport_request_id, None).await;
+                if cancellation_token.is_cancelled() {
+                    checkpoint_stop_partial(app, &context, &message_id, None).await?;
+                    return Err(VcpRequestFailure::stopping(error, None));
+                }
+                return Err(VcpRequestFailure::recoverable_helper(error, None));
+            }
+        };
         FramedRead::new(stream, helper_frame_codec())
     };
     #[cfg(target_os = "android")]
@@ -1865,6 +2431,10 @@ async fn handle_streaming_request<R: Runtime>(
     #[cfg(target_os = "android")]
     let mut helper_terminal_received = false;
     #[cfg(target_os = "android")]
+    let mut _resumed_chat_activity = None;
+    #[cfg(target_os = "android")]
+    let mut helper_rejected = false;
+    #[cfg(target_os = "android")]
     let mut cancel_sent = false;
 
     #[cfg(not(target_os = "android"))]
@@ -1874,19 +2444,23 @@ async fn handle_streaming_request<R: Runtime>(
                 .to_string()
                 .into());
         }
+        let body = request_body
+            .ok_or_else(|| VcpRequestFailure::preparation("模型请求正文未准备".into()))?;
+        let length = body.length;
+        let upload = body
+            .into_http_body()
+            .await
+            .map_err(VcpRequestFailure::preparation)?;
         let response = tokio::select! {
             biased;
             _ = cancellation_token.cancelled() => {
-                return Ok((json!({
-                    "fullContent": "",
-                    "finishReason": "cancelled_by_user",
-                    "streamingStarted": false,
-                }), true));
+                return Ok(VcpResponse::cancelled());
             }
             response = client.post(final_url)
                 .header(AUTHORIZATION, format!("Bearer {api_key}"))
                 .header(CONTENT_TYPE, "application/json")
-                .json(&request_body)
+                .header(CONTENT_LENGTH, length)
+                .body(upload)
                 .send() => response.map_err(|error| error.to_string())?,
         };
         if !response.status().is_success() {
@@ -1981,7 +2555,11 @@ async fn handle_streaming_request<R: Runtime>(
                                 return Err(HELPER_SESSION_NOT_FOUND.to_string());
                             }
                             if event_type == "error" && event["code"].as_str() == Some("capacity_exhausted") {
+                                helper_rejected = true;
                                 return Err(STREAM_CAPACITY_EXHAUSTED.to_string());
+                            }
+                            if event_type == "error" && matches!(event["code"].as_str(), Some("invalid_request" | "service_stopping")) {
+                                helper_rejected = true;
                             }
                             if let Some(generation) = event["generation"].as_str() {
                                 if let Some(current) = helper_generation.as_deref() {
@@ -2003,9 +2581,6 @@ async fn handle_streaming_request<R: Runtime>(
                                     let content = event["content"].as_str()
                                         .ok_or_else(|| "Helper data frame is missing content".to_string())?;
                                     pending_chunk.push_str(content);
-                                    if let Some(reason) = event["finishReason"].as_str() {
-                                        last_finish_reason = Some(reason.to_string());
-                                    }
                                 }
                                 "snapshot_start" => {
                                     if !is_resume || snapshot_in_progress || !aurora_buffer.full_text.is_empty() || !pending_chunk.is_empty() {
@@ -2034,25 +2609,22 @@ async fn handle_streaming_request<R: Runtime>(
                                     }
                                     flush_aurora_window(&mut aurora_buffer, &mut pending_chunk);
                                     output.send_aurora(&mut aurora_buffer, &message_id, &context, None, true);
-                                    if let Some(reason) = event["finishReason"].as_str() {
-                                        last_finish_reason = Some(reason.to_string());
-                                    }
                                     if completed {
                                         helper_terminal_received = true;
+                                        last_finish_reason = event["finishReason"].as_str().map(str::to_owned);
                                         if let Some(error) = event["error"].as_str() {
                                             return Err(error.to_string());
                                         }
                                         return Ok(());
                                     }
+                                    _resumed_chat_activity = Some(super::vcp_ws_activity::ChatActivityGuard::acquire(app));
                                 }
                                 "terminal" => {
                                     if snapshot_in_progress || (is_resume && !snapshot_received) {
                                         return Err("Helper terminal arrived before a complete snapshot".to_string());
                                     }
                                     helper_terminal_received = true;
-                                    if let Some(reason) = event["finishReason"].as_str() {
-                                        last_finish_reason = Some(reason.to_string());
-                                    }
+                                    last_finish_reason = event["finishReason"].as_str().map(str::to_owned);
                                     if let Some(error) = event["error"].as_str() {
                                         return Err(error.to_string());
                                     }
@@ -2080,7 +2652,7 @@ async fn handle_streaming_request<R: Runtime>(
 
     #[cfg(target_os = "android")]
     let outcome = match outcome {
-        Err(message) if !helper_terminal_received && message != STREAM_CAPACITY_EXHAUSTED => {
+        Err(message) if !helper_terminal_received && !helper_rejected => {
             // Losing the local transport says nothing about the upstream
             // generation. The helper remains its owner; a later explicit
             // recovery can claim a complete snapshot or its completed mailbox.
@@ -2092,6 +2664,23 @@ async fn handle_streaming_request<R: Runtime>(
                 send_update(&mut aurora_buffer);
                 Some(aurora_buffer.full_text)
             };
+            // The helper may have published its completed result after the
+            // five-second ACK grace. EOF is not a new generation failure.
+            let message = match read_completed_transport(app, &transport_request_id, &output).await
+            {
+                Ok(Some(result)) => return result,
+                Ok(None) => message,
+                Err(error) => error.to_string(),
+            };
+            if message != HELPER_SESSION_NOT_FOUND {
+                observe_detached_helper(app, &transport_request_id, helper_generation.as_deref())
+                    .await;
+            }
+            if cancelled || cancellation_token.is_cancelled() {
+                checkpoint_stop_partial(app, &context, &message_id, partial_content.as_deref())
+                    .await?;
+                return Err(VcpRequestFailure::stopping(message, partial_content));
+            }
             return Err(VcpRequestFailure::recoverable_helper(
                 message,
                 partial_content,
@@ -2129,20 +2718,18 @@ async fn handle_streaming_request<R: Runtime>(
             }
         }
     }
-    outcome.map_err(|message| {
-        VcpRequestFailure::streaming(message, aurora_buffer.full_text.clone())
-    })?;
+    if let Err(message) = outcome {
+        return Err(VcpRequestFailure::streaming(
+            message,
+            aurora_buffer.full_text,
+        ));
+    }
     let is_aborted = last_finish_reason.as_deref() == Some("cancelled_by_user");
-    Ok((
-        json!({
-            "fullContent": aurora_buffer.full_text,
-            "streamingStarted": true,
-            "contextMetricsRounds": metrics_rounds.to_vec(),
-            "attachmentTokenEstimate": attachment_tokens,
-            "finishReason": last_finish_reason.unwrap_or_else(|| "completed".to_string()),
-        }),
+    Ok(VcpResponse {
+        full_content: aurora_buffer.full_text,
+        finish_reason: Some(last_finish_reason.unwrap_or_else(|| "completed".to_string())),
         is_aborted,
-    ))
+    })
 }
 
 /// 4. 抽离非流式请求循环
@@ -2151,42 +2738,33 @@ async fn handle_non_streaming_request(
     client: Client,
     final_url: &str,
     api_key: &str,
-    request_body: Value,
+    request_body: PreparedBody,
     message_id: String,
     context: Option<Value>,
     cancellation_token: CancellationToken,
     output: Arc<RequestOutput>,
-) -> Result<(Value, bool), String> {
+) -> Result<VcpResponse, String> {
     let _transport_slot = CHAT_TRANSPORT_SLOTS
         .try_acquire()
         .map_err(|_| STREAM_CAPACITY_EXHAUSTED.to_string())?;
     let send_stream_event = |event: StreamEvent| {
         output.send(event);
     };
-    let cancelled_result = || {
-        (
-            json!({
-                "response": Value::Null,
-                "fullContent": "",
-                "finishReason": "cancelled_by_user",
-                "context": context,
-            }),
-            true,
-        )
-    };
-
+    let length = request_body.length;
+    let upload = request_body.into_http_body().await?;
     let request_future = client
         .post(final_url)
         .header(AUTHORIZATION, format!("Bearer {}", api_key))
         .header(CONTENT_TYPE, "application/json")
-        .json(&request_body)
+        .header(CONTENT_LENGTH, length)
+        .body(upload)
         .send();
 
     let response = tokio::select! {
         _ = cancellation_token.cancelled() => {
             log::warn!("[VCPClient] Non-streaming request aborted before response for message: {}", message_id);
             // 用户取消由上层统一 Finalizer 持久化并发送唯一终态事件。
-            return Ok(cancelled_result());
+            return Ok(VcpResponse::cancelled());
         }
         res = request_future => {
             match res {
@@ -2202,34 +2780,42 @@ async fn handle_non_streaming_request(
     if !response.status().is_success() {
         let status = response.status();
         let text = tokio::select! {
-            _ = cancellation_token.cancelled() => return Ok(cancelled_result()),
+            _ = cancellation_token.cancelled() => return Ok(VcpResponse::cancelled()),
             text = response.text() => text.unwrap_or_default(),
         };
         let err_msg = format!("VCP服务器错误: {} - {}", status, text);
         return Err(err_msg);
     }
 
-    let vcp_response = tokio::select! {
-        _ = cancellation_token.cancelled() => return Ok(cancelled_result()),
+    let mut vcp_response = tokio::select! {
+        _ = cancellation_token.cancelled() => return Ok(VcpResponse::cancelled()),
         value = response.json::<Value>() => value.map_err(|error| format!("JSON解析失败: {error}"))?,
     };
 
     // 从标准的 OpenAI 格式中提取文本和结束原因
-    let choices = vcp_response["choices"].as_array();
-    let first_choice = choices.and_then(|c| c.first());
-    let full_content = first_choice
-        .and_then(|choice| choice["message"]["content"].as_str())
-        .unwrap_or("")
-        .to_string();
-    let finish_reason = first_choice
-        .and_then(|choice| choice["finish_reason"].as_str())
-        .map(|r| {
-            if r == "stop" {
-                "completed".to_string()
-            } else {
-                r.to_string()
-            }
-        });
+    let first_choice = vcp_response
+        .get_mut("choices")
+        .and_then(Value::as_array_mut)
+        .and_then(|choices| choices.first_mut());
+    let (full_content, finish_reason) = if let Some(choice) = first_choice {
+        let content = match choice
+            .get_mut("message")
+            .and_then(|message| message.get_mut("content"))
+            .map(Value::take)
+        {
+            Some(Value::String(content)) => content,
+            _ => String::new(),
+        };
+        let reason = match choice.get_mut("finish_reason").map(Value::take) {
+            Some(Value::String(reason)) if reason == "stop" => Some("completed".to_string()),
+            Some(Value::String(reason)) => Some(reason),
+            _ => None,
+        };
+        (content, reason)
+    } else {
+        (String::new(), None)
+    };
+    drop(vcp_response);
 
     // 发送单次 aurora 事件以将文本呈现在 UI 中
     let update = AuroraUpdate {
@@ -2250,15 +2836,11 @@ async fn handle_non_streaming_request(
         context.clone(),
     ));
 
-    Ok((
-        json!({
-            "response": vcp_response,
-            "fullContent": full_content,
-            "finishReason": finish_reason,
-            "context": context
-        }),
-        false,
-    ))
+    Ok(VcpResponse {
+        full_content,
+        finish_reason,
+        is_aborted: false,
+    })
 }
 
 /// 中止请求 Command: interruptRequest
@@ -2277,14 +2859,57 @@ pub async fn interruptRequest(
         TopicKey::new(owner_type, owner_id, topic_id),
         message_id.clone(),
     );
+    let origin = state.0.get(&key).and_then(|entry| {
+        entry
+            .output
+            .state
+            .lock()
+            .ok()?
+            .origin_user_message_id
+            .clone()
+    });
+    if let Some(origin) = origin {
+        let speech_app = app.clone();
+        tauri::async_runtime::spawn(async move {
+            if let Err(error) = crate::vcp_modules::chat::voice_service::stop_chat_reply_by_origin(
+                &speech_app,
+                &origin,
+            )
+            .await
+            {
+                log::warn!("[VCPClient] Could not stop reply speech: {error}");
+            }
+        });
+    }
     log::info!(
         "[VCPClient] interruptRequest called for messageId: {}. Active requests: {}",
         message_id,
         state.0.len()
     );
-    let entry = state.0.get(&key).map(|entry| entry.value().clone());
-    if let Some(entry) = &entry {
-        entry.cancellation_token.cancel();
+    let db = app.state::<DbState>();
+    let pending = sqlx::query(
+        "UPDATE active_generations SET stop_requested = 1
+         WHERE owner_type = ? AND owner_id = ? AND topic_id = ? AND msg_id = ?",
+    )
+    .bind(&key.topic.owner_type)
+    .bind(&key.topic.owner_id)
+    .bind(&key.topic.topic_id)
+    .bind(&key.msg_id)
+    .execute(&db.pool)
+    .await
+    .map_err(|error| error.to_string())?
+    .rows_affected()
+        != 0;
+    let entry = state
+        .0
+        .get(&key)
+        .filter(|entry| !entry.released.is_cancelled())
+        .map(|entry| entry.value().clone());
+    if entry.is_some() || pending {
+        schedule_pending_stop(&app, &state, key.clone());
+    }
+    if entry.is_none() && pending {
+        return Ok(json!({ "success": true, "status": "cancelling" }));
     }
     let settlement = async {
         if let Some(entry) = entry {
@@ -2301,12 +2926,17 @@ pub async fn interruptRequest(
         .fetch_optional(&db.pool)
         .await
         .map_err(|error| error.to_string())?;
+        let retained_terminal = state.0.get(&key).is_some_and(|entry| {
+            entry.released.is_cancelled() && entry.output.pending_terminal().is_some()
+        });
         match reason.flatten() {
             Some(reason) => {
                 Ok(json!({ "success": true, "status": "completed", "finishReason": reason }))
             }
+            None if retained_terminal => Ok(json!({ "success": true, "status": "cancelling" })),
+            None if pending => Ok(json!({ "success": true, "status": "cancelling" })),
             None => Err(format!(
-                "Request {} is no longer running but has no committed terminal result",
+                "Request {} has no committed terminal result",
                 message_id
             )),
         }
@@ -2390,33 +3020,192 @@ pub struct ActiveGeneration {
     pub created_at: i64,
     pub agent_id: Option<String>,
     pub agent_name: Option<String>,
+    pub stop_requested: bool,
 }
 
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReconnectChatStreamsResult {
+    generations: Vec<ActiveGeneration>,
+    group_turns: Vec<Value>,
+    active_requests: Vec<Value>,
+}
+
+/// Replaces the interface consumer once, then delegates every transport or
+/// mailbox reconciliation to its existing request lease. No generation is
+/// awaited by this command and no response text is copied into its receipt.
 #[tauri::command]
-pub async fn get_active_generations(
-    app: tauri::AppHandle,
-    active_requests: tauri::State<'_, ActiveRequests>,
-    stream_channel: Channel<StreamEvent>,
-) -> Result<Vec<ActiveGeneration>, String> {
-    // A group turn can be assembling its next speaker while no generation row
-    // exists. Install the consumer on the turn before reading pending messages.
+pub async fn reconnect_chat_streams<R: Runtime>(
+    app: AppHandle<R>,
+    webview: tauri::Webview<R>,
+    connection_id: String,
+    channel: Option<tauri::ipc::JavaScriptChannelId>,
+) -> Result<ReconnectChatStreamsResult, String> {
+    let channel = channel.map(|channel| channel.channel_on(webview.clone()));
+    reconnect_chat_output_for_webview(app, connection_id, channel, Some(webview)).await
+}
+
+#[cfg(test)]
+async fn reconnect_chat_output<R: Runtime>(
+    app: AppHandle<R>,
+    connection_id: String,
+    channel: Option<Channel<StreamEvent>>,
+) -> Result<ReconnectChatStreamsResult, String> {
+    reconnect_chat_output_for_webview(app, connection_id, channel, None).await
+}
+
+pub(crate) fn is_current_webview<R: Runtime>(
+    app: &AppHandle<R>,
+    webview: &tauri::Webview<R>,
+) -> bool {
+    let Some(current) = app.get_webview_window(webview.label()) else {
+        return false;
+    };
+    // Tauri 2.12.1 clones share their Arc<ResourceTable>; a replacement with the
+    // same label has a different table. Drop each guard before taking the next:
+    // current and caller can refer to the same non-reentrant mutex.
+    let current_table = {
+        let resources = current.resources_table();
+        std::ptr::from_ref(&*resources) as usize
+    };
+    let caller_table = {
+        let resources = webview.resources_table();
+        std::ptr::from_ref(&*resources) as usize
+    };
+    current_table == caller_table
+}
+
+async fn reconnect_chat_output_for_webview<R: Runtime>(
+    app: AppHandle<R>,
+    connection_id: String,
+    channel: Option<Channel<StreamEvent>>,
+    webview: Option<tauri::Webview<R>>,
+) -> Result<ReconnectChatStreamsResult, String> {
+    let requests = app.state::<ActiveRequests>();
     let turns = app.state::<ActiveGroupTurns>();
-    let turn_keys = turns
-        .0
-        .iter()
-        .map(|entry| entry.key().clone())
-        .collect::<Vec<_>>();
-    for key in turn_keys {
-        turns.attach_output(&active_requests, &key, stream_channel.clone())?;
-    }
-    for request in active_requests.0.iter() {
-        request.output.attach(stream_channel.clone())?;
-    }
-    recover_offline_completed(&app, &active_requests, stream_channel.clone()).await?;
+    let mut keys = std::collections::HashSet::new();
+    let mut group_turns = Vec::new();
+    let mut active_requests = Vec::new();
+    let channel = {
+        let mut current = requests.1.lock().map_err(|error| error.to_string())?;
+        if webview
+            .as_ref()
+            .is_some_and(|webview| !is_current_webview(&app, webview))
+        {
+            return Err("connection_stale".to_string());
+        }
+        let replace_connection = channel.is_some();
+        if let Some(channel) = channel {
+            *current = Some(ChatOutputConnection {
+                id: connection_id.clone(),
+                channel,
+            });
+        }
+        let connection = current.as_ref().ok_or("connection_not_registered")?;
+        if connection.id != connection_id {
+            return Err("connection_stale".to_string());
+        }
+        let channel = connection.channel.clone();
+        // A new WebView may reuse a numeric JS callback ID. Registration
+        // replaces the consumer by connection identity, not by that number.
+        for request in requests.0.iter() {
+            if request
+                .output
+                .attach_connection(channel.clone(), replace_connection)?
+                && request
+                    .output
+                    .send_activity(request.key(), request.attempt_id, true)
+            {
+                active_requests.push(json!({
+                    "ownerType": request.key().topic.owner_type,
+                    "ownerId": request.key().topic.owner_id,
+                    "topicId": request.key().topic.topic_id,
+                    "requestId": request.attempt_id,
+                }));
+            }
+            keys.insert(request.key().clone());
+        }
+        let active_turns = turns
+            .active
+            .iter()
+            .map(|turn| turn.key().clone())
+            .collect::<Vec<_>>();
+        for key in active_turns {
+            if let Some(turn) = turns.attach_output(&requests, &key, channel.clone())? {
+                group_turns.push(turn);
+            }
+        }
+        channel
+    };
     let db = app.state::<DbState>();
+    let generations = pending_generations(&db.pool).await?;
+    for generation in &generations {
+        keys.insert(MessageKey::new(
+            TopicKey::new(
+                &generation.owner_type,
+                &generation.owner_id,
+                &generation.topic_id,
+            ),
+            &generation.msg_id,
+        ));
+    }
+    for path in offline_completed_paths(&app, None).await? {
+        match open_offline_completed(path.clone()).await {
+            Ok(file) => {
+                let key = file.metadata.message_key()?;
+                if file.metadata.request_id == message_transport_request_id(&key) {
+                    keys.insert(key);
+                }
+            }
+            Err(error) => {
+                log::warn!("[VCPClient] Keeping unreadable offline SSE file {path:?}: {error}")
+            }
+        }
+    }
+    if requests
+        .1
+        .lock()
+        .map_err(|error| error.to_string())?
+        .as_ref()
+        .is_none_or(|connection| connection.id != connection_id)
+    {
+        return Err("connection_stale".to_string());
+    }
+    for key in keys {
+        let app = app.clone();
+        let channel = channel.clone();
+        tauri::async_runtime::spawn(async move {
+            let result = recover_active_generation(
+                app.clone(),
+                app.state::<ActiveRequests>(),
+                key.topic.owner_id.clone(),
+                key.topic.owner_type.clone(),
+                key.topic.topic_id.clone(),
+                key.msg_id.clone(),
+                channel.clone(),
+            )
+            .await;
+            if let Err(error) = result {
+                // The owner sends detailed recoverable failures itself. A DB or
+                // mailbox failure before a transport exists still needs an event.
+                log::warn!(
+                    "[VCPClient] Reconnect for {} remains pending: {error}",
+                    key.msg_id
+                );
+            }
+        });
+    }
+    Ok(ReconnectChatStreamsResult {
+        generations,
+        group_turns,
+        active_requests,
+    })
+}
+
+async fn pending_generations(pool: &sqlx::SqlitePool) -> Result<Vec<ActiveGeneration>, String> {
     let rows = sqlx::query(
         "SELECT ag.msg_id, ag.topic_id, ag.owner_id, ag.owner_type, ag.created_at, \
-                m.agent_id, COALESCE(m.name, a.name) AS agent_name \
+                m.agent_id, COALESCE(m.name, a.name) AS agent_name, ag.stop_requested \
          FROM active_generations ag \
          JOIN messages m ON m.owner_type = ag.owner_type \
             AND m.owner_id = ag.owner_id AND m.topic_id = ag.topic_id AND m.msg_id = ag.msg_id \
@@ -2424,7 +3213,7 @@ pub async fn get_active_generations(
          WHERE m.deleted_at IS NULL AND m.finish_reason IS NULL \
          ORDER BY ag.created_at ASC",
     )
-    .fetch_all(&db.pool)
+    .fetch_all(pool)
     .await
     .map_err(|e| e.to_string())?;
 
@@ -2445,6 +3234,7 @@ pub async fn get_active_generations(
             created_at: row.get("created_at"),
             agent_id: row.get("agent_id"),
             agent_name: row.get("agent_name"),
+            stop_requested: row.get("stop_requested"),
         });
     }
     Ok(list)
@@ -2457,66 +3247,30 @@ pub(crate) async fn finalize_stream_error<R: Runtime>(
     partial_content: String,
     error: String,
     stream_channel: Option<Channel<StreamEvent>>,
+    agent_id: Option<String>,
 ) -> Result<Option<String>, String> {
-    use sqlx::Row;
-
-    let pending = sqlx::query_scalar::<_, bool>(
-        "SELECT EXISTS(
-            SELECT 1 FROM active_generations
-            WHERE owner_type = ? AND owner_id = ? AND topic_id = ? AND msg_id = ?
-         )",
-    )
-    .bind(&key.topic.owner_type)
-    .bind(&key.topic.owner_id)
-    .bind(&key.topic.topic_id)
-    .bind(&key.msg_id)
-    .fetch_one(pool)
-    .await
-    .map_err(|e| e.to_string())?;
-
-    if pending {
-        let agent_id_row = sqlx::query(
-            "SELECT agent_id FROM messages
-             WHERE owner_type = ? AND owner_id = ? AND topic_id = ? AND msg_id = ?",
-        )
-        .bind(&key.topic.owner_type)
-        .bind(&key.topic.owner_id)
-        .bind(&key.topic.topic_id)
-        .bind(&key.msg_id)
-        .fetch_optional(pool)
-        .await
-        .map_err(|e| e.to_string())?;
-        let agent_id = agent_id_row.and_then(|r| r.get::<Option<String>, _>("agent_id"));
-
-        let error = if error.trim().is_empty() {
-            "生成意外中断"
-        } else {
-            error.as_str()
-        };
-        let final_content = stream_error_content(&partial_content, error);
-
-        crate::vcp_modules::chat::message_service::finalize_stream_message(
-            app_handle.clone(),
-            pool,
-            key,
-            final_content.clone(),
-            false,
-            Some("error".to_string()),
-            stream_channel,
-            agent_id,
-        )
-        .await?;
-        return Ok(Some(final_content));
+    let error = if error.trim().is_empty() {
+        "生成意外中断"
     } else {
-        // Another owner may have committed the terminal message after recovery began.
-        // Terminal rows are immutable: a late recovery must be an idempotent no-op.
-        log::info!(
-            "[VCPClient] Generation {} is no longer pending; skipping late error finalization.",
-            key.msg_id
-        );
-        discard_request_helper(app_handle, key).await;
-    }
-    Ok(None)
+        error.as_str()
+    };
+    // The caller already owns the speaker identity. Retain the complete error
+    // terminal before any database access; the finalizer's transaction alone
+    // decides whether the message is pending, already settled, or removed.
+    let committed = crate::vcp_modules::chat::message_service::finalize_stream_message(
+        app_handle.clone(),
+        pool,
+        key,
+        stream_error_content(&partial_content, error),
+        false,
+        Some("error".to_string()),
+        stream_channel,
+        agent_id,
+    )
+    .await?;
+    Ok(committed
+        .filter(|message| message.newly_committed)
+        .map(|message| message.content))
 }
 
 #[derive(Debug, Deserialize)]
@@ -2653,6 +3407,96 @@ async fn remove_offline_completed(path: &std::path::Path) -> Result<(), String> 
     }
 }
 
+#[cfg(target_os = "android")]
+async fn read_completed_transport<R: Runtime>(
+    app: &AppHandle<R>,
+    request_id: &str,
+    output: &RequestOutput,
+) -> Result<Option<Result<VcpResponse, VcpRequestFailure>>, VcpRequestFailure> {
+    use tokio::io::{AsyncReadExt, AsyncSeekExt};
+    let mut files = Vec::new();
+    for path in offline_completed_paths(app, Some(request_id))
+        .await
+        .map_err(|error| VcpRequestFailure::recoverable_helper(error, None))?
+    {
+        files.push(
+            open_offline_completed(path)
+                .await
+                .map_err(|error| VcpRequestFailure::recoverable_helper(error, None))?,
+        );
+    }
+    files.sort_by_key(|file| std::cmp::Reverse(file.metadata.completed_at));
+    let Some(file) = files.into_iter().next() else {
+        return Ok(None);
+    };
+    let mut reader = tokio::fs::File::open(&file.path)
+        .await
+        .map_err(|error| VcpRequestFailure::recoverable_helper(error.to_string(), None))?;
+    reader
+        .seek(std::io::SeekFrom::Start(file.content_offset))
+        .await
+        .map_err(|error| VcpRequestFailure::recoverable_helper(error.to_string(), None))?;
+    let mut content = String::new();
+    reader
+        .read_to_string(&mut content)
+        .await
+        .map_err(|error| VcpRequestFailure::recoverable_helper(error.to_string(), None))?;
+    output.retain_completed_file(&file);
+    if let Some(error) = file.metadata.error {
+        return Ok(Some(Err(VcpRequestFailure::streaming(error, content))));
+    }
+    let reason = file
+        .metadata
+        .finish_reason
+        .unwrap_or_else(|| "completed".to_string());
+    let aborted = reason == "cancelled_by_user";
+    Ok(Some(Ok(VcpResponse {
+        full_content: content,
+        finish_reason: Some(reason),
+        is_aborted: aborted,
+    })))
+}
+
+#[cfg(target_os = "android")]
+async fn checkpoint_stop_partial<R: Runtime>(
+    app: &AppHandle<R>,
+    context: &Option<Value>,
+    message_id: &str,
+    partial: Option<&str>,
+) -> Result<(), VcpRequestFailure> {
+    let key = message_key_from_context(context, message_id)?;
+    let db = app.state::<DbState>();
+    sqlx::query(
+        "UPDATE active_generations SET stop_requested = 1,
+         stop_partial_content = COALESCE(?, stop_partial_content)
+         WHERE owner_type = ? AND owner_id = ? AND topic_id = ? AND msg_id = ?",
+    )
+    .bind(partial)
+    .bind(&key.topic.owner_type)
+    .bind(&key.topic.owner_id)
+    .bind(&key.topic.topic_id)
+    .bind(&key.msg_id)
+    .execute(&db.pool)
+    .await
+    .map_err(|error| {
+        VcpRequestFailure::stopping(
+            format!("停止待确认，暂存正文失败：{error}"),
+            partial.map(str::to_string),
+        )
+    })?;
+    Ok(())
+}
+
+/// Recovery sends authoritative content through StreamEvent, never in a second
+/// internal JSON response. Only the coordination outcome needs to be returned.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RecoveryStatus {
+    Attached,
+    Completed,
+    Failed,
+    NotFound,
+}
+
 /// Called with the message's ActiveRequestLease held. The helper file remains
 /// available after read or transaction failures; only a durable DB decision consumes it.
 async fn finalize_offline_completed<R: Runtime>(
@@ -2660,14 +3504,14 @@ async fn finalize_offline_completed<R: Runtime>(
     key: &MessageKey,
     file: OfflineCompletedFile,
     stream_channel: Channel<StreamEvent>,
-) -> Result<Value, String> {
+) -> Result<RecoveryStatus, String> {
     use tokio::io::{AsyncReadExt, AsyncSeekExt};
 
-    type OfflineMessageRow = (String, Option<String>, Option<i64>, Option<String>, bool);
+    type OfflineMessageRow = (Option<String>, Option<i64>, Option<String>, bool);
 
     let db = app.state::<DbState>();
     let row: Option<OfflineMessageRow> = sqlx::query_as(
-        "SELECT m.content, m.finish_reason, m.deleted_at, m.agent_id,
+        "SELECT m.finish_reason, m.deleted_at, m.agent_id,
                 EXISTS(SELECT 1 FROM active_generations ag
                        WHERE ag.owner_type = m.owner_type AND ag.owner_id = m.owner_id
                          AND ag.topic_id = m.topic_id AND ag.msg_id = m.msg_id)
@@ -2681,16 +3525,16 @@ async fn finalize_offline_completed<R: Runtime>(
     .fetch_optional(&db.pool)
     .await
     .map_err(|error| error.to_string())?;
-    let Some((content, finish_reason, deleted_at, agent_id, pending)) = row else {
+    let Some((finish_reason, deleted_at, agent_id, pending)) = row else {
         remove_offline_completed(&file.path).await?;
-        return Ok(json!({ "status": "not_found", "content": "" }));
+        return Ok(RecoveryStatus::NotFound);
     };
     if deleted_at.is_some() || finish_reason.is_some() {
         remove_offline_completed(&file.path).await?;
         return Ok(if deleted_at.is_some() {
-            json!({ "status": "not_found", "content": "" })
+            RecoveryStatus::NotFound
         } else {
-            json!({ "status": "completed", "content": content, "finishReason": finish_reason })
+            RecoveryStatus::Completed
         });
     }
     if !pending {
@@ -2719,69 +3563,29 @@ async fn finalize_offline_completed<R: Runtime>(
             .finish_reason
             .unwrap_or_else(|| "completed".to_string())
     };
-    let content = crate::vcp_modules::chat::message_service::finalize_stream_message(
+    let committed = crate::vcp_modules::chat::message_service::finalize_recovered_stream_message(
         app.clone(),
         &db.pool,
         key,
         content,
-        finish_reason == "cancelled_by_user",
-        Some(finish_reason.clone()),
-        Some(stream_channel),
+        finish_reason.clone(),
+        stream_channel,
         agent_id,
     )
     .await?;
     remove_offline_completed(&file.path).await?;
-    Ok(json!({ "status": "completed", "content": content, "finishReason": finish_reason }))
-}
-
-async fn recover_offline_completed<R: Runtime>(
-    app: &AppHandle<R>,
-    active_requests: &ActiveRequests,
-    stream_channel: Channel<StreamEvent>,
-) -> Result<(), String> {
-    let mut files = Vec::new();
-    for path in offline_completed_paths(app, None).await? {
-        match open_offline_completed(path.clone()).await {
-            Ok(file) => files.push(file),
-            Err(error) => log::warn!(
-                "[VCPClient] Keeping unreadable offline SSE file {:?}: {}",
-                path,
-                error
-            ),
-        }
-    }
-    files.sort_by_key(|file| std::cmp::Reverse(file.metadata.completed_at));
-    for file in files {
-        let key = file.metadata.message_key()?;
-        // CLI step transports belong to their turn owner, not the chat-message
-        // finalizer. Never commit one step as the whole message on cold recovery.
-        if file.metadata.request_id != message_transport_request_id(&key) {
-            continue;
-        }
-        let Ok((_lease, _cancellation)) =
-            ActiveRequestLease::try_acquire(active_requests.0.clone(), key.clone())
-        else {
-            continue;
-        };
-        request_output(app, &key, Some(stream_channel.clone()));
-        if let Err(error) =
-            finalize_offline_completed(app, &key, file, stream_channel.clone()).await
-        {
-            log::warn!(
-                "[VCPClient] Offline SSE recovery for {} remains pending: {}",
-                key.msg_id,
-                error
-            );
-        }
-    }
-    Ok(())
+    Ok(if committed.is_some() {
+        RecoveryStatus::Completed
+    } else {
+        RecoveryStatus::NotFound
+    })
 }
 
 async fn recover_offline_generation<R: Runtime>(
     app: &AppHandle<R>,
     key: &MessageKey,
     stream_channel: Channel<StreamEvent>,
-) -> Result<Option<Value>, String> {
+) -> Result<Option<RecoveryStatus>, String> {
     let request_id = message_transport_request_id(key);
     let mut files = Vec::new();
     for path in offline_completed_paths(app, Some(&request_id)).await? {
@@ -2805,9 +3609,9 @@ async fn recover_offline_generation<R: Runtime>(
 async fn terminal_generation_result(
     pool: &sqlx::Pool<sqlx::Sqlite>,
     key: &MessageKey,
-) -> Result<Value, String> {
-    let terminal: Option<(String, Option<String>)> = sqlx::query_as(
-        "SELECT content, finish_reason FROM messages
+) -> Result<RecoveryStatus, String> {
+    let terminal: Option<Option<String>> = sqlx::query_scalar(
+        "SELECT finish_reason FROM messages
          WHERE owner_type = ? AND owner_id = ? AND topic_id = ? AND msg_id = ?
            AND deleted_at IS NULL",
     )
@@ -2819,25 +3623,22 @@ async fn terminal_generation_result(
     .await
     .map_err(|error| error.to_string())?;
     Ok(match terminal {
-        Some((content, Some(finish_reason))) => json!({
-            "status": "completed", "content": content, "finishReason": finish_reason,
-        }),
-        Some((content, None)) => json!({ "status": "failed", "content": content }),
-        None => json!({ "status": "not_found", "content": "" }),
+        Some(Some(_)) => RecoveryStatus::Completed,
+        Some(None) => RecoveryStatus::Failed,
+        None => RecoveryStatus::NotFound,
     })
 }
 
-#[tauri::command]
 #[allow(clippy::too_many_arguments)]
-pub async fn recover_active_generation<R: Runtime>(
+async fn recover_active_generation<R: Runtime>(
     app: AppHandle<R>,
     active_requests: tauri::State<'_, ActiveRequests>,
     owner_id: String,
     owner_type: String,
     topic_id: String,
     msg_id: String,
-    stream_channel: Channel<StreamEvent>,
-) -> Result<Value, String> {
+    mut stream_channel: Channel<StreamEvent>,
+) -> Result<RecoveryStatus, String> {
     log::info!(
         "[VCPClient] recover_active_generation called for {}/{}/{}/{}",
         owner_type,
@@ -2847,15 +3648,20 @@ pub async fn recover_active_generation<R: Runtime>(
     );
     let key = MessageKey::new(TopicKey::new(&owner_type, &owner_id, &topic_id), &msg_id);
 
-    if let Some(turns) = app.try_state::<ActiveGroupTurns>() {
-        turns.attach_output(&active_requests, &key.topic, stream_channel.clone())?;
-    }
-
     // Keep the live attempt and replace only its consumer. If finalization won
     // the output lock first, wait for that lease to leave before reading its
     // durable result; do not claim a second attempt beside a closing one.
     let (_recovery_lease, _recovery_cancellation_token) = loop {
-        match ActiveRequestLease::try_acquire(active_requests.0.clone(), key.clone()) {
+        {
+            let current = active_requests
+                .1
+                .lock()
+                .map_err(|error| error.to_string())?;
+            if let Some(channel) = current.as_ref() {
+                stream_channel = channel.channel.clone();
+            }
+        }
+        match ActiveRequestLease::try_acquire_recovery(active_requests.0.clone(), key.clone()) {
             Ok(claim) => break claim,
             Err(_) => {
                 let Some(entry) = active_requests
@@ -2865,22 +3671,64 @@ pub async fn recover_active_generation<R: Runtime>(
                 else {
                     continue;
                 };
-                if entry.output.attach(stream_channel.clone())? {
-                    return Ok(json!({ "status": "attached" }));
+                let attached = {
+                    let current = active_requests
+                        .1
+                        .lock()
+                        .map_err(|error| error.to_string())?;
+                    if let Some(channel) = current.as_ref() {
+                        stream_channel = channel.channel.clone();
+                    }
+                    entry.output.attach(stream_channel.clone())?
+                };
+                if attached {
+                    let db = app.state::<DbState>();
+                    let pending: bool = sqlx::query_scalar(
+                        "SELECT EXISTS(SELECT 1 FROM active_generations
+                         WHERE owner_type = ? AND owner_id = ? AND topic_id = ? AND msg_id = ?)",
+                    )
+                    .bind(&key.topic.owner_type)
+                    .bind(&key.topic.owner_id)
+                    .bind(&key.topic.topic_id)
+                    .bind(&key.msg_id)
+                    .fetch_one(&db.pool)
+                    .await
+                    .map_err(|error| error.to_string())?;
+                    if pending {
+                        entry.output.send(recovery_state_event(
+                            &key,
+                            if entry.cancellation_token.is_cancelled() {
+                                "stopping"
+                            } else {
+                                "connected"
+                            },
+                        ));
+                    }
+                    return Ok(RecoveryStatus::Attached);
                 }
                 entry.released.cancelled().await;
             }
         }
     };
-    request_output(&app, &key, Some(stream_channel.clone()));
+    let output = request_output(&app, &key, Some(stream_channel.clone()));
+    let result = async {
+
+    if let Some(terminal) = output.pending_terminal() {
+        let db = app.state::<DbState>();
+        let committed = crate::vcp_modules::chat::message_service::retry_stream_terminal(
+            app.clone(), &db.pool, &key, terminal, Some(stream_channel.clone()),
+        ).await?;
+        return Ok(if committed.is_some() { RecoveryStatus::Completed } else { RecoveryStatus::NotFound });
+    }
 
     if let Some(recovered) = recover_offline_generation(&app, &key, stream_channel.clone()).await? {
         return Ok(recovered);
     }
 
     let db = app.state::<DbState>();
-    let pending: Option<(Option<String>,)> = sqlx::query_as(
-        "SELECT m.agent_id \
+    type PendingGenerationRow = (Option<String>, bool, Option<String>, i64, Option<String>);
+    let pending: Option<PendingGenerationRow> = sqlx::query_as(
+        "SELECT m.agent_id, ag.stop_requested, ag.stop_partial_content, ag.created_at, m.name \
          FROM active_generations ag \
          JOIN messages m ON m.owner_type = ag.owner_type AND m.owner_id = ag.owner_id \
             AND m.topic_id = ag.topic_id AND m.msg_id = ag.msg_id \
@@ -2895,30 +3743,42 @@ pub async fn recover_active_generation<R: Runtime>(
     .await
     .map_err(|e| e.to_string())?;
 
-    let Some((agent_id,)) = pending else {
+    let Some((agent_id, stop_requested, stop_partial, created_at, agent_name)) = pending else {
         return terminal_generation_result(&db.pool, &key).await;
     };
+    let mut event = recovery_state_event(&key, if stop_requested { "stopping" } else { "reconnecting" });
+    event.timestamp = Some(created_at.max(0) as u64);
+    if let Some(context) = event.context.as_mut() {
+        context["agentId"] = json!(agent_id);
+        context["agentName"] = json!(agent_name);
+    }
+    event.content = stop_partial.clone();
+    output.send(event);
+    if stop_requested {
+        _recovery_cancellation_token.cancel();
+    }
 
     #[cfg(target_os = "android")]
     {
-        let resumed = resume_claimed_generation(
+        return resume_claimed_generation(
             &app,
             &key,
             agent_id,
             stream_channel,
-            _recovery_cancellation_token,
+            _recovery_cancellation_token.clone(),
         )
-        .await?;
-        return Ok(json!({
-            "status": resumed["status"].as_str().unwrap_or("completed"),
-            "content": resumed["fullContent"],
-            "finishReason": resumed["finishReason"],
-        }));
+        .await;
     }
 
     #[cfg(not(target_os = "android"))]
     {
-        let _ = agent_id;
+        if stop_requested {
+            let committed = crate::vcp_modules::chat::message_service::finalize_stream_message(
+                app.clone(), &db.pool, &key, stop_partial.unwrap_or_default(), true,
+                Some("cancelled_by_user".to_string()), Some(stream_channel.clone()), agent_id,
+            ).await?;
+            return Ok(if committed.is_some() { RecoveryStatus::Completed } else { RecoveryStatus::NotFound });
+        }
 
         log::warn!(
         "[VCPClient] Active generation {} not found in active_requests and no local cache available. Marking as failed.",
@@ -2932,23 +3792,93 @@ pub async fn recover_active_generation<R: Runtime>(
             String::new(),
             "后台进程已被系统销毁，流式对话中断".to_string(),
             Some(stream_channel.clone()),
+            agent_id,
         )
         .await?;
 
-        let content: Option<String> = sqlx::query_scalar(
-            "SELECT content FROM messages
-         WHERE owner_type = ? AND owner_id = ? AND topic_id = ? AND msg_id = ?
-           AND deleted_at IS NULL",
-        )
-        .bind(&owner_type)
-        .bind(&owner_id)
-        .bind(&topic_id)
-        .bind(&msg_id)
-        .fetch_optional(&db.pool)
-        .await
-        .map_err(|e| e.to_string())?;
-        Ok(json!({ "status": "failed", "content": content.unwrap_or_default() }))
+        Ok(RecoveryStatus::Failed)
     }
+    }.await;
+    match &result {
+        Ok(RecoveryStatus::Completed | RecoveryStatus::Failed) => {
+            // A terminal row can win just before this connection attaches. Its
+            // durable result is delivered through the same channel, once.
+            if let Err(error) = emit_persisted_terminal(&app, &key, &output).await {
+                output.send(StreamEvent::error(
+                    key.msg_id.clone(),
+                    recovery_state_event(&key, "error").context,
+                    error.clone(),
+                ));
+                return Err(error);
+            }
+        }
+        Err(error) => {
+            let mut event = StreamEvent::error(
+                key.msg_id.clone(),
+                recovery_state_event(&key, "error").context,
+                error.clone(),
+            );
+            if _recovery_cancellation_token.is_cancelled() {
+                event.r#type = "stopping".to_string();
+            }
+            output.send(event);
+        }
+        _ => {}
+    }
+    result
+}
+
+fn recovery_state_event(key: &MessageKey, state: &str) -> StreamEvent {
+    StreamEvent {
+        r#type: state.to_string(),
+        message_id: key.msg_id.clone(),
+        context: Some(json!({
+            "ownerType": key.topic.owner_type, "ownerId": key.topic.owner_id,
+            "topicId": key.topic.topic_id,
+        })),
+        ..Default::default()
+    }
+}
+
+async fn emit_persisted_terminal<R: Runtime>(
+    app: &AppHandle<R>,
+    key: &MessageKey,
+    output: &RequestOutput,
+) -> Result<(), String> {
+    let db = app.state::<DbState>();
+    type PersistedTerminalRow = (String, String, i64, Option<String>, Option<String>, i64);
+    let row: Option<PersistedTerminalRow> = sqlx::query_as(
+        "SELECT m.content, m.finish_reason, m.timestamp, m.agent_id, m.name, t.updated_at
+         FROM messages m JOIN topics t ON t.owner_type = m.owner_type AND t.owner_id = m.owner_id
+           AND t.topic_id = m.topic_id
+         WHERE m.owner_type = ? AND m.owner_id = ? AND m.topic_id = ? AND m.msg_id = ?
+           AND m.deleted_at IS NULL AND m.finish_reason IS NOT NULL",
+    )
+    .bind(&key.topic.owner_type)
+    .bind(&key.topic.owner_id)
+    .bind(&key.topic.topic_id)
+    .bind(&key.msg_id)
+    .fetch_optional(&db.pool)
+    .await
+    .map_err(|error| error.to_string())?;
+    if let Some((content, reason, timestamp, agent_id, name, topic_updated_at)) = row {
+        let mut context = recovery_state_event(key, "end").context;
+        if let Some(context) = context.as_mut() {
+            context["agentId"] = json!(agent_id);
+            context["agentName"] = json!(name);
+            context["replayed"] = json!(true);
+        }
+        output.send(StreamEvent::end(
+            key.msg_id.clone(),
+            context,
+            Some(reason),
+            Some(content),
+            None,
+            Some(timestamp.max(0) as u64),
+            Some(topic_updated_at),
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(any(target_os = "android", test))]
@@ -2957,8 +3887,10 @@ async fn handle_recovery_failure<R: Runtime>(
     key: &MessageKey,
     failure: VcpRequestFailure,
     stream_channel: Channel<StreamEvent>,
-) -> Result<Value, String> {
+    agent_id: Option<String>,
+) -> Result<RecoveryStatus, String> {
     let recovery_pending = failure.is_recovery_pending();
+    let stop_pending = failure.is_stop_pending();
     let (error, partial_content) = failure.into_parts();
     if error == HELPER_SESSION_NOT_FOUND {
         // Publication and live-session removal are one helper transition.
@@ -2967,11 +3899,32 @@ async fn handle_recovery_failure<R: Runtime>(
         if let Some(recovered) =
             recover_offline_generation(app, key, stream_channel.clone()).await?
         {
-            return Ok(json!({
-                "status": recovered["status"],
-                "fullContent": recovered["content"],
-                "finishReason": recovered["finishReason"],
-            }));
+            return Ok(recovered);
+        }
+        let db = app.state::<DbState>();
+        let stop: Option<Option<String>> = sqlx::query_scalar(
+            "SELECT stop_partial_content FROM active_generations
+             WHERE owner_type = ? AND owner_id = ? AND topic_id = ? AND msg_id = ? AND stop_requested = 1",
+        )
+        .bind(&key.topic.owner_type).bind(&key.topic.owner_id).bind(&key.topic.topic_id).bind(&key.msg_id)
+        .fetch_optional(&db.pool).await.map_err(|error| error.to_string())?;
+        if let Some(stored_partial) = stop {
+            let committed = crate::vcp_modules::chat::message_service::finalize_stream_message(
+                app.clone(),
+                &db.pool,
+                key,
+                partial_content.or(stored_partial).unwrap_or_default(),
+                true,
+                Some("cancelled_by_user".to_string()),
+                Some(stream_channel),
+                agent_id,
+            )
+            .await?;
+            return Ok(if committed.is_some() {
+                RecoveryStatus::Completed
+            } else {
+                RecoveryStatus::NotFound
+            });
         }
     } else if recovery_pending || error == STREAM_CAPACITY_EXHAUSTED {
         // The helper still owns the complete response. A local attachment or
@@ -2983,12 +3936,12 @@ async fn handle_recovery_failure<R: Runtime>(
             "ownerId": key.topic.owner_id,
             "topicId": key.topic.topic_id,
         }));
-        deliver_request_event(
-            app,
-            key,
-            Some(stream_channel),
-            StreamEvent::error(key.msg_id.clone(), context, error.clone()),
-        );
+        let mut event = StreamEvent::error(key.msg_id.clone(), context, error.clone());
+        event.content = partial_content;
+        if stop_pending {
+            event.r#type = "stopping".to_string();
+        }
+        deliver_request_event(app, key, Some(stream_channel), event);
         return Err(error);
     }
 
@@ -3000,21 +3953,20 @@ async fn handle_recovery_failure<R: Runtime>(
     };
     let db = app.state::<DbState>();
     let pool = &db.pool;
-    let committed_content =
-        finalize_stream_error(app, pool, key, partial_content, error, Some(stream_channel)).await?;
-    let Some(committed_content) = committed_content else {
-        let terminal = terminal_generation_result(pool, key).await?;
-        return Ok(json!({
-            "status": terminal["status"],
-            "fullContent": terminal["content"],
-            "finishReason": terminal["finishReason"],
-        }));
-    };
-    Ok(json!({
-        "status": "failed",
-        "fullContent": committed_content,
-        "finishReason": "error",
-    }))
+    let committed_content = finalize_stream_error(
+        app,
+        pool,
+        key,
+        partial_content,
+        error,
+        Some(stream_channel),
+        agent_id,
+    )
+    .await?;
+    if committed_content.is_none() {
+        return terminal_generation_result(pool, key).await;
+    }
+    Ok(RecoveryStatus::Failed)
 }
 
 #[cfg(target_os = "android")]
@@ -3024,7 +3976,7 @@ async fn resume_claimed_generation<R: Runtime>(
     agent_id: Option<String>,
     stream_channel: Channel<StreamEvent>,
     cancellation_token: CancellationToken,
-) -> Result<Value, String> {
+) -> Result<RecoveryStatus, String> {
     let msg_id = key.msg_id.clone();
     let topic_id = key.topic.topic_id.clone();
     let owner_id = key.topic.owner_id.clone();
@@ -3049,12 +4001,13 @@ async fn resume_claimed_generation<R: Runtime>(
         "agentId": if owner_type == "agent" { Some(&owner_id) } else { None },
     });
 
-    let (mut res, is_aborted) = match handle_streaming_request(
+    let response = match handle_streaming_request(
         app,
         client,
         "",
         "",
-        Value::Null,
+        None,
+        0,
         msg_id.clone(),
         transport_request_id,
         Some(context.clone()),
@@ -3070,31 +4023,28 @@ async fn resume_claimed_generation<R: Runtime>(
                 "[VCPClient] Claimed recovery failed during handle_streaming_request: {}",
                 failure
             );
-            return handle_recovery_failure(app, key, failure, stream_channel).await;
+            return handle_recovery_failure(app, key, failure, stream_channel, agent_id).await;
         }
     };
 
-    let finish_reason = if is_aborted {
-        Some("cancelled_by_user".to_string())
-    } else {
-        res["finishReason"].as_str().map(|s| s.to_string())
-    };
-
     log::info!("[VCPClient] Claimed recovery completed. Finalizing message.");
-    let committed_content = crate::vcp_modules::chat::message_service::finalize_stream_message(
+    let committed = crate::vcp_modules::chat::message_service::finalize_stream_message(
         app.clone(),
         &pool,
         key,
-        res["fullContent"].as_str().unwrap_or("").to_string(),
-        is_aborted,
-        finish_reason,
+        response.full_content,
+        response.is_aborted,
+        response.finish_reason,
         Some(stream_channel),
         agent_id,
     )
     .await?;
 
-    res["fullContent"] = json!(committed_content);
-    Ok(res)
+    Ok(if committed.is_some() {
+        RecoveryStatus::Completed
+    } else {
+        RecoveryStatus::NotFound
+    })
 }
 
 #[cfg(test)]
@@ -3102,8 +4052,13 @@ mod offline_completed_tests {
     use super::*;
 
     async fn fixture() -> (DbState, MessageKey, tempfile::TempDir, std::path::PathBuf) {
-        let pool = sqlx::sqlite::SqlitePoolOptions::new()
-            .max_connections(1)
+        fixture_with_options(sqlx::sqlite::SqlitePoolOptions::new().max_connections(1)).await
+    }
+
+    async fn fixture_with_options(
+        options: sqlx::sqlite::SqlitePoolOptions,
+    ) -> (DbState, MessageKey, tempfile::TempDir, std::path::PathBuf) {
+        let pool = options
             .connect("sqlite::memory:")
             .await
             .expect("test database");
@@ -3111,6 +4066,12 @@ mod offline_completed_tests {
             .execute(&pool)
             .await
             .expect("schema");
+        sqlx::raw_sql(include_str!(
+            "../../../migrations/0102_stream_stop_intent.sql"
+        ))
+        .execute(&pool)
+        .await
+        .expect("stop intent schema");
         sqlx::raw_sql(
             "INSERT INTO agents (owner_type, agent_id, name, model, updated_at)
              VALUES ('agent', 'offline-agent', 'Agent', 'test', 1);
@@ -3166,6 +4127,908 @@ mod offline_completed_tests {
         (db, key, directory, path)
     }
 
+    fn channel() -> (
+        Channel<StreamEvent>,
+        tokio::sync::mpsc::UnboundedReceiver<Value>,
+    ) {
+        let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+        (
+            Channel::new(move |body| {
+                let _ = sender.send(body.deserialize::<Value>()?);
+                Ok(())
+            }),
+            receiver,
+        )
+    }
+
+    async fn reject_terminal_commits(pool: &sqlx::SqlitePool) {
+        sqlx::raw_sql(
+            "CREATE TRIGGER reject_terminal_commit BEFORE UPDATE OF finish_reason ON messages
+             WHEN NEW.finish_reason IS NOT NULL
+             BEGIN SELECT RAISE(ABORT, 'forced terminal commit failure'); END;",
+        )
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    async fn receive_event(
+        events: &mut tokio::sync::mpsc::UnboundedReceiver<Value>,
+        event_type: &str,
+    ) -> Value {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let event = events
+                    .recv()
+                    .await
+                    .expect("stream channel remains available");
+                if event["type"] == event_type {
+                    return event;
+                }
+            }
+        })
+        .await
+        .expect("stream event")
+    }
+
+    #[tokio::test]
+    async fn failed_terminal_commit_recovers_its_body_and_reason_on_a_new_connection() {
+        for (aborted, reason) in [(false, "length"), (true, "cancelled_by_user")] {
+            let (db, key, _directory, _path) = fixture().await;
+            let pool = db.pool.clone();
+            let app = tauri::test::mock_app();
+            app.manage(db);
+            app.manage(ActiveRequests::default());
+            app.manage(ActiveGroupTurns::default());
+            let requests = app.state::<ActiveRequests>();
+            let (lease, cancellation) =
+                ActiveRequestLease::try_acquire(requests.0.clone(), key.clone()).unwrap();
+            let output = Arc::downgrade(&lease.entry.output);
+            let (original, mut original_events) = channel();
+            lease
+                .bind_output(app.handle(), Some(original.clone()))
+                .unwrap();
+            if aborted {
+                cancellation.cancel();
+            }
+            reject_terminal_commits(&pool).await;
+            let content = "已收到的回答 🦀\n\n```rust\nlet x = 1;\n```";
+            let error = crate::vcp_modules::chat::message_service::finalize_stream_message(
+                app.handle().clone(),
+                &pool,
+                &key,
+                content.into(),
+                aborted,
+                Some(reason.into()),
+                Some(original),
+                Some("offline-agent".into()),
+            )
+            .await
+            .expect_err("the injected transaction failure must surface");
+            assert!(error.contains("forced terminal commit failure"));
+            assert_eq!(
+                receive_event(&mut original_events, "error").await["content"],
+                content
+            );
+            drop(lease);
+            let unfinished: (String, Option<String>) =
+                sqlx::query_as("SELECT content, finish_reason FROM messages")
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap();
+            assert_eq!(
+                unfinished,
+                (String::new(), None),
+                "the failed transaction must not claim persistence"
+            );
+            sqlx::query("DROP TRIGGER reject_terminal_commit")
+                .execute(&pool)
+                .await
+                .unwrap();
+
+            let (replacement, mut events) = channel();
+            let receipt = reconnect_chat_output(
+                app.handle().clone(),
+                "replacement".into(),
+                Some(replacement),
+            )
+            .await
+            .unwrap();
+            assert_eq!(receipt.generations.len(), 1);
+            let end = receive_event(&mut events, "end").await;
+            assert_eq!(end["content"], content);
+            assert_eq!(end["finishReason"], reason);
+            assert_eq!(end["context"]["replayed"], true);
+            let durable: (String, String) =
+                sqlx::query_as("SELECT content, finish_reason FROM messages")
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap();
+            assert_eq!(durable, (content.into(), reason.into()));
+            assert_eq!(
+                sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM active_generations")
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap(),
+                0
+            );
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while output.upgrade().is_some() {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("committed terminal owner must be released");
+            while let Ok(event) = original_events.try_recv() {
+                assert_ne!(event["type"], "end");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_error_query_retains_group_body_reason_and_speaker_for_recovery() {
+        let (db, _, _directory, _path) = fixture_with_options(
+            sqlx::sqlite::SqlitePoolOptions::new()
+                .max_connections(1)
+                .acquire_timeout(Duration::from_millis(100)),
+        )
+        .await;
+        let pool = db.pool.clone();
+        sqlx::raw_sql(
+            "INSERT INTO groups (owner_type, group_id, name, updated_at)
+             VALUES ('group', 'error-group', 'Group', 1);
+             INSERT INTO topics (topic_id, owner_type, owner_id, title, created_at, updated_at)
+             VALUES ('error-topic', 'group', 'error-group', 'Topic', 1, 1);",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let key = MessageKey::new(
+            TopicKey::new("group", "error-group", "error-topic"),
+            "error-message",
+        );
+        crate::vcp_modules::chat::message_service::begin_stream_message(
+            &db,
+            &key,
+            Some("offline-agent"),
+            Some("Agent"),
+        )
+        .await
+        .unwrap();
+        let app = tauri::test::mock_app();
+        app.manage(db);
+        app.manage(ActiveRequests::default());
+        app.manage(ActiveGroupTurns::default());
+        let (lease, _) =
+            ActiveRequestLease::try_acquire(app.state::<ActiveRequests>().0.clone(), key.clone())
+                .unwrap();
+        let output = Arc::downgrade(&lease.entry.output);
+        let (original, mut original_events) = channel();
+        lease
+            .bind_output(app.handle(), Some(original.clone()))
+            .unwrap();
+
+        // Exhaust the pool before the error entry point's first database access.
+        let connection = pool.acquire().await.unwrap();
+        let partial = "网络断开前已收到的群回复 🦀";
+        let expected = format!("{partial}\n\n> VCP流式错误: connection reset");
+        let error = finalize_stream_error(
+            app.handle(),
+            &pool,
+            &key,
+            partial.into(),
+            "connection reset".into(),
+            Some(original),
+            Some("offline-agent".into()),
+        )
+        .await
+        .expect_err("the first database access must time out");
+        assert!(
+            error.contains("timed out"),
+            "unexpected database failure: {error}"
+        );
+        drop(lease);
+        drop(connection);
+        assert!(
+            output.upgrade().is_some(),
+            "failed error finalization must retain its terminal owner"
+        );
+        assert_eq!(
+            receive_event(&mut original_events, "error").await["content"],
+            expected
+        );
+
+        let (replacement, mut events) = channel();
+        let recovered = recover_active_generation(
+            app.handle().clone(),
+            app.state::<ActiveRequests>(),
+            key.topic.owner_id.clone(),
+            key.topic.owner_type.clone(),
+            key.topic.topic_id.clone(),
+            key.msg_id.clone(),
+            replacement,
+        )
+        .await
+        .unwrap();
+        assert!(matches!(recovered, RecoveryStatus::Completed));
+        let end = receive_event(&mut events, "end").await;
+        assert_eq!(end["content"], expected);
+        assert_eq!(end["finishReason"], "error");
+        assert_eq!(end["context"]["agentId"], "offline-agent");
+        assert_eq!(end["context"]["replayed"], true);
+        let (content, reason, agent_id, name, timestamp, hash): (
+            String,
+            String,
+            String,
+            String,
+            i64,
+            String,
+        ) = sqlx::query_as(
+            "SELECT content, finish_reason, agent_id, name, timestamp, content_hash
+                 FROM messages WHERE msg_id = 'error-message'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(content, expected);
+        assert_eq!(reason, "error");
+        assert_eq!(agent_id, "offline-agent");
+        assert_eq!(
+            hash,
+            crate::vcp_modules::sync_hash::HashAggregator::compute_message_fingerprint(
+                &key.msg_id,
+                "assistant",
+                Some(&name),
+                &content,
+                timestamp as u64,
+                Some(&agent_id),
+                &[],
+            )
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM active_generations WHERE msg_id = 'error-message'",
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+            0
+        );
+        assert!(
+            output.upgrade().is_none(),
+            "committed terminal owner must be released"
+        );
+    }
+
+    #[tokio::test]
+    async fn late_error_does_not_advance_a_settled_or_deleted_message() {
+        for deleted in [false, true] {
+            let (db, key, _directory, _path) = fixture().await;
+            let pool = db.pool.clone();
+            let app = tauri::test::mock_app();
+            app.manage(db);
+            app.manage(ActiveRequests::default());
+            crate::vcp_modules::chat::message_service::finalize_stream_message(
+                app.handle().clone(),
+                &pool,
+                &key,
+                "already completed".into(),
+                false,
+                Some("stop".into()),
+                None,
+                Some("offline-agent".into()),
+            )
+            .await
+            .unwrap();
+            if deleted {
+                sqlx::query("UPDATE messages SET deleted_at = 42")
+                    .execute(&pool)
+                    .await
+                    .unwrap();
+            }
+            let (lease, _) = ActiveRequestLease::try_acquire(
+                app.state::<ActiveRequests>().0.clone(),
+                key.clone(),
+            )
+            .unwrap();
+            let output = Arc::downgrade(&lease.entry.output);
+            let (replacement, mut events) = channel();
+            lease
+                .bind_output(app.handle(), Some(replacement.clone()))
+                .unwrap();
+            let result = finalize_stream_error(
+                app.handle(),
+                &pool,
+                &key,
+                "late partial".into(),
+                "late failure".into(),
+                Some(replacement),
+                Some("offline-agent".into()),
+            )
+            .await
+            .unwrap();
+            assert!(
+                result.is_none(),
+                "late errors must not count as a new group speaker completion"
+            );
+            drop(lease);
+            assert!(output.upgrade().is_none());
+            let row: (String, String, Option<i64>) =
+                sqlx::query_as("SELECT content, finish_reason, deleted_at FROM messages")
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap();
+            assert_eq!(
+                row,
+                (
+                    "already completed".into(),
+                    "stop".into(),
+                    deleted.then_some(42)
+                )
+            );
+            while let Ok(event) = events.try_recv() {
+                assert_ne!(event["type"], "error");
+                if event["type"] == "end" {
+                    assert!(!deleted, "deleted messages must not be replayed");
+                    assert_eq!(event["content"], "already completed");
+                    assert_eq!(event["context"]["replayed"], true);
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn stop_after_repeated_commit_failure_settles_the_received_terminal() {
+        let (db, key, _directory, _path) = fixture().await;
+        let pool = db.pool.clone();
+        let app = tauri::test::mock_app();
+        app.manage(db);
+        app.manage(ActiveRequests::default());
+        app.manage(ActiveGroupTurns::default());
+        let requests = app.state::<ActiveRequests>();
+        let (lease, _) = ActiveRequestLease::try_acquire(requests.0.clone(), key.clone()).unwrap();
+        reject_terminal_commits(&pool).await;
+        assert!(
+            crate::vcp_modules::chat::message_service::finalize_stream_message(
+                app.handle().clone(),
+                &pool,
+                &key,
+                "complete response".into(),
+                false,
+                Some("completed".into()),
+                None,
+                Some("offline-agent".into()),
+            )
+            .await
+            .is_err()
+        );
+        drop(lease);
+        let (replacement, mut events) = channel();
+        *requests.1.lock().unwrap() = Some(ChatOutputConnection {
+            id: "replacement".into(),
+            channel: replacement.clone(),
+        });
+        assert!(recover_active_generation(
+            app.handle().clone(),
+            app.state::<ActiveRequests>(),
+            key.topic.owner_id.clone(),
+            key.topic.owner_type.clone(),
+            key.topic.topic_id.clone(),
+            key.msg_id.clone(),
+            replacement,
+        )
+        .await
+        .is_err());
+        assert_eq!(
+            receive_event(&mut events, "error").await["content"],
+            "complete response"
+        );
+        sqlx::query("DROP TRIGGER reject_terminal_commit")
+            .execute(&pool)
+            .await
+            .unwrap();
+        // This is the same durable intent / scheduling boundary used by the
+        // stop commands when no producer lease remains.
+        sqlx::query("UPDATE active_generations SET stop_requested = 1")
+            .execute(&pool)
+            .await
+            .unwrap();
+        schedule_pending_stop(app.handle(), &requests, key);
+        let end = receive_event(&mut events, "end").await;
+        assert_eq!(end["content"], "complete response");
+        assert_eq!(
+            end["finishReason"], "completed",
+            "stop cannot rewrite a result already received"
+        );
+        let durable: (String, String) =
+            sqlx::query_as("SELECT content, finish_reason FROM messages")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(durable, ("complete response".into(), "completed".into()));
+    }
+
+    #[tokio::test]
+    async fn stop_waits_for_a_producer_that_leaves_a_failed_terminal() {
+        let (db, key, _directory, _path) = fixture().await;
+        let pool = db.pool.clone();
+        let app = tauri::test::mock_app();
+        app.manage(db);
+        app.manage(ActiveRequests::default());
+        let requests = app.state::<ActiveRequests>();
+        let (lease, _) = ActiveRequestLease::try_acquire(requests.0.clone(), key.clone()).unwrap();
+        let (consumer, mut events) = channel();
+        *requests.1.lock().unwrap() = Some(ChatOutputConnection {
+            id: "current".into(),
+            channel: consumer,
+        });
+        reject_terminal_commits(&pool).await;
+        assert!(
+            crate::vcp_modules::chat::message_service::finalize_stream_message(
+                app.handle().clone(),
+                &pool,
+                &key,
+                "received before stop".into(),
+                false,
+                Some("length".into()),
+                None,
+                Some("offline-agent".into()),
+            )
+            .await
+            .is_err()
+        );
+        sqlx::query("UPDATE active_generations SET stop_requested = 1")
+            .execute(&pool)
+            .await
+            .unwrap();
+        schedule_pending_stop(app.handle(), &requests, key);
+        sqlx::query("DROP TRIGGER reject_terminal_commit")
+            .execute(&pool)
+            .await
+            .unwrap();
+        drop(lease);
+        let end = receive_event(&mut events, "end").await;
+        assert_eq!(end["content"], "received before stop");
+        assert_eq!(end["finishReason"], "length");
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM active_generations")
+                .fetch_one(&pool)
+                .await
+                .unwrap(),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn deleting_a_failed_terminal_releases_it_without_replaying_the_body() {
+        for release_producer_first in [false, true] {
+            let (db, key, _directory, _path) = fixture().await;
+            let pool = db.pool.clone();
+            let app = tauri::test::mock_app();
+            app.manage(db);
+            app.manage(ActiveRequests::default());
+            let requests = app.state::<ActiveRequests>();
+            let (lease, _) =
+                ActiveRequestLease::try_acquire(requests.0.clone(), key.clone()).unwrap();
+            let output = Arc::downgrade(&lease.entry.output);
+            let (consumer, mut events) = channel();
+            reject_terminal_commits(&pool).await;
+            assert!(
+                crate::vcp_modules::chat::message_service::finalize_stream_message(
+                    app.handle().clone(),
+                    &pool,
+                    &key,
+                    "discarded answer".into(),
+                    false,
+                    Some("completed".into()),
+                    Some(consumer),
+                    Some("offline-agent".into()),
+                )
+                .await
+                .is_err()
+            );
+            assert_eq!(
+                receive_event(&mut events, "error").await["content"],
+                "discarded answer"
+            );
+            let mut lease = Some(lease);
+            if release_producer_first {
+                drop(lease.take());
+            }
+            let deletion = crate::vcp_modules::chat::message_service::delete_messages(
+                &app.state::<DbState>(),
+                &key.topic,
+                vec![key.msg_id.clone()],
+                None,
+            )
+            .await
+            .unwrap();
+            assert_eq!(deletion.active_ids, vec![key.msg_id.clone()]);
+            discard_deleted_generation(app.handle(), &key).await;
+            drop(lease);
+            assert!(
+                output.upgrade().is_none(),
+                "deleted terminal must have no retained owner"
+            );
+            sqlx::query("DROP TRIGGER reject_terminal_commit")
+                .execute(&pool)
+                .await
+                .unwrap();
+            let (replacement, mut replacement_events) = channel();
+            assert_eq!(
+                recover_active_generation(
+                    app.handle().clone(),
+                    app.state::<ActiveRequests>(),
+                    key.topic.owner_id.clone(),
+                    key.topic.owner_type.clone(),
+                    key.topic.topic_id.clone(),
+                    key.msg_id.clone(),
+                    replacement,
+                )
+                .await
+                .unwrap(),
+                RecoveryStatus::NotFound
+            );
+            while let Ok(event) = replacement_events.try_recv() {
+                assert_ne!(event["type"], "end");
+            }
+            assert!(
+                sqlx::query_scalar::<_, Option<i64>>("SELECT deleted_at FROM messages")
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap()
+                    .is_some()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn preparing_owner_reconnects_without_creating_a_pending_message() {
+        let (db, key, _directory, _path) = fixture().await;
+        sqlx::query("DELETE FROM active_generations")
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        let app = tauri::test::mock_app();
+        app.manage(db);
+        app.manage(ActiveRequests::default());
+        app.manage(ActiveGroupTurns::default());
+        let requests = app.state::<ActiveRequests>();
+        let (lease, _) = ActiveRequestLease::try_acquire(requests.0.clone(), key).unwrap();
+        lease.bind_output(app.handle(), Some(channel().0)).unwrap();
+        let (replacement, mut events) = channel();
+        let receipt = reconnect_chat_output(
+            app.handle().clone(),
+            "preparing-interface".into(),
+            Some(replacement),
+        )
+        .await
+        .unwrap();
+        assert!(receipt.generations.is_empty());
+        assert_eq!(receipt.active_requests.len(), 1);
+        tokio::task::yield_now().await;
+        let active = events.recv().await.unwrap();
+        assert_eq!(active["type"], "request_activity");
+        assert_eq!(active["messageId"], "");
+        assert_eq!(active["chunk"]["active"], true);
+        drop(lease);
+        let inactive = events.recv().await.unwrap();
+        assert_eq!(inactive["type"], "request_activity");
+        assert_eq!(inactive["chunk"]["active"], false);
+        assert_eq!(
+            active["context"]["requestId"],
+            inactive["context"]["requestId"]
+        );
+        assert!(
+            events.try_recv().is_err(),
+            "preparation must not create a chat bubble"
+        );
+    }
+
+    #[test]
+    fn only_a_matching_live_tts_listener_keeps_aurora_delivery_without_a_webview() {
+        let output = RequestOutput::default();
+        let events = Arc::new(std::sync::Mutex::new(Vec::<serde_json::Value>::new()));
+        {
+            let captured = events.clone();
+            let mut state = output.state.lock().unwrap();
+            state.origin_user_message_id = Some("voice-user".into());
+            state.chat_feed = Some(Arc::new(move |event| {
+                captured
+                    .lock()
+                    .unwrap()
+                    .push(serde_json::to_value(event).unwrap())
+            }));
+            state.has_chat_listener = Some(Arc::new(|origin| origin == "voice-user"));
+        }
+        let mut buffer = AuroraBuffer::new();
+        buffer.append_chunk("后台朗读正文。");
+        buffer.process_queue();
+        output.send_aurora(&mut buffer, "reply", &None, None, false);
+        assert_eq!(events.lock().unwrap().len(), 1);
+        assert_eq!(
+            events.lock().unwrap()[0]["context"]["originUserMessageId"],
+            "voice-user"
+        );
+        output.state.lock().unwrap().has_chat_listener = Some(Arc::new(|_| false));
+        buffer.append_chunk("没有朗读消费者时不构建交付。");
+        buffer.process_queue();
+        output.send_aurora(&mut buffer, "reply", &None, None, false);
+        assert_eq!(events.lock().unwrap().len(), 1);
+        assert!(output.state.lock().unwrap().snapshot_pending);
+    }
+
+    #[tokio::test]
+    async fn voice_origin_follows_the_real_output_owner_not_the_fallback_channel() {
+        let app = tauri::test::mock_app();
+        app.manage(ActiveRequests::default());
+        app.manage(ActiveGroupTurns::default());
+        let (connected, mut events) = channel();
+        *app.state::<ActiveRequests>().1.lock().unwrap() = Some(ChatOutputConnection {
+            id: "connected".into(),
+            channel: connected,
+        });
+        let (fallback, mut unused) = channel();
+        let key = MessageKey::new(TopicKey::new("agent", "owner", "topic"), "reply");
+        let (lease, _) =
+            ActiveRequestLease::try_acquire(app.state::<ActiveRequests>().0.clone(), key.clone())
+                .unwrap();
+        lease.set_origin_user_message("voice-user").unwrap();
+        lease
+            .bind_output(app.handle(), Some(fallback.clone()))
+            .unwrap();
+        let activity = events.recv().await.unwrap();
+        assert_eq!(activity["context"]["originUserMessageId"], "voice-user");
+        deliver_request_event(
+            app.handle(),
+            &key,
+            Some(fallback),
+            StreamEvent::thinking(
+                key.msg_id.clone(),
+                Some(
+                    json!({ "ownerId": "owner", "ownerType": "agent", "topicId": "topic", "agentName": "Agent" }),
+                ),
+            ),
+        );
+        let thinking = events.recv().await.unwrap();
+        assert_eq!(thinking["context"]["originUserMessageId"], "voice-user");
+        assert_eq!(thinking["context"]["agentName"], "Agent");
+        assert!(unused.try_recv().is_err());
+        drop(lease);
+        assert_eq!(
+            events.recv().await.unwrap()["context"]["originUserMessageId"],
+            "voice-user"
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_webview_with_the_same_label_cannot_replace_the_current_connection() {
+        let previous_app = tauri::test::mock_app();
+        let previous = tauri::WebviewWindowBuilder::new(
+            &previous_app,
+            "main",
+            tauri::WebviewUrl::App("index.html".into()),
+        )
+        .build()
+        .unwrap();
+        let app = tauri::test::mock_app();
+        let current = tauri::WebviewWindowBuilder::new(
+            &app,
+            "main",
+            tauri::WebviewUrl::App("index.html".into()),
+        )
+        .build()
+        .unwrap();
+        app.manage(ActiveRequests::default());
+        app.manage(ActiveGroupTurns::default());
+        assert!(is_current_webview(app.handle(), current.as_ref()));
+        assert!(!is_current_webview(app.handle(), previous.as_ref()));
+        *app.state::<ActiveRequests>().1.lock().unwrap() = Some(ChatOutputConnection {
+            id: "current-interface".into(),
+            channel: channel().0,
+        });
+        let result = reconnect_chat_output_for_webview(
+            app.handle().clone(),
+            "late-old-interface".into(),
+            Some(channel().0),
+            Some(previous.as_ref().clone()),
+        )
+        .await;
+        assert_eq!(result.err().as_deref(), Some("connection_stale"));
+        assert_eq!(
+            app.state::<ActiveRequests>()
+                .1
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .id,
+            "current-interface"
+        );
+    }
+
+    #[tokio::test]
+    async fn reconnect_returns_while_generation_runs_and_reuses_registered_consumer() {
+        let (db, key, _directory, _path) = fixture().await;
+        let app = tauri::test::mock_app();
+        app.manage(db);
+        app.manage(ActiveRequests::default());
+        app.manage(ActiveGroupTurns::default());
+        let requests = app.state::<ActiveRequests>();
+        let (_lease, token) =
+            ActiveRequestLease::try_acquire(requests.0.clone(), key.clone()).unwrap();
+        let output = request_output(app.handle(), &key, None);
+        let (consumer, mut events) = channel();
+        let receipt = tokio::time::timeout(
+            Duration::from_secs(2),
+            reconnect_chat_output(
+                app.handle().clone(),
+                "interface-a".into(),
+                Some(consumer.clone()),
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(receipt.generations.len(), 1);
+        assert!(!token.is_cancelled());
+        assert!(requests.0.contains_key(&key));
+        let mut buffer = AuroraBuffer::new();
+        buffer.append_chunk("已有正文");
+        buffer.process_queue();
+        output.send_aurora(&mut buffer, &key.msg_id, &None, None, false);
+        let revision = output.state.lock().unwrap().consumer_revision;
+        reconnect_chat_output(app.handle().clone(), "interface-a".into(), None)
+            .await
+            .unwrap();
+        assert_eq!(output.state.lock().unwrap().consumer_revision, revision);
+        buffer.append_chunk("继续");
+        buffer.process_queue();
+        output.send_aurora(&mut buffer, &key.msg_id, &None, None, false);
+        let mut aurora = Vec::new();
+        while let Ok(event) = events.try_recv() {
+            if event["type"] == "aurora" {
+                aurora.push(event);
+            }
+        }
+        assert_eq!(aurora.len(), 2);
+        assert_eq!(aurora[0]["aurora"]["kind"], "snapshot");
+        assert_eq!(aurora[1]["aurora"]["kind"], "delta");
+        assert_eq!(aurora[1]["aurora"]["chunk"], "继续");
+        // Callback numbers are local to an interface. A new connection must
+        // replace the consumer even when that numeric ID is reused.
+        reconnect_chat_output(app.handle().clone(), "interface-b".into(), Some(consumer))
+            .await
+            .unwrap();
+        let replacement_revision = output.state.lock().unwrap().consumer_revision;
+        assert!(replacement_revision > revision);
+        assert_eq!(
+            reconnect_chat_output(app.handle().clone(), "interface-a".into(), None)
+                .await
+                .err()
+                .as_deref(),
+            Some("connection_stale")
+        );
+        assert_eq!(
+            output.state.lock().unwrap().consumer_revision,
+            replacement_revision
+        );
+    }
+
+    #[tokio::test]
+    #[cfg(not(target_os = "android"))]
+    async fn cold_reconnect_settles_persisted_stop_without_error_text() {
+        let (db, key, _directory, _path) = fixture().await;
+        sqlx::query("UPDATE active_generations SET stop_requested = 1, stop_partial_content = ?")
+            .bind("保留已经收到的正文")
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        let app = tauri::test::mock_app();
+        let pool = db.pool.clone();
+        app.manage(db);
+        app.manage(ActiveRequests::default());
+        app.manage(ActiveGroupTurns::default());
+        let (consumer, mut events) = channel();
+        let receipt = reconnect_chat_output(
+            app.handle().clone(),
+            "stop-interface".into(),
+            Some(consumer),
+        )
+        .await
+        .unwrap();
+        assert!(receipt.generations[0].stop_requested);
+        let end = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let event = events.recv().await.unwrap();
+                if event["type"] == "end" {
+                    break event;
+                }
+                assert_eq!(event["type"], "stopping");
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(end["content"], "保留已经收到的正文");
+        assert_eq!(end["finishReason"], "cancelled_by_user");
+        let pending: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM active_generations")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(pending, 0);
+        assert_eq!(end["messageId"], key.msg_id);
+    }
+
+    #[test]
+    fn group_turn_child_cancellation_and_drop_use_the_current_consumer() {
+        let app = tauri::test::mock_app();
+        app.manage(ActiveRequests::default());
+        app.manage(ActiveGroupTurns::default());
+        let turns = app.state::<ActiveGroupTurns>();
+        let requests = app.state::<ActiveRequests>();
+        let key = TopicKey::new("group", "group-a", "topic-a");
+        let turn = turns.try_acquire(key.clone()).unwrap();
+        turn.start_session("continue", true).unwrap();
+        let (original, mut original_events) = channel();
+        turn.bind_output(app.handle(), original).unwrap();
+        assert_eq!(original_events.try_recv().unwrap()["chunk"]["active"], true);
+        let child = turn.child_token();
+        let (replacement, mut events) = channel();
+        turns.attach_output(&requests, &key, replacement).unwrap();
+        let active = events.try_recv().unwrap();
+        turn.cancel();
+        assert!(child.is_cancelled());
+        drop(turn);
+        let inactive = events.try_recv().unwrap();
+        assert_eq!(inactive["chunk"]["active"], false);
+        assert_eq!(inactive["chunk"]["stopReason"], "cancelled_by_user");
+        assert_eq!(active["context"]["turnId"], inactive["context"]["turnId"]);
+        assert!(
+            inactive["consumerRevision"].as_u64().unwrap()
+                > active["consumerRevision"].as_u64().unwrap()
+        );
+        assert!(original_events.try_recv().is_err());
+        assert!(turns
+            .attach_output(&requests, &key, channel().0)
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn jev_lease_drop_preserves_a_decided_stop_or_error_when_cancelled() {
+        let app = tauri::test::mock_app();
+        app.manage(ActiveRequests::default());
+        let turns = ActiveGroupTurns::default();
+        let key = TopicKey::new("group", "group-a", "topic-a");
+        for (reason, error) in [
+            ("error", Some("JEV HTTP 401")),
+            ("end_option_selected", None),
+        ] {
+            let turn = turns.try_acquire(key.clone()).unwrap();
+            let session = turn.start_session("continue", true).unwrap();
+            let (output, mut events) = channel();
+            turn.bind_output(app.handle(), output).unwrap();
+            assert_eq!(events.try_recv().unwrap()["chunk"]["active"], true);
+            if let Some(error) = error {
+                session.fail(error.into());
+            } else {
+                let decision = session.decision_context(0).unwrap().unwrap();
+                assert!(session
+                    .accept_decision(decision.revision, &[], Some(reason.into()))
+                    .unwrap());
+            }
+            turn.cancel();
+            drop(turn);
+            let event = events.try_recv().unwrap();
+            assert_eq!(event["type"], "group_turn");
+            assert_eq!(event["chunk"]["active"], false);
+            assert_eq!(event["chunk"]["phase"], "idle");
+            assert_eq!(event["chunk"]["stopReason"], reason);
+            assert_eq!(event["chunk"]["error"], json!(error));
+            assert!(events.try_recv().is_err());
+        }
+    }
+
     #[tokio::test]
     async fn recovery_capacity_and_partial_snapshot_failures_preserve_pending_content() {
         let (db, key, _directory, path) = fixture().await;
@@ -3198,7 +5061,15 @@ mod offline_completed_tests {
             let output = request_output(app.handle(), &key, Some(old_channel.clone()));
             output.attach(channel.clone()).expect("replacement WebView");
             let reason = failure.to_string();
-            let result = handle_recovery_failure(app.handle(), &key, failure, old_channel).await;
+            let expected_partial = failure.partial_content.clone();
+            let result = handle_recovery_failure(
+                app.handle(),
+                &key,
+                failure,
+                old_channel,
+                Some("offline-agent".into()),
+            )
+            .await;
             assert_eq!(
                 result.expect_err("attachment failure must remain retryable"),
                 reason
@@ -3219,7 +5090,12 @@ mod offline_completed_tests {
                 .expect("complete backup retained"));
             let event = events.try_recv().expect("replacement consumer notified");
             assert_eq!(event["type"], "error");
-            assert!(event["content"].is_null());
+            assert_eq!(event["content"], json!(expected_partial));
+            assert!(events.try_recv().is_err());
+            drop(_lease);
+            let released = events.try_recv().expect("request activity released");
+            assert_eq!(released["type"], "request_activity");
+            assert_eq!(released["chunk"]["active"], false);
             assert!(events.try_recv().is_err());
         }
     }
@@ -3260,18 +5136,25 @@ mod offline_completed_tests {
         let file = open_offline_completed(path.clone())
             .await
             .expect("reread retained file");
+        let (events, mut received) = tokio::sync::mpsc::unbounded_channel();
+        let channel = Channel::new(move |body| {
+            let _ = events.send(body.deserialize::<Value>()?);
+            Ok(())
+        });
         let result = finalize_offline_completed(app.handle(), &key, file, channel)
             .await
             .expect("durable recovery");
-        assert_eq!(result["content"], "第一行 🦀\n{\"正文不是JSON\":true}\n");
-        assert_eq!(result["finishReason"], "stop");
+        assert_eq!(result, RecoveryStatus::Completed);
+        let event = received.try_recv().expect("recovered terminal event");
+        assert_eq!(event["type"], "end");
+        assert_eq!(event["context"]["replayed"], true);
         assert!(!tokio::fs::try_exists(&path).await.expect("file consumed"));
         let durable: (String, Option<String>) =
             sqlx::query_as("SELECT content, finish_reason FROM messages")
                 .fetch_one(&pool)
                 .await
                 .expect("committed message");
-        assert_eq!(durable.0, result["content"].as_str().unwrap());
+        assert_eq!(durable.0, "第一行 🦀\n{\"正文不是JSON\":true}\n");
         assert_eq!(durable.1.as_deref(), Some("stop"));
         let pending: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM active_generations")
             .fetch_one(&pool)
@@ -3301,15 +5184,13 @@ mod offline_completed_tests {
         let result = finalize_offline_completed(app.handle(), &key, file, channel)
             .await
             .expect("discard deleted file");
-        assert_eq!(result["status"], "not_found");
-        assert_eq!(result["content"], "");
+        assert_eq!(result, RecoveryStatus::NotFound);
         assert_eq!(sent.load(std::sync::atomic::Ordering::SeqCst), 0);
         assert!(!tokio::fs::try_exists(&path).await.expect("file consumed"));
         let terminal = terminal_generation_result(&app.state::<DbState>().pool, &key)
             .await
             .expect("late recovery result");
-        assert_eq!(terminal["status"], "not_found");
-        assert_eq!(terminal["content"], "");
+        assert_eq!(terminal, RecoveryStatus::NotFound);
     }
 
     #[tokio::test]
@@ -3427,6 +5308,19 @@ mod active_request_tests {
         assert!(buffer.pending_mutations.is_empty());
     }
 
+    async fn empty_request_body() -> Option<PreparedBody> {
+        Some(
+            request_body::prepare(
+                std::path::PathBuf::from("target/test-fixtures/http-bodies"),
+                json!({}),
+                CancellationToken::new(),
+                request_body::PREPARATION_SLOT.acquire().await.unwrap(),
+            )
+            .await
+            .unwrap(),
+        )
+    }
+
     #[tokio::test]
     #[cfg(not(target_os = "android"))]
     async fn sse_http_eof_flushes_multiline_rounds_without_a_done_marker() {
@@ -3440,8 +5334,8 @@ mod active_request_tests {
             assert!(received > 0, "client closed before sending a request");
             let body = concat!(
                 "data: {\"choices\":[{\"delta\":{\"content\":\"first\"},\n",
-                "data: \"finish_reason\":\"tool_calls\"}]}\n\n",
-                "data: {\"choices\":[{\"delta\":{\"content\":\"tail\"},\"finish_reason\":\"stop\"}]}\n\n",
+                "data: \"finish_reason\":\"stop\"}]}\n\n",
+                "data: {\"choices\":[{\"delta\":{\"content\":\"tail\"},\"finish_reason\":\"tool_calls\"}]}\n\n",
             );
             socket.write_all(format!(
                 "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\n\r\n{body}",
@@ -3452,12 +5346,13 @@ mod active_request_tests {
         let (channel, mut events) = event_channel();
         let output = Arc::new(RequestOutput::default());
         output.bind_initial(Some(channel));
-        let (result, aborted) = handle_streaming_request(
+        let result = handle_streaming_request(
             app.handle(),
             Client::new(),
             &endpoint,
             "",
-            json!({}),
+            empty_request_body().await,
+            0,
             "message".into(),
             "transport".into(),
             None,
@@ -3467,9 +5362,9 @@ mod active_request_tests {
         )
         .await
         .unwrap();
-        assert_eq!(result["fullContent"], "firsttail");
-        assert_eq!(result["finishReason"], "stop");
-        assert!(!aborted);
+        assert_eq!(result.full_content, "firsttail");
+        assert_eq!(result.finish_reason.as_deref(), Some("tool_calls"));
+        assert!(!result.is_aborted);
         let mut delivered = String::new();
         while let Ok(event) = events.try_recv() {
             assert_eq!(event["aurora"]["kind"], "delta");
@@ -3478,6 +5373,48 @@ mod active_request_tests {
             }
         }
         assert_eq!(delivered, "firsttail");
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    #[cfg(not(target_os = "android"))]
+    async fn sse_clean_eof_completes_a_new_round_without_its_own_finish_reason() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0; 4096];
+            assert!(socket.read(&mut request).await.unwrap() > 0);
+            let body = concat!(
+                "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+                "data: {\"choices\":[{\"delta\":{\"content\":\"second round\"}}]}\n\n",
+            );
+            socket.write_all(format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\n\r\n{body}",
+                body.len(),
+            ).as_bytes()).await.unwrap();
+        });
+        let app = tauri::test::mock_app();
+        let result = handle_streaming_request(
+            app.handle(),
+            Client::new(),
+            &endpoint,
+            "",
+            empty_request_body().await,
+            0,
+            "message".into(),
+            "transport".into(),
+            None,
+            CancellationToken::new(),
+            Arc::default(),
+            false,
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.full_content, "second round");
+        assert_eq!(result.finish_reason.as_deref(), Some("completed"));
+        assert!(!result.is_aborted);
         server.await.unwrap();
     }
 
@@ -3510,7 +5447,8 @@ mod active_request_tests {
             Client::new(),
             &endpoint,
             "",
-            json!({}),
+            empty_request_body().await,
+            0,
             "message".into(),
             "transport".into(),
             None,
@@ -3563,7 +5501,8 @@ mod active_request_tests {
                 Client::new(),
                 &endpoint,
                 "",
-                json!({}),
+                empty_request_body().await,
+                0,
                 "message".to_string(),
                 "transport".to_string(),
                 None,
@@ -3591,13 +5530,13 @@ mod active_request_tests {
         );
         assert!(old_events.try_recv().is_err());
         cancellation.cancel();
-        let (result, aborted) = tokio::time::timeout(Duration::from_secs(1), request)
+        let result = tokio::time::timeout(Duration::from_secs(1), request)
             .await
             .unwrap()
             .unwrap()
             .unwrap();
-        assert!(aborted);
-        assert_eq!(result["fullContent"], "<think>first");
+        assert!(result.is_aborted);
+        assert_eq!(result.full_content, "<think>first");
         release_server.cancel();
         server.await.unwrap();
     }
@@ -3624,6 +5563,9 @@ mod active_request_tests {
         assert_eq!(original_events.recv().await.unwrap()["messageId"], "first");
         let (replacement, mut replacement_events) = event_channel();
         turns.attach_output(&requests, &topic, replacement).unwrap();
+        let turn_activity = replacement_events.recv().await.unwrap();
+        assert_eq!(turn_activity["type"], "group_turn");
+        assert_eq!(turn_activity["chunk"]["active"], true);
         deliver_request_event(
             app.handle(),
             &first_key,
@@ -3643,11 +5585,17 @@ mod active_request_tests {
         let released = first_lease.entry.released.clone();
         drop(first_lease);
         assert!(released.is_cancelled());
+        let released_activity = replacement_events.recv().await.unwrap();
+        assert_eq!(released_activity["type"], "request_activity");
+        assert_eq!(released_activity["chunk"]["active"], false);
 
         let (gap_replacement, mut gap_events) = event_channel();
         turns
             .attach_output(&requests, &topic, gap_replacement)
             .unwrap();
+        let gap_activity = gap_events.recv().await.unwrap();
+        assert_eq!(gap_activity["type"], "group_turn");
+        assert_eq!(gap_activity["chunk"]["active"], true);
         let second_key = MessageKey::new(topic, "second");
         let (_second_lease, _) =
             ActiveRequestLease::try_acquire(requests.0.clone(), second_key.clone()).unwrap();
@@ -3660,6 +5608,182 @@ mod active_request_tests {
         assert_eq!(gap_events.recv().await.unwrap()["messageId"], "second");
         assert!(original_events.try_recv().is_err());
         assert!(replacement_events.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn non_streaming_http_preserves_text_and_finish_metadata() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            for reason in [Some("stop"), Some("length"), None] {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = [0; 4096];
+                assert!(socket.read(&mut request).await.unwrap() > 0);
+                let body = json!({
+                    "choices": [{ "message": { "content": "正文 🦀\n\"quote\"\\tail" }, "finish_reason": reason }],
+                    "usage": { "completion_tokens": 7 },
+                }).to_string();
+                socket.write_all(format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len(),
+                ).as_bytes()).await.unwrap();
+            }
+        });
+        for reason in [Some("completed"), Some("length"), None] {
+            let (channel, mut events) = event_channel();
+            let output = Arc::new(RequestOutput::default());
+            output.bind_initial(Some(channel));
+            let response = handle_non_streaming_request(
+                Client::new(),
+                &endpoint,
+                "",
+                empty_request_body().await.unwrap(),
+                "message".into(),
+                Some(json!({ "topicId": "topic" })),
+                CancellationToken::new(),
+                output,
+            )
+            .await
+            .unwrap();
+            assert_eq!(response.full_content, "正文 🦀\n\"quote\"\\tail");
+            assert_eq!(response.finish_reason.as_deref(), reason);
+            assert!(!response.is_aborted);
+            let event = events.recv().await.unwrap();
+            assert_eq!(event["aurora"]["content"], response.full_content);
+            assert_eq!(event["context"]["topicId"], "topic");
+            assert!(
+                events.try_recv().is_err(),
+                "the application finalizer owns the terminal event"
+            );
+        }
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn non_streaming_upload_preserves_prepared_utf8_json_bytes() {
+        use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
+        let value = json!({"messages": [{"role": "user", "content": "中文\n\"😀".repeat(4096)}]});
+        let expected = serde_json::to_vec(&value).unwrap();
+        let body = request_body::prepare(
+            std::path::PathBuf::from("target/test-fixtures/http-bodies"),
+            value,
+            CancellationToken::new(),
+            request_body::PREPARATION_SLOT.acquire().await.unwrap(),
+        )
+        .await
+        .unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let mut reader = tokio::io::BufReader::new(socket);
+            let mut length = None;
+            loop {
+                let mut line = String::new();
+                assert!(reader.read_line(&mut line).await.unwrap() > 0);
+                if line == "\r\n" {
+                    break;
+                }
+                if let Some((name, value)) = line.split_once(':') {
+                    if name.eq_ignore_ascii_case("content-length") {
+                        length = Some(value.trim().parse::<usize>().unwrap());
+                    }
+                }
+            }
+            assert_eq!(length, Some(expected.len()));
+            let mut received = vec![0; expected.len()];
+            reader.read_exact(&mut received).await.unwrap();
+            assert_eq!(received, expected);
+            let response = r#"{"choices":[{"message":{"content":"ok"},"finish_reason":"stop"}]}"#;
+            reader.get_mut().write_all(format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response}",
+                response.len(),
+            ).as_bytes()).await.unwrap();
+        });
+        let response = handle_non_streaming_request(
+            Client::new(),
+            &endpoint,
+            "",
+            body,
+            "message".into(),
+            None,
+            CancellationToken::new(),
+            Arc::default(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.full_content, "ok");
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn prepared_upload_replays_the_same_body_after_307_and_308() {
+        use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
+        for status in [307, 308] {
+            let value = json!({"messages": [{"role": "user", "content": "正文\n😀".repeat(2048)}]});
+            let expected = serde_json::to_vec(&value).unwrap();
+            let body = request_body::prepare(
+                std::path::PathBuf::from("target/test-fixtures/http-bodies"),
+                value,
+                CancellationToken::new(),
+                request_body::PREPARATION_SLOT.acquire().await.unwrap(),
+            )
+            .await
+            .unwrap();
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let endpoint = format!("http://{}", listener.local_addr().unwrap());
+            let server = tokio::spawn(async move {
+                for redirect in [true, false] {
+                    let (socket, _) = listener.accept().await.unwrap();
+                    let mut reader = tokio::io::BufReader::new(socket);
+                    let mut length = None;
+                    loop {
+                        let mut line = String::new();
+                        assert!(reader.read_line(&mut line).await.unwrap() > 0);
+                        if line == "\r\n" {
+                            break;
+                        }
+                        if let Some((name, value)) = line.split_once(':') {
+                            if name.eq_ignore_ascii_case("content-length") {
+                                length = Some(value.trim().parse::<usize>().unwrap());
+                            }
+                        }
+                    }
+                    assert_eq!(length, Some(expected.len()));
+                    let mut received = vec![0; expected.len()];
+                    reader.read_exact(&mut received).await.unwrap();
+                    assert_eq!(received, expected);
+                    let reply = if redirect {
+                        format!("HTTP/1.1 {status} Redirect\r\nLocation: /destination\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                    } else {
+                        let content =
+                            r#"{"choices":[{"message":{"content":"ok"},"finish_reason":"stop"}]}"#;
+                        format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{content}", content.len())
+                    };
+                    reader.get_mut().write_all(reply.as_bytes()).await.unwrap();
+                }
+            });
+            let result = tokio::time::timeout(
+                Duration::from_secs(5),
+                handle_non_streaming_request(
+                    Client::new(),
+                    &endpoint,
+                    "",
+                    body,
+                    "message".into(),
+                    None,
+                    CancellationToken::new(),
+                    Arc::default(),
+                ),
+            )
+            .await;
+            if !matches!(&result, Ok(Ok(_))) {
+                server.abort();
+            }
+            assert_eq!(result.unwrap().unwrap().full_content, "ok", "HTTP {status}");
+            server.await.unwrap();
+        }
     }
 
     #[tokio::test]
@@ -3686,7 +5810,7 @@ mod active_request_tests {
                 Client::new(),
                 &endpoint,
                 "",
-                json!({}),
+                empty_request_body().await.unwrap(),
                 "message".into(),
                 None,
                 request_cancel,
@@ -3700,234 +5824,19 @@ mod active_request_tests {
             .unwrap();
         tokio::time::sleep(Duration::from_millis(20)).await;
         cancellation.cancel();
-        let (result, aborted) = tokio::time::timeout(Duration::from_secs(1), request)
+        let result = tokio::time::timeout(Duration::from_secs(1), request)
             .await
             .unwrap()
             .unwrap()
             .unwrap();
-        assert!(aborted);
-        assert_eq!(result["finishReason"], "cancelled_by_user");
+        assert!(result.is_aborted);
+        assert_eq!(result.finish_reason.as_deref(), Some("cancelled_by_user"));
         release_server.cancel();
         server.await.unwrap();
     }
 
     fn message_key(message_id: &str) -> MessageKey {
         MessageKey::new(TopicKey::new("agent", "agent-a", "topic-a"), message_id)
-    }
-
-    #[test]
-    fn endpoint_modes_cover_base_full_prefix_port_and_query_urls() {
-        let cases = [
-            (
-                "https://example.invalid",
-                "https://example.invalid/v1/chat/completions",
-                "https://example.invalid/v1/chatvcp/completions",
-            ),
-            (
-                "https://example.invalid/v1/chat/completions",
-                "https://example.invalid/v1/chat/completions",
-                "https://example.invalid/v1/chatvcp/completions",
-            ),
-            (
-                "http://example.invalid:6005/proxy?tenant=mobile",
-                "http://example.invalid:6005/proxy/v1/chat/completions?tenant=mobile",
-                "http://example.invalid:6005/proxy/v1/chatvcp/completions?tenant=mobile",
-            ),
-            (
-                "https://example.invalid:443/proxy",
-                "https://example.invalid:443/proxy/v1/chat/completions",
-                "https://example.invalid:443/proxy/v1/chatvcp/completions",
-            ),
-            (
-                "https://example.invalid/proxy%20space?tenant=mobile",
-                "https://example.invalid/proxy%20space/v1/chat/completions?tenant=mobile",
-                "https://example.invalid/proxy%20space/v1/chatvcp/completions?tenant=mobile",
-            ),
-            (
-                "https://example.invalid/proxy/v1",
-                "https://example.invalid/proxy/v1/chat/completions",
-                "https://example.invalid/proxy/v1/chatvcp/completions",
-            ),
-            (
-                "https://example.invalid/proxy/v1/chatvcp/completions/?key=value",
-                "https://example.invalid/proxy/v1/chat/completions?key=value",
-                "https://example.invalid/proxy/v1/chatvcp/completions?key=value",
-            ),
-        ];
-
-        for (raw, standard, vcp_tools) in cases {
-            assert_eq!(
-                resolve_chat_endpoint(
-                    raw,
-                    ChatEndpointMode::Standard,
-                    ChatRequestPurpose::Interactive,
-                )
-                .expect("standard endpoint"),
-                standard
-            );
-            assert_eq!(
-                resolve_chat_endpoint(
-                    raw,
-                    ChatEndpointMode::VcpTools,
-                    ChatRequestPurpose::Interactive,
-                )
-                .expect("VCP tools endpoint"),
-                vcp_tools
-            );
-            assert_eq!(
-                resolve_chat_endpoint(raw, ChatEndpointMode::Raw, ChatRequestPurpose::Interactive,)
-                    .expect("raw endpoint"),
-                raw
-            );
-        }
-    }
-
-    #[test]
-    fn request_purpose_matrix_matches_vchat_semantics() {
-        let raw = "https://example.invalid/proxy";
-        let cases = [
-            (
-                ChatEndpointMode::Standard,
-                ChatRequestPurpose::Interactive,
-                "https://example.invalid/proxy/v1/chat/completions",
-            ),
-            (
-                ChatEndpointMode::Standard,
-                ChatRequestPurpose::Auxiliary,
-                "https://example.invalid/proxy/v1/chat/completions",
-            ),
-            (
-                ChatEndpointMode::VcpTools,
-                ChatRequestPurpose::Interactive,
-                "https://example.invalid/proxy/v1/chatvcp/completions",
-            ),
-            (
-                ChatEndpointMode::VcpTools,
-                ChatRequestPurpose::Auxiliary,
-                "https://example.invalid/proxy/v1/chat/completions",
-            ),
-            (ChatEndpointMode::Raw, ChatRequestPurpose::Interactive, raw),
-            (ChatEndpointMode::Raw, ChatRequestPurpose::Auxiliary, raw),
-        ];
-
-        for (mode, purpose, expected) in cases {
-            assert_eq!(
-                resolve_chat_endpoint(raw, mode, purpose).expect("purpose endpoint"),
-                expected
-            );
-        }
-    }
-
-    #[test]
-    fn raw_mode_is_byte_for_byte_unchanged() {
-        let raw = "HTTP://Example.INVALID:8443/custom/%2f?signature=a%2Fb&x=1";
-        assert_eq!(
-            resolve_chat_endpoint(raw, ChatEndpointMode::Raw, ChatRequestPurpose::Interactive,)
-                .expect("raw endpoint"),
-            raw
-        );
-    }
-
-    #[test]
-    fn model_discovery_is_prefix_aware_and_conservative_in_raw_mode() {
-        assert_eq!(
-            resolve_model_discovery_endpoint(
-                "https://example.invalid/proxy?tenant=mobile",
-                ChatEndpointMode::VcpTools,
-            )
-            .expect("derived discovery"),
-            Some("https://example.invalid/proxy/v1/models?tenant=mobile".to_string())
-        );
-        assert_eq!(
-            resolve_model_discovery_endpoint(
-                "https://example.invalid/proxy/v1/chat/completions?tenant=mobile",
-                ChatEndpointMode::Raw,
-            )
-            .expect("safe raw discovery"),
-            Some("https://example.invalid/proxy/v1/models?tenant=mobile".to_string())
-        );
-        assert_eq!(
-            resolve_model_discovery_endpoint(
-                "https://example.invalid/custom/gateway",
-                ChatEndpointMode::Raw,
-            )
-            .expect("unsafe raw discovery"),
-            None
-        );
-    }
-
-    #[test]
-    fn endpoint_validation_rejects_unsafe_or_non_http_urls() {
-        for raw in [
-            "ftp://example.invalid/v1/chat/completions",
-            "https://user:secret@example.invalid/v1/chat/completions",
-            "https://example.invalid/v1/chat/completions#fragment",
-            "https://example.invalid/v1/chat/completions\n",
-            "https://",
-        ] {
-            assert!(
-                resolve_chat_endpoint(raw, ChatEndpointMode::Raw, ChatRequestPurpose::Interactive,)
-                    .is_err(),
-                "unexpectedly accepted {raw}"
-            );
-        }
-    }
-
-    #[test]
-    fn stream_error_content_appends_one_terminal_suffix() {
-        let final_content = stream_error_content("partial", "network failed");
-        assert_eq!(final_content, "partial\n\n> VCP流式错误: network failed");
-        assert_eq!(
-            stream_error_content(&final_content, "network failed"),
-            final_content
-        );
-        assert_eq!(
-            stream_error_content("", "network failed"),
-            "\n\n> VCP流式错误: network failed"
-        );
-    }
-
-    #[test]
-    fn durable_end_serializes_the_committed_content() {
-        let event = StreamEvent::end(
-            "message-4".to_string(),
-            None,
-            Some("error".to_string()),
-            Some("committed".to_string()),
-            Some(Vec::new()),
-            Some(123),
-            Some(456),
-        );
-        let wire = serde_json::to_value(event).expect("serialize durable end");
-        assert_eq!(wire["type"], "end");
-        assert_eq!(wire["content"], "committed");
-        assert_eq!(wire["finishReason"], "error");
-        assert_eq!(wire["timestamp"], 123);
-        assert_eq!(wire["topicUpdatedAt"], 456);
-    }
-
-    #[test]
-    fn local_attachment_metadata_is_internal_and_labels_never_reveal_parent_paths() {
-        let mut message = json!({
-            "role": "user",
-            "content": "hello",
-            "__vcpLocalAttachments": [{
-                "sha256": "a".repeat(64),
-                "hostPath": "/data/user/0/private/secret.png"
-            }]
-        });
-        remove_internal_local_attachment_metadata(&mut message);
-        let wire = serde_json::to_string(&message).expect("serialize model message");
-        assert!(!wire.contains("__vcpLocalAttachments"));
-        assert!(!wire.contains("/data/user/0/private"));
-        assert_eq!(
-            bounded_attachment_label("/data/user/0/private/\nphoto.png"),
-            "photo.png"
-        );
-        assert_eq!(
-            short_hash(&format!("{}not-a-hash", "a".repeat(64))),
-            "a".repeat(12)
-        );
     }
 
     #[tokio::test]
@@ -3950,6 +5859,115 @@ mod active_request_tests {
 
         drop(lease);
         assert!(!requests.0.contains_key(&key));
+    }
+
+    #[tokio::test]
+    async fn cancelled_voice_admission_cannot_start_http_after_late_registration() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let app = tauri::test::mock_app();
+        app.manage(ActiveRequests::default());
+        let requests = app.state::<ActiveRequests>();
+        let key = message_key("late-voice-reply");
+        let cancellation = CancellationToken::new();
+        cancellation.cancel();
+        let (lease, token) = ActiveRequestLease::try_acquire_with_cancellation(
+            requests.0.clone(),
+            key.clone(),
+            cancellation,
+        )
+        .unwrap();
+        lease.set_origin_user_message("voice-origin").unwrap();
+        lease.bind_output(app.handle(), None).unwrap();
+        {
+            let output = lease.entry.output.state.lock().unwrap();
+            assert!(output.channel.is_none());
+            assert!(
+                output.chat_feed.is_some(),
+                "Rust feed binds without a WebView"
+            );
+        }
+        let result = perform_vcp_request_registered(
+            app.handle(),
+            VcpRequestPayload {
+                vcp_url: endpoint,
+                vcp_api_key: String::new(),
+                messages: vec![json!({"role": "user", "content": "voice"})],
+                model_config: json!({"stream": true}),
+                message_id: key.msg_id.clone(),
+                context: Some(json!({
+                    "ownerType": key.topic.owner_type,
+                    "ownerId": key.topic.owner_id,
+                    "topicId": key.topic.topic_id,
+                })),
+                transport_request_id: None,
+            },
+            None,
+            token,
+        )
+        .await
+        .unwrap();
+        assert!(result.is_aborted);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(30), listener.accept())
+                .await
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn voice_group_without_webview_keeps_the_feed_and_group_cancellation() {
+        let app = tauri::test::mock_app();
+        app.manage(ActiveRequests::default());
+        app.manage(ActiveGroupTurns::default());
+        let turns = app.state::<ActiveGroupTurns>();
+        let topic = TopicKey::new("group", "voice-group", "voice-topic");
+        let turn = turns.try_acquire(topic.clone()).unwrap();
+        turn.set_origin_user_message("voice-origin").unwrap();
+        turn.bind_optional_output(app.handle(), None).unwrap();
+        let events = Arc::new(std::sync::Mutex::new(Vec::<StreamEvent>::new()));
+        {
+            let entry = turns.active.get(&topic).unwrap();
+            assert!(entry.channel.lock().unwrap().is_none());
+            assert!(entry.chat_feed.lock().unwrap().is_some());
+            let captured = events.clone();
+            *entry.chat_feed.lock().unwrap() = Some(Arc::new(move |event| {
+                captured.lock().unwrap().push(event.clone());
+            }));
+        }
+        let speaker = turn.child_token();
+        turn.cancel();
+        assert!(turn.is_cancelled());
+        assert!(speaker.is_cancelled());
+        drop(turn);
+        let events = events.lock().unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].r#type, "group_turn");
+        assert_eq!(events[0].chunk.as_ref().unwrap()["active"], false);
+        assert_eq!(
+            events[0].context.as_ref().unwrap()["originUserMessageId"],
+            "voice-origin"
+        );
+        let later = turns.try_acquire(topic).unwrap();
+        assert!(
+            !later.is_cancelled(),
+            "a later unrelated group turn owns another token"
+        );
+    }
+
+    #[tokio::test]
+    async fn group_release_reaches_all_waiters_even_before_their_first_poll() {
+        let turns = ActiveGroupTurns::default();
+        let topic = TopicKey::new("group", "group", "topic");
+        let turn = turns.try_acquire(topic.clone()).unwrap();
+        let first = turns.try_acquire_or_wait(topic.clone()).err().unwrap();
+        let second = turns.try_acquire_or_wait(topic.clone()).err().unwrap();
+        let mut first = Box::pin(first);
+        let mut second = Box::pin(second);
+        drop(turn);
+        assert!(futures_util::poll!(&mut first).is_ready());
+        assert!(futures_util::poll!(&mut second).is_ready());
+        assert!(turns.try_acquire(topic).is_ok());
     }
 
     #[test]
@@ -3980,44 +5998,5 @@ mod active_request_tests {
                 .attempt_id,
             new_attempt_id
         );
-    }
-
-    #[test]
-    fn helper_control_ack_requires_acceptance_and_exact_identity() {
-        let valid = json!({
-            "action": "ack_committed_ack",
-            "requestId": "message-3",
-            "generation": "generation-17",
-            "accepted": true,
-        });
-        assert!(
-            validate_helper_control_ack(&valid, "ack_committed", "message-3", "generation-17")
-                .is_ok()
-        );
-        assert!(
-            validate_helper_control_ack(&valid, "discard", "message-3", "generation-17").is_err()
-        );
-        assert!(
-            validate_helper_control_ack(&valid, "ack_committed", "message-4", "generation-17")
-                .is_err()
-        );
-        assert!(
-            validate_helper_control_ack(&valid, "ack_committed", "message-3", "generation-18")
-                .is_err()
-        );
-
-        let rejected = json!({
-            "action": "ack_committed_ack",
-            "requestId": "message-3",
-            "generation": "generation-17",
-            "accepted": false,
-        });
-        assert!(validate_helper_control_ack(
-            &rejected,
-            "ack_committed",
-            "message-3",
-            "generation-17"
-        )
-        .is_err());
     }
 }

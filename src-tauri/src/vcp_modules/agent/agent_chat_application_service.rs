@@ -1,18 +1,22 @@
 use crate::vcp_modules::agent_service::{read_agent_config_internal, AgentConfigState};
+use crate::vcp_modules::chat::voice_service::VoiceReplyPolicy;
 use crate::vcp_modules::chat_manager::ChatMessage;
 use crate::vcp_modules::db_manager::DbState;
+use crate::vcp_modules::infra::vcp_http_endpoint::ChatRequestPurpose;
+use crate::vcp_modules::infra::vcp_ws_activity::ChatActivityGuard;
 use crate::vcp_modules::message_service;
-use crate::vcp_modules::settings_manager::{read_settings, SettingsState};
+use crate::vcp_modules::settings_manager::{read_config, SettingsState};
 use crate::vcp_modules::topic_types::{MessageKey, TopicKey};
 use crate::vcp_modules::vcp_client::{
-    freeze_chat_connection, message_transport_request_id, perform_vcp_request,
-    perform_vcp_request_registered, ActiveRequestLease, ActiveRequests, ChatConnectionSnapshot,
-    ChatRequestPurpose, StreamEvent, VcpRequestPayload,
+    freeze_chat_connection, message_transport_request_id, perform_vcp_request_registered,
+    ActiveRequestLease, ActiveRequests, ChatConnectionSnapshot, StreamEvent, VcpRequestPayload,
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
+use std::sync::Arc;
 use tauri::{ipc::Channel, AppHandle, State};
 use tauri_plugin_vcp_mobile::stream::{ForegroundLease, ForegroundTask};
+use tokio_util::sync::CancellationToken;
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -20,6 +24,46 @@ pub struct AgentChatPayload {
     pub agent_id: String,
     pub topic_id: String,
     pub user_message: ChatMessage,
+}
+
+/// Register the real request before preparation awaits, without creating a
+/// pending database message until configuration and context are ready.
+pub(crate) struct PreparedAgentRequest {
+    key: MessageKey,
+    _lease: ActiveRequestLease,
+    _activity: ChatActivityGuard,
+    cancellation_token: CancellationToken,
+}
+
+impl PreparedAgentRequest {
+    pub(crate) fn acquire(
+        app: &AppHandle<impl tauri::Runtime>,
+        requests: &ActiveRequests,
+        agent_id: &str,
+        topic_id: &str,
+        origin_user_message_id: &str,
+        channel: Option<Channel<StreamEvent>>,
+        cancellation_token: CancellationToken,
+    ) -> Result<Self, String> {
+        let key = MessageKey::new(
+            TopicKey::new("agent", agent_id, topic_id),
+            format!("msg_{}", uuid::Uuid::new_v4()),
+        );
+        let (lease, cancellation_token) = ActiveRequestLease::try_acquire_with_cancellation(
+            requests.0.clone(),
+            key.clone(),
+            cancellation_token,
+        )?;
+        let activity = ChatActivityGuard::acquire(app);
+        lease.set_origin_user_message(origin_user_message_id)?;
+        lease.bind_output(app, channel)?;
+        Ok(Self {
+            key,
+            _lease: lease,
+            _activity: activity,
+            cancellation_token,
+        })
+    }
 }
 
 #[tauri::command]
@@ -32,17 +76,27 @@ pub async fn handle_agent_chat_message(
     payload: AgentChatPayload,
     stream_channel: Channel<crate::vcp_modules::vcp_client::StreamEvent>,
 ) -> Result<Value, String> {
-    let settings = read_settings(app_handle.clone(), settings_state).await?;
+    let request = PreparedAgentRequest::acquire(
+        &app_handle,
+        &active_requests,
+        &payload.agent_id,
+        &payload.topic_id,
+        &payload.user_message.id,
+        Some(stream_channel.clone()),
+        CancellationToken::new(),
+    )?;
+    let settings = read_config(app_handle.clone(), settings_state).await?;
     let connection = freeze_chat_connection(&settings, ChatRequestPurpose::Interactive)?;
-    internal_process_agent_chat_message(
+    process_prepared_agent_chat_message(
         app_handle,
         agent_state,
         db_state,
-        active_requests,
+        request,
         payload,
         connection,
-        stream_channel,
+        Some(stream_channel),
         false, // append_user_msg
+        None,
     )
     .await
 }
@@ -58,12 +112,53 @@ pub async fn internal_process_agent_chat_message(
     stream_channel: Channel<crate::vcp_modules::vcp_client::StreamEvent>,
     append_user_msg: bool,
 ) -> Result<Value, String> {
+    let request = PreparedAgentRequest::acquire(
+        &app_handle,
+        &active_requests,
+        &payload.agent_id,
+        &payload.topic_id,
+        &payload.user_message.id,
+        Some(stream_channel.clone()),
+        CancellationToken::new(),
+    )?;
+    process_prepared_agent_chat_message(
+        app_handle,
+        agent_state,
+        db_state,
+        request,
+        payload,
+        connection,
+        Some(stream_channel),
+        append_user_msg,
+        None,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn process_prepared_agent_chat_message(
+    app_handle: AppHandle<impl tauri::Runtime>,
+    agent_state: State<'_, AgentConfigState>,
+    db_state: State<'_, DbState>,
+    request: PreparedAgentRequest,
+    payload: AgentChatPayload,
+    connection: ChatConnectionSnapshot,
+    stream_channel: Option<Channel<StreamEvent>>,
+    append_user_msg: bool,
+    reply_policy: Option<Arc<VoiceReplyPolicy>>,
+) -> Result<Value, String> {
     let agent_id = payload.agent_id;
     let topic_id = payload.topic_id;
     let topic_key = TopicKey::new("agent", &agent_id, &topic_id);
     let user_message = payload.user_message;
 
-    let thinking_id = format!("msg_{}", uuid::Uuid::new_v4());
+    let request_key = request.key;
+    let cancellation_token = request.cancellation_token;
+    let thinking_id = request_key.msg_id.clone();
+
+    if cancellation_token.is_cancelled() {
+        return Ok(json!({ "status": "cancelled", "messageId": thinking_id }));
+    }
 
     // 1. 读取 Agent 配置
     let agent_config =
@@ -71,6 +166,9 @@ pub async fn internal_process_agent_chat_message(
 
     // 2. 只有在需要时才将用户消息追加到数据库 (重新生成时设为 false)
     if append_user_msg {
+        if cancellation_token.is_cancelled() {
+            return Ok(json!({ "status": "cancelled", "messageId": thinking_id }));
+        }
         message_service::append_single_message(
             app_handle.clone(),
             &db_state.pool,
@@ -100,13 +198,13 @@ pub async fn internal_process_agent_chat_message(
     };
 
     let messages = crate::vcp_modules::context_assembler::orchestrate_chat_context(
-        &db_state.pool,
+        &db_state,
         &history,
         &topic_key,
         &agent_config.name,
-        "agent",
         effective_prompt,
         None,
+        reply_policy.as_deref(),
     )
     .await?;
 
@@ -129,9 +227,9 @@ pub async fn internal_process_agent_chat_message(
         "agentName": agent_config.name
     }));
 
-    let request_key = MessageKey::new(topic_key.clone(), thinking_id.clone());
-    let (_request_lease, cancellation_token) =
-        ActiveRequestLease::try_acquire(active_requests.0.clone(), request_key.clone())?;
+    if cancellation_token.is_cancelled() {
+        return Ok(json!({ "status": "cancelled", "messageId": thinking_id }));
+    }
     message_service::begin_stream_message(
         &db_state,
         &request_key,
@@ -142,14 +240,14 @@ pub async fn internal_process_agent_chat_message(
 
     // A separate lease per operation also releases on cancellation of this future.
     // Acquisition reports native failure through the shared notification channel.
-    let foreground_lease =
+    let _foreground_lease =
         ForegroundLease::acquire(&app_handle, ForegroundTask::Stream, &agent_config.name).ok();
 
     // 在发起 VCP 请求前，向前端发射 thinking 事件以初始化气泡
     crate::vcp_modules::vcp_client::deliver_request_event(
         &app_handle,
         &request_key,
-        Some(stream_channel.clone()),
+        stream_channel.clone(),
         StreamEvent::thinking(thinking_id.clone(), context.clone()),
     );
 
@@ -164,40 +262,47 @@ pub async fn internal_process_agent_chat_message(
     };
 
     // 8. 发起请求
+    #[cfg(target_os = "ios")]
+    let ios_reply = agent_config.stream_output.then(|| {
+        crate::vcp_modules::chat::ios_reply_task::ReplyTask::begin(&app_handle, &agent_config.name)
+    });
     let result = perform_vcp_request_registered(
         &app_handle,
         request_payload,
-        Some(stream_channel.clone()),
+        stream_channel.clone(),
         cancellation_token,
     )
     .await;
 
-    // 9. 停止前台服务
-    if let Some(lease) = foreground_lease {
-        let _ = lease.release();
-    }
-
+    // Keep the native lease through the durable finalizer (including errors).
     // 8. 流式结束后（含中断），将最终内容委派统一的 Finalizer 进行存盘与事件分发
     match result {
-        Ok((res, is_aborted)) => {
-            if let Some(full_content) = res["fullContent"].as_str() {
-                let finish_reason = if is_aborted {
-                    Some("cancelled_by_user".to_string())
-                } else {
-                    res["finishReason"].as_str().map(|s| s.to_string())
-                };
-
-                message_service::finalize_stream_message(
-                    app_handle.clone(),
-                    &db_state.pool,
-                    &request_key,
-                    full_content.to_string(),
-                    is_aborted,
-                    finish_reason,
-                    Some(stream_channel),
-                    Some(agent_id.clone()),
-                )
-                .await?;
+        Ok(response) => {
+            let committed = message_service::finalize_stream_message(
+                app_handle.clone(),
+                &db_state.pool,
+                &request_key,
+                response.full_content,
+                response.is_aborted,
+                response.finish_reason,
+                stream_channel,
+                Some(agent_id.clone()),
+            )
+            .await;
+            if committed.is_err() {
+                return Ok(json!({ "status": "recovery_pending", "messageId": thinking_id }));
+            }
+            #[cfg(target_os = "ios")]
+            if let Some(task) = ios_reply {
+                task.finish(committed.is_ok_and(|saved| {
+                    saved.is_some_and(|message| {
+                        message.newly_committed
+                            && !matches!(
+                                message.finish_reason.as_str(),
+                                "error" | "cancelled_by_user"
+                            )
+                    })
+                }));
             }
         }
         Err(failure) => {
@@ -205,8 +310,24 @@ pub async fn internal_process_agent_chat_message(
                 "[AgentChatAppService] perform_vcp_request failed: {}",
                 failure
             );
+            let stop_pending = failure.is_stop_pending();
             let recovery_pending = failure.is_recovery_pending();
             let (error, partial_content) = failure.into_parts();
+            if stop_pending {
+                crate::vcp_modules::vcp_client::deliver_request_event(
+                    &app_handle,
+                    &request_key,
+                    stream_channel,
+                    StreamEvent {
+                        r#type: "stopping".to_string(),
+                        message_id: thinking_id.clone(),
+                        context,
+                        content: partial_content,
+                        ..Default::default()
+                    },
+                );
+                return Ok(json!({ "status": "stopping", "messageId": thinking_id }));
+            }
             if recovery_pending {
                 let notice = format!("后台生成连接中断，稍后返回前台可继续接管：{error}");
                 let mut event = StreamEvent::error(thinking_id.clone(), context, notice.clone());
@@ -214,173 +335,26 @@ pub async fn internal_process_agent_chat_message(
                 crate::vcp_modules::vcp_client::deliver_request_event(
                     &app_handle,
                     &request_key,
-                    Some(stream_channel),
+                    stream_channel,
                     event,
                 );
-                return Err(notice);
+                return Ok(json!({ "status": "recovery_pending", "messageId": thinking_id }));
             }
-            let _ = crate::vcp_modules::vcp_client::finalize_stream_error(
+            if crate::vcp_modules::vcp_client::finalize_stream_error(
                 &app_handle,
                 &db_state.pool,
                 &request_key,
                 partial_content.unwrap_or_default(),
-                error,
-                Some(stream_channel),
+                error.clone(),
+                stream_channel,
+                Some(agent_id.clone()),
             )
-            .await?;
-        }
-    }
-
-    Ok(json!({ "status": "sent", "messageId": thinking_id }))
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-#[allow(dead_code)] // DORMANT ASSET: floating-assistant bridge is retained but not registered.
-pub struct AssistantChatPayload {
-    pub agent_id: String,
-    pub temp_messages: Vec<crate::vcp_modules::chat::topic_service::TempMessage>,
-}
-
-#[tauri::command]
-#[allow(dead_code)] // DORMANT ASSET: floating-assistant bridge is retained but not registered.
-pub async fn handle_assistant_chat_stream(
-    app_handle: AppHandle,
-    agent_state: State<'_, AgentConfigState>,
-    active_requests: State<'_, ActiveRequests>,
-    settings_state: State<'_, SettingsState>,
-    payload: AssistantChatPayload,
-    stream_channel: Channel<crate::vcp_modules::vcp_client::StreamEvent>,
-) -> Result<Value, String> {
-    let settings = read_settings(app_handle.clone(), settings_state).await?;
-    let connection = freeze_chat_connection(&settings, ChatRequestPurpose::Interactive)?;
-    let agent_id = payload.agent_id;
-    let temp_messages = payload.temp_messages;
-
-    let thinking_id = format!("msg_{}", uuid::Uuid::new_v4());
-
-    // 1. 读取 Agent 配置
-    let agent_config =
-        read_agent_config_internal(&app_handle, &agent_state, &agent_id, Some(true)).await?;
-
-    // 2. 启动前台服务保活
-    let foreground_lease =
-        ForegroundLease::acquire(&app_handle, ForegroundTask::Stream, &agent_config.name).ok();
-
-    // 3. 构造请求消息数组 (注入 System Prompt)
-    let mut messages: Vec<Value> = Vec::new();
-
-    let effective_prompt = if !agent_config.mobile_system_prompt.is_empty() {
-        agent_config.mobile_system_prompt.clone()
-    } else {
-        agent_config.system_prompt.clone()
-    };
-
-    messages.push(json!({
-        "role": "system",
-        "content": effective_prompt
-    }));
-
-    for temp_msg in temp_messages {
-        messages.push(json!({
-            "role": temp_msg.role,
-            "content": temp_msg.content
-        }));
-    }
-
-    // 4. 构造 VCP 请求载荷
-    let mut model_config = json!({
-        "model": agent_config.model,
-        "max_tokens": agent_config.max_output_tokens,
-        "contextTokenLimit": agent_config.context_token_limit,
-        "stream": agent_config.stream_output
-    });
-    if agent_config.use_temperature {
-        model_config["temperature"] = json!(agent_config.temperature);
-    }
-
-    let context = Some(json!({
-        "agentId": agent_id,
-        "ownerId": agent_id,
-        "ownerType": "agent",
-        "topicId": "assistant_chat",
-        "agentName": agent_config.name
-    }));
-
-    let request_key = MessageKey::new(
-        TopicKey::new("agent", &agent_id, "assistant_chat"),
-        thinking_id.clone(),
-    );
-    let request_payload = VcpRequestPayload {
-        vcp_url: connection.endpoint_url,
-        vcp_api_key: connection.api_key,
-        messages,
-        model_config,
-        message_id: thinking_id.clone(),
-        context: context.clone(),
-        transport_request_id: Some(message_transport_request_id(&request_key)),
-    };
-
-    // 发送 thinking 事件通知前端初始化气泡
-    let _ = stream_channel.send(StreamEvent::thinking(thinking_id.clone(), context.clone()));
-
-    // 5. 发起流式请求 (直接调用 perform_vcp_request，不存入 DB)
-    let result = perform_vcp_request(
-        &app_handle,
-        active_requests.0.clone(),
-        request_key,
-        request_payload,
-        Some(stream_channel.clone()),
-    )
-    .await;
-
-    // 6. 停止前台服务
-    if let Some(lease) = foreground_lease {
-        let _ = lease.release();
-    }
-
-    // 7. 处理请求结果并补发流终结事件
-    let final_ts = crate::vcp_modules::infra::utils::now_millis() as u64;
-    match result {
-        Ok((res, is_aborted)) => {
-            if res["fullContent"].is_string() {
-                let finish_reason = if is_aborted {
-                    Some("cancelled_by_user".to_string())
-                } else {
-                    res["finishReason"].as_str().map(|s| s.to_string())
-                };
-
-                // 发送 end 事件让前端知道传输完毕
-                let _ = stream_channel.send(StreamEvent::end(
-                    thinking_id.clone(),
-                    context,
-                    finish_reason,
-                    res["fullContent"].as_str().map(str::to_string),
-                    None,
-                    Some(final_ts),
-                    None,
-                ));
+            .await
+            .is_err()
+            {
+                return Ok(json!({ "status": "recovery_pending", "messageId": thinking_id }));
             }
-        }
-        Err(failure) => {
-            log::error!(
-                "[AssistantChatAppService] perform_vcp_request failed: {}",
-                failure
-            );
-            let (error, partial_content) = failure.into_parts();
-            let final_content = crate::vcp_modules::vcp_client::stream_error_content(
-                partial_content.as_deref().unwrap_or_default(),
-                &error,
-            );
-            let _ = stream_channel.send(StreamEvent::end(
-                thinking_id.clone(),
-                context,
-                Some("error".to_string()),
-                Some(final_content),
-                None,
-                Some(final_ts),
-                None,
-            ));
+            return Err(error);
         }
     }
 

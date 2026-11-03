@@ -75,7 +75,7 @@
 | ID | 既定产品选择 | 当前实施解释 |
 |---|---|---|
 | D1 | Tauri 原生 iPhone/iPad | 同一 Vue/Rust + Swift adapter |
-| D2 | 其他任务沿用尽力后台；SSE 后台持续接收按最新审批优先解决 | P5-1 核对静音音频、continued task 等候选的实际条件；前台常亮与明确收尾是回退，不替代 SSE 新要求，也不承诺尚未证明的系统保证 |
+| D2 | 2026-11-01 用户决定移除聊天静音保活。iOS 26 持续后台任务仅用于尽力展示智能体或群组名称及预计进度 | Swift 异步管理展示。Rust 独立读取 SSE 并直接落库，正常 EOF 即完成，读取失败时保存已收到的正文并结束，不增加回复缓存与自动重试。同步和预渲染沿用前台常亮租约 |
 | D3 | 接受按平台语义分类迁移 | 以真实命令及消费者安排实现；02 的迁移分类用于理解接口差异，不定义 UI 可见性或新审批范围 |
 | D4 | 最低 iOS/iPadOS 26.0；高于该版本的新 API 分层 | 2026-10-09 用户明确选定 26.0，替代 Phase 0–2 的 15.0 工程基线；Tauri/Swift 目标同步。系统权限、任务提交与资源激活仍按真实结果处理，Apple 编译证据待 G1 |
 | D5 | iPhone+iPad、单 Scene、当前窗口宽度响应 | 复用组件树，按框架要求接 Scene 生命周期 |
@@ -83,18 +83,18 @@
 | D7 | 安全默认 + 用户显式受信 LAN | LAN 属于首期，细化 Rust/WebKit transport 和拒绝恢复 |
 | D8 | Android Release 附属实验性 unsigned 产物，用户自签 | 06 的设备 `.app.zip` / 条件性 `.unsigned.ipa`；应用内更新归 Android |
 | D9 | incoming share 已批准接入，覆盖原延期 | P4-4 复用 ticket/session 与主 App 导入 owner；扩展及自签输入交给 P6 |
-| D10 | 本 App 系统通知已批准接入，覆盖原延期 | P3-3 接真实授权、发送和点击响应；App 内 Toast 保留。APNs 服务端、付费 Team 和读取其他 App 通知不自动纳入 |
+| D10 | 2026-11-01 用户要求开启本应用通知才能进入 iOS 主界面，后台回复成功入库后发送本地通知 | 点击完成通知定位到对应消息，普通通知打开应用。沿用本地通知与现有冷启动点击入口 |
 | D11 | 高密度线性 UI、语义层级、iPhone/iPad 基础可访问性 | 命中区、输入字号、焦点和返回，按实际 DOM/样式/事件路径审计 |
 | D12 | Swift adapter，单 Rust 业务 owner | 生命周期、附件、任务通过现有 IPC/Channel 连接 |
 | D13 | CI 候选 ID `com.vcp.avatar`，用户可改写 | 最终 ID、plist task 前缀和 entitlement 配套 |
-| D14 | 日常源码审计，Apple 构建用阶段性手动 GitHub Actions；每阶段可按需诊断；项目 iOS 实机测试、正式签名及付费 Team 为范围外 | 2026-10-16 用户明确允许每阶段检查，复用现有 G1 device 构建链；G1 接入、G2 集成/打包职责保留，见 07/08 与 Apple 工程说明 |
+| D14 | 日常源码审计，Apple 构建在 GitHub Actions 上按需手动执行。项目 iOS 实机测试、正式签名及付费 Team 在范围外 | 2026-10-16 用户允许每阶段按需诊断。现行归档入口见 [iOS 构建说明](../../docs/IOS_BUILD.md)。 |
 | D15 | 首产物保留核心业务与原生附件，并纳入本轮获批系统功能及 SSE 专项 | 前台核心是中间里程碑；P3–P5 获批项逐项记录实现与未关闭问题，完整范围按 08 推进 |
 | D16 | 采用静态正确性与硬上限，设备性能专项为范围外 | 审查像素、缓冲、副本和并发预算 |
 | D17 | 语音仍未开发，入口保留并说明 | iOS 点击不请求麦克风，可继续文字输入；后续接入再修 MIME/扩展名契约 |
 | D18 | 原生获取/staging/大图，Rust 解析与 CAS，附件 P0 | Files/PHPicker/security scope/ImageIO 与三条导入链 |
-| D19 | 真实 token/字符/字节/chunk/terminal，未知总量表达为未知 | 领域计量与系统 Progress 分层，具体适配问题见 04 |
+| D19 | iOS 聊天的系统进度条按经过时间估算，完成状态由 Rust 提供 | Swift 本地计时，15、60、180、600 秒分别达到 40%、70%、85%、99%，成功收尾时填至 100%。流式期间无需统计字数或跨桥更新 |
 
-相机、PhotoKit 保存、outgoing share、设备/完整网络信息与 Distributed 的原延期已被最新审批覆盖：媒体/分享归 Phase 4，设备工具/Distributed 归 Phase 3。语音实现、视频抽帧和 Android 本地 CLI 的原范围未被改变。关于页集中功能说明 U1 仍是未批准建议，不自动加入产品。
+相机、PhotoKit 保存、outgoing share、设备/完整网络信息与 Distributed 的原延期已被最新审批覆盖：媒体/分享归 Phase 4，设备工具/Distributed 归 Phase 3。2026-10-17 用户又批准双端音视频附件处理：Android Media3 音频与现有视频抽帧优化、iOS 原生音频转换与视频抽帧，图片保持现状，详见 [实施记录](./phase-5/05-双端音视频附件处理.md)。语音输入和 Android 本地 CLI 的原范围未被改变。关于页集中功能说明 U1 仍是未批准建议，不自动加入产品。
 
 ### 2026-10-09 开发方式与新增任务
 
@@ -102,12 +102,12 @@
 - 共享 Vue 默认使用运行时平台分支；仅有真实的平台依赖或模块副作用时局部处理构建差异，不全面建设两套前端构建或平台映射。
 - 移除原 `platform.rs` 四字段表、Swift 静态能力查询及其启动链；系统权限和动态结果由真实操作取得，不为假想绕过增设另一层功能门禁。
 - 共同权限引导在 P3-2 接入，平台没有相应 API/设置的项目不显示；电量/空间在 P3-4 复现真实查询。磁盘 API 获批不等于把 Android 的 5 GB 启动阻断搬到 iOS。
-- SSE 专项保留用户提出的静音音频等候选并逐条件研究；不能将候选写成已采用/有效，也不能用原有尽力后台总结消解连续接收要求。无法覆盖的条件作为未关闭项明确报告。
+- 2026-10-17 曾采用静音音频实验，2026-11-01 改为上表 D2 的系统进度展示。源码、Apple 归档与实际设备运行分别记录。
 - 新功能继续复用 Rust 领域 owner、原生资源 owner 与现有提示消费者；CSP/Keychain 等独立安全改造不属于此次批准范围。
 
 ### 2026-10-07 用户追加决定：开发与验收节奏
 
-D14 进一步明确为长期工作方式：项目现在及后续均不建设 iOS 实机测试体系；开发在 Windows 通过生产源码、锁定依赖、接口声明和编译规则逐条查找并修复缺陷。GitHub Actions 是唯一 Apple 构建入口，只在阶段性验收手动执行，集中处理编译、链接与产物诊断。07/08 据此撤下固定 Simulator 旅程及社区设备验收项，默认采用 device archive；按需 Simulator 诊断同样限定在 Actions 阶段验收内。
+D14 约定项目在 Windows 审阅生产源码、锁定依赖和接口，在 GitHub Actions 上手动取得 Apple 编译、链接及归档证据。07/08 记载了当时对分期验收的规划。
 
 ### 对前次 N 表的处理
 
@@ -124,7 +124,7 @@ N3/N5/N6 将 D2/D15 改成前台限定和真机研发门禁；N7/N8 改写了 D8
 | 文件媒体与双向分享 | 闭合 picker/相机/相册/导出/预览与分享交接，确定扩展和自签输入 | P4-1–P4-4 |
 | WebKit 缓存 | 明确清理类别和结果，接共享维护页及实际 WebView owner | P4-5 |
 | SSE 后台持续接收 | 核对用户提出的静音音频、continued task 等候选的具体条件；形成选型、实现与未覆盖情况 | P5-1 / P5-2 |
-| 未知总量进度 | 读取 Progress/BGContinuedProcessingTask 声明，完成映射与 system end 分支 | continued-task progress adapter |
+| 未知总量进度 | 按 D19 展示时间估算进度，观察正常结束与系统过期时的收尾 | continued-task progress adapter |
 | 常亮与其他后台任务 | idle timer 持有/释放及 Sync/Log/Distributed/维护的 stop/join/恢复 | P5-4 |
 | 自签 Bundle ID | 主 App/扩展 ID、共享容器、各 target entitlement/profile 与 task identifier 配套改写 | P4-4 输入 / Phase 6 用户产物 |
 

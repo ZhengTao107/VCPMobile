@@ -221,10 +221,10 @@ export function useNotificationProcessor() {
       return { silent: true };
     }
 
-    let title = 'VCP 通知';
-    let message = '';
+    let title: string;
+    let message: string;
     let type: VcpNotification['type'] = 'info';
-    let isPreformatted = false;
+    let isPreformatted: boolean;
     let duration = 7000;
     let actions: VcpNotification['actions'] = [];
     let notificationId: string | undefined = undefined;
@@ -245,8 +245,8 @@ export function useNotificationProcessor() {
 
       if (vcpData.tool_name && vcpData.status) {
         // 工具回执（成功/失败）只进通知中心，不弹浮动卡片：对齐桌面端开启「通知过滤」后的表现，
-        // 避免每次工具调用都弹卡遮挡界面；审批请求等需要处理的提醒走其他分支，不受影响。
-        historyOnly = true;
+        // 避免每次工具调用都弹卡遮挡界面；审批请求、连接配置错误等需要处理的提醒仍弹出。
+        if (vcpData.id !== 'vcp_connection_configuration_error') historyOnly = true;
         const isDailyNote = String(vcpData.tool_name).toLowerCase() === 'dailynote';
         type = vcpData.status === 'error' 
           ? 'error' 
@@ -255,7 +255,7 @@ export function useNotificationProcessor() {
         const statusText = vcpData.status === 'success' ? '执行成功' : vcpData.status === 'error' ? '执行失败' : vcpData.status;
         title = `${vcpData.tool_name} ${statusText}`;
 
-        let rawContent = typeof vcpData.content === 'string'
+        const rawContent = typeof vcpData.content === 'string'
           ? vcpData.content
           : (vcpData.content ? JSON.stringify(vcpData.content) : '');
         message = rawContent;

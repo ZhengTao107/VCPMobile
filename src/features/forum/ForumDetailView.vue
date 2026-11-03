@@ -6,7 +6,7 @@
  * UID/楼层号 Monospace；回复署名默认取设置中的用户名。
  */
 import { computed, onMounted, ref, watch } from 'vue';
-import { ArrowLeft, Send, Trash2 } from 'lucide-vue-next';
+import { ArrowLeft, Send, Trash2 } from '@lucide/vue';
 import RefreshButton from '../../components/ui/RefreshButton.vue';
 import { useForumStore } from './forumStore';
 import { useSettingsStore } from '../../core/stores/settings';
@@ -54,9 +54,10 @@ watch(
 // ---------- 快捷回复 ----------
 const replyMaid = ref('');
 const replyContent = ref('');
+const isReplyComposing = ref(false);
 
 onMounted(() => {
-  replyMaid.value = settingsStore.settings?.userName ?? '';
+  replyMaid.value = settingsStore.settings?.identity.userName ?? '';
 });
 
 const canReply = computed(
@@ -67,6 +68,13 @@ async function sendReply(): Promise<void> {
   if (!canReply.value) return;
   const ok = await store.reply(props.uid, replyMaid.value.trim(), replyContent.value.trim());
   if (ok) replyContent.value = '';
+}
+
+function handleReplyKeydown(event: KeyboardEvent): void {
+  if (isReplyComposing.value || event.isComposing || event.keyCode === 229) return;
+  if (event.key !== 'Enter' || event.shiftKey || event.ctrlKey || event.metaKey || event.altKey) return;
+  event.preventDefault();
+  void sendReply();
 }
 
 function refresh(): void {
@@ -147,7 +155,7 @@ async function deletePost(): Promise<void> {
               <span class="fd-time">{{ relativeTime(postMeta.timestampMs) }}</span>
             </div>
           </div>
-          <!-- eslint-disable-next-line vue/no-v-html -->
+          <!-- eslint-disable-next-line vue/no-v-html -- renderForumMarkdown filters the parsed post body through filterTrustedRichHtml. -->
           <div class="fd-body markdown-body" v-html="renderForumMarkdown(detail.mainBody)" />
         </article>
 
@@ -180,7 +188,7 @@ async function deletePost(): Promise<void> {
               <Trash2 :size="13" />
             </button>
           </div>
-          <!-- eslint-disable-next-line vue/no-v-html -->
+          <!-- eslint-disable-next-line vue/no-v-html -- Replies use the same guarded renderForumMarkdown boundary as the main post. -->
           <div class="fd-body markdown-body" v-html="renderForumMarkdown(floor.body)" />
         </article>
       </template>
@@ -203,7 +211,10 @@ async function deletePost(): Promise<void> {
         rows="1"
         placeholder="回复…"
         enterkeyhint="send"
-        @keydown.enter.exact.prevent="sendReply"
+        @compositionstart="isReplyComposing = true"
+        @compositionend="isReplyComposing = false"
+        @blur="isReplyComposing = false"
+        @keydown="handleReplyKeydown"
       />
       <button
         type="button"
