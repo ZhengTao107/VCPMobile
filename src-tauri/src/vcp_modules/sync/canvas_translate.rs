@@ -15,8 +15,9 @@ use super::canvas_sync::{
     atomic_write, cancel_request, canvas_client, describe_error, io_err, mirror_root, read_limited,
     register, unregister, validate_name,
 };
-use crate::vcp_modules::infra::settings_manager::{read_settings, SettingsState};
-use crate::vcp_modules::infra::vcp_client::{freeze_chat_connection, ChatRequestPurpose};
+use crate::vcp_modules::infra::settings_manager::{read_config, SettingsState};
+use crate::vcp_modules::infra::vcp_client::freeze_chat_connection;
+use crate::vcp_modules::infra::vcp_http_endpoint::ChatRequestPurpose;
 use reqwest::header::{ACCEPT, CONTENT_TYPE};
 use reqwest::Client;
 use serde::Serialize;
@@ -154,8 +155,8 @@ pub async fn canvas_translate_request(
     if system.len() + user.len() > MAX_PROMPT_BYTES {
         return Err("PROMPT_TOO_LARGE".to_owned());
     }
-    let settings = read_settings(app.clone(), app.state::<SettingsState>()).await?;
-    if settings.vcp_api_key.trim().is_empty() {
+    let settings = read_config(app.clone(), app.state::<SettingsState>()).await?;
+    if settings.server.api_key.trim().is_empty() {
         return Err("VCP_NOT_CONFIGURED".to_owned());
     }
     let connection = freeze_chat_connection(&settings, ChatRequestPurpose::Auxiliary)

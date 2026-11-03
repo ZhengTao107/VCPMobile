@@ -104,6 +104,8 @@ describe('ThemePicker draft, preview and presentation controls', () => {
   });
 
   it('navigates through themes using prev and next buttons', async () => {
+    // fork ptp4g#33：新增主题后按文件名排在首位的是 acid-basalt。
+    localStorage.setItem('vcp-theme-name', 'themes-acid-basalt.ts');
     const store = useThemeStore();
     wrapper = mount(ThemePicker, { global: { plugins: [pinia] } });
     await flushPromises();

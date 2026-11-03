@@ -209,6 +209,7 @@ describe("open tabs store", () => {
     }));
 
     const { tabs, select, ids } = setup();
+    await select("a", "t2");
     expect(ids()).toEqual(["a/t1", "a/t2", "a/t3"]);
     expect(tabs.activeTabKey).toBe(keyOf("a", "t2"));
 

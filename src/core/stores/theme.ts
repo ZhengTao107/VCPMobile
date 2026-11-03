@@ -73,19 +73,21 @@ for (const [path, mod] of Object.entries(themeModules)) {
 }
 
 export const normalizeThemeModuleKey = (value: unknown): string | null => {
+  return typeof value === 'string' && themeModulesByKey.has(value) ? value : null;
+};
+
+/** fork ptp4g#37：电脑端主题文件名（含旧中文 css 名）→ 手机 TS 主题模块键；解析不到返回 null。 */
+export const resolveLegacyThemeKey = (value: unknown): string | null => {
   if (typeof value !== 'string') return null;
   const input = value.trim();
   if (!input || input.includes('/') || input.includes('\\') || input.includes('\0')) {
     return null;
   }
-
   const legacyMapped = LEGACY_THEME_MAP[input] || input;
   const key = legacyMapped.endsWith('.css')
     ? `${legacyMapped.slice(0, -4)}.ts`
     : legacyMapped;
-
-  if (!key.endsWith('.ts') || !themeModulesByKey.has(key)) return null;
-  return key;
+  return normalizeThemeModuleKey(key);
 };
 
 export const normalizeThemeMode = (value: unknown): ThemeMode =>

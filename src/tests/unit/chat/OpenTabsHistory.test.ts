@@ -14,6 +14,7 @@ import {
   type RecentlyClosedEntry,
 } from "@/core/stores/openTabsStore";
 import { clearInvokeMocks, invokeMock, mockInvoke } from "@/tests/mocks/tauri";
+import { mockChatNavigation } from "@/tests/helpers/chatNavigation";
 
 function installPersistedPinia() {
   const pinia = createPinia();
@@ -65,6 +66,7 @@ function setup() {
 beforeEach(() => {
   localStorage.clear();
   clearInvokeMocks();
+  mockChatNavigation();
   mockInvoke("get_unread_counts", () => ({}));
 });
 

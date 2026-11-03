@@ -3,6 +3,7 @@ import { createPinia, setActivePinia } from 'pinia';
 import {
   resolveThemeWallpaperUrl,
   normalizeThemePreferencePatch,
+  resolveLegacyThemeKey,
   THEME_PREFERENCE_DEFAULTS,
   useThemeStore,
 } from '@/core/stores/theme';
@@ -95,14 +96,14 @@ describe('theme and chat presentation store contracts', () => {
     store.$dispose();
   });
   it('normalizes legacy CSS theme identities to the compiled TS module key', () => {
-    expect(normalizeThemeModuleKey('themes-bear-holiday.css')).toBe('themes-bear-holiday.ts');
-    expect(normalizeThemeModuleKey('themes熊熊假日.css')).toBe('themes-bear-holiday.ts');
-    expect(normalizeThemeModuleKey('themesCodeIDE.css')).toBe('themes-code-ide.ts');
-    expect(normalizeThemeModuleKey('themes纸墨与机芯.css')).toBe('themes-paper-ink-clockwork.ts');
-    expect(normalizeThemeModuleKey('themes-bear-holiday.ts')).toBe('themes-bear-holiday.ts');
-    expect(normalizeThemeModuleKey('../themes-bear-holiday.ts')).toBeNull();
-    expect(normalizeThemeModuleKey('https://example.com/theme.ts')).toBeNull();
-    expect(normalizeThemeModuleKey('missing.ts')).toBeNull();
+    expect(resolveLegacyThemeKey('themes-bear-holiday.css')).toBe('themes-bear-holiday.ts');
+    expect(resolveLegacyThemeKey('themes熊熊假日.css')).toBe('themes-bear-holiday.ts');
+    expect(resolveLegacyThemeKey('themesCodeIDE.css')).toBe('themes-code-ide.ts');
+    expect(resolveLegacyThemeKey('themes纸墨与机芯.css')).toBe('themes-paper-ink-clockwork.ts');
+    expect(resolveLegacyThemeKey('themes-bear-holiday.ts')).toBe('themes-bear-holiday.ts');
+    expect(resolveLegacyThemeKey('../themes-bear-holiday.ts')).toBeNull();
+    expect(resolveLegacyThemeKey('https://example.com/theme.ts')).toBeNull();
+    expect(resolveLegacyThemeKey('missing.ts')).toBeNull();
   });
 
 

@@ -477,8 +477,8 @@ export function createTopicTitleResolver(deps: TopicTitleResolverDeps) {
 }
 
 export const deviceNameFromSettings = (settings: AppSettings | null | undefined) => {
-  const name =
-    typeof settings?.distributedDeviceName === "string" ? settings.distributedDeviceName.trim() : "";
+  const raw = settings?.distributed?.deviceName;
+  const name = typeof raw === "string" ? raw.trim() : "";
   return name || "Android 手机";
 };
 

@@ -4,7 +4,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { useSettingsStore } from "../stores/settings";
 import {
   LEGACY_THEME_MAP,
-  normalizeThemeModuleKey,
+  resolveLegacyThemeKey,
   useThemeStore,
   type ThemeMode,
 } from "../stores/theme";
@@ -78,7 +78,7 @@ export function mobileThemeFromComputer(computerTheme: unknown): string | null {
   if (typeof computerTheme !== "string") return null;
   const name = computerTheme.trim();
   if (!Object.prototype.hasOwnProperty.call(LEGACY_THEME_MAP, name)) return null;
-  return normalizeThemeModuleKey(name);
+  return resolveLegacyThemeKey(name);
 }
 
 /** 手机主题 id → 电脑主题文件名；反查不到返回 null（不推）。 */
@@ -245,13 +245,14 @@ export function useSettingsRemote(isForeground: () => boolean): () => void {
     readLocal: () => {
       const settings = settingsStore.settings;
       if (!settings) return null;
-      const userName = typeof settings.userName === "string" ? settings.userName.trim() : "";
+      const raw = settings.identity?.userName;
+      const userName = typeof raw === "string" ? raw.trim() : "";
       return { userName, themeMode: themeStore.mode };
     },
     applyLocal: async (patch) => {
       if (patch.themeMode) themeStore.mode = patch.themeMode;
       if (patch.userName !== undefined) {
-        await settingsStore.updateSettings({ userName: patch.userName });
+        await settingsStore.updateFields({ "identity.userName": patch.userName });
       }
     },
     fetchSettings: (target) =>
@@ -278,7 +279,7 @@ export function useSettingsRemote(isForeground: () => boolean): () => void {
     { immediate: true },
   );
   const stopLocal = watch(
-    () => [settingsStore.settings?.userName, themeStore.mode],
+    () => [settingsStore.settings?.identity?.userName, themeStore.mode],
     () => remote.schedulePush(),
   );
   const dispose = () => {

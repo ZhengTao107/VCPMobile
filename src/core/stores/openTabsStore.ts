@@ -494,7 +494,8 @@ export const useOpenTabsStore = defineStore("openTabs", () => {
       return true;
     }
     try {
-      await sessionStore.selectTopicById(target.ownerId, target.ownerType, target.topicId);
+      const status = await sessionStore.selectTopicById(target.ownerId, target.ownerType, target.topicId);
+      if (status !== "accepted") return false;
       activeCanvasPath.value = null;
       markSlot();
       return true;
