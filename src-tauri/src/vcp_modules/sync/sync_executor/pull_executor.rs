@@ -446,6 +446,7 @@ async fn process_topic_messages(
     parsed_messages: Vec<crate::vcp_modules::sync_dto::MessageSyncDTO>,
     write_queue: &DbWriteQueue,
     prerender_enabled: bool,
+    metrics_only: bool,
 ) -> Result<(), String> {
     if !parsed_messages.is_empty() {
         // 1. 将预渲染和 Zstd 压缩移至 blocking 线程池；消息指纹直接使用 Wire 值。
@@ -488,6 +489,7 @@ async fn process_topic_messages(
                     render_bytes: rb,
                     content_hash,
                     context_metric_rounds,
+                    metrics_only,
                 });
             }
 
@@ -844,6 +846,7 @@ impl PullExecutor {
         requests: &[(TopicKey, Vec<String>)], // (topic identity, msg_ids)，空 vec = 拉全部消息
         write_queue: &DbWriteQueue,
         prerender_enabled: bool,
+        metrics_only: bool,
     ) -> Result<Vec<BatchPullResult>, String> {
         if requests.is_empty() {
             return Ok(Vec::new());
@@ -1086,8 +1089,14 @@ impl PullExecutor {
                 let legacy_attachment_warnings = frame.legacy_attachment_warnings;
 
                 spawn_handles.spawn(async move {
-                    match process_topic_messages(&key, pull_dtos, &wq_clone, prerender_enabled)
-                        .await
+                    match process_topic_messages(
+                        &key,
+                        pull_dtos,
+                        &wq_clone,
+                        prerender_enabled,
+                        metrics_only,
+                    )
+                    .await
                     {
                         Ok(()) => {
                             let _ = tx_clone
@@ -1171,8 +1180,14 @@ impl PullExecutor {
                     let wq_clone = write_queue.clone();
                     let tx_clone = tx.clone();
                     spawn_handles.spawn(async move {
-                        match process_topic_messages(&key, pull_dtos, &wq_clone, prerender_enabled)
-                            .await
+                        match process_topic_messages(
+                            &key,
+                            pull_dtos,
+                            &wq_clone,
+                            prerender_enabled,
+                            metrics_only,
+                        )
+                        .await
                         {
                             Ok(()) => {
                                 let _ = tx_clone

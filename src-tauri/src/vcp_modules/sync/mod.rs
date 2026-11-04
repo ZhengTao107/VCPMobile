@@ -1,7 +1,8 @@
 pub mod attachment_blob;
+pub mod canvas_shared_translation;
 pub mod canvas_sync;
 pub mod canvas_translate;
-pub mod canvas_shared_translation;
+pub mod context_metrics_backfill;
 pub mod open_tabs;
 pub mod settings_sync;
 pub mod sidechat_sync;

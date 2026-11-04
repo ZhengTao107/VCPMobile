@@ -57,6 +57,8 @@ pub(crate) struct PreparedMessageWrite {
     pub content_hash: String,
     /// ptp4g#44：pull 带来的电脑端 assistantContextMetricRounds，只合并进 context_metrics。
     pub context_metric_rounds: Option<serde_json::Value>,
+    /// ptp4g#44：回填拉取只合并用量，不写正文、指纹与附件（电脑端版本不同也不覆盖）。
+    pub metrics_only: bool,
 }
 
 struct CollectedWriteBatch {
@@ -140,6 +142,7 @@ mod tests {
                 render_bytes: Vec::new(),
                 content_hash: format!("hash-{message_id}"),
                 context_metric_rounds: None,
+                metrics_only: false,
             })
             .collect();
         DbWriteTask::TopicMessages {
@@ -175,6 +178,7 @@ mod tests {
                     render_bytes: vec![message_id as u8, 1],
                     content_hash: format!("content-hash-{message_id}"),
                     context_metric_rounds: None,
+                    metrics_only: false,
                 }
             })
             .collect();
@@ -1143,6 +1147,7 @@ mod tests {
                 render_bytes: Vec::new(),
                 content_hash: hash.into(),
                 context_metric_rounds: Some(rounds),
+                metrics_only: false,
             }
         };
         let tx = conn.transaction().expect("begin transaction");
@@ -1185,7 +1190,10 @@ mod tests {
         assert_eq!(same_hash, "same-hash");
         assert_eq!(same["attachmentTokenEstimate"], 7);
         assert_eq!(same["rounds"].as_array().unwrap().len(), 2);
-        assert_eq!(same["rounds"][0]["totalContextTokens"].as_f64(), Some(100.0));
+        assert_eq!(
+            same["rounds"][0]["totalContextTokens"].as_f64(),
+            Some(100.0)
+        );
         assert_eq!(same["rounds"][0]["upstreamUsage"]["cachedTokens"], 40);
         assert_eq!(read("user").0, None);
         let fresh: serde_json::Value =
@@ -1193,6 +1201,78 @@ mod tests {
         assert_eq!(fresh["rounds"].as_array().unwrap().len(), 1);
         assert_eq!(fresh["attachmentTokenEstimate"], 0);
         assert_eq!(read("plain").0, None);
+    }
+
+    /// ptp4g#44：回填（metrics_only）即使电脑端正文/哈希不同，也只合并用量，
+    /// 不改正文、指纹与 updated_at；本地不存在的消息不会被插入。
+    #[test]
+    fn metrics_only_backfill_never_rewrites_message_rows() {
+        let mut conn = rusqlite::Connection::open_in_memory().expect("open test database");
+        conn.execute_batch(include_str!("../../../migrations/0100_baseline_v2.sql"))
+            .expect("create baseline schema");
+        conn.execute_batch(include_str!(
+            "../../../migrations/9001_add_message_context_metrics.sql"
+        ))
+        .expect("context metrics column");
+        conn.execute_batch(
+            "INSERT INTO agents (owner_type, agent_id, name, model, updated_at)
+                VALUES ('agent', 'agent', 'Agent', '', 1);
+             INSERT INTO topics (
+                owner_type, owner_id, topic_id, title, created_at, updated_at
+             ) VALUES ('agent', 'agent', 'topic', 'Topic', 1, 1);
+             INSERT INTO messages (
+                owner_type, owner_id, topic_id, msg_id, role, content, timestamp,
+                content_hash, created_at, updated_at
+             ) VALUES ('agent', 'agent', 'topic', 'local', 'assistant', 'local body', 3,
+                'local-hash', 3, 3);",
+        )
+        .expect("seed message");
+        let write = |id: &str| PreparedMessageWrite {
+            message: ChatMessage {
+                id: id.into(),
+                role: "assistant".into(),
+                content: "remote body".into(),
+                timestamp: 9,
+                updated_at: Some(9),
+                topic_id: Some("topic".into()),
+                ..Default::default()
+            },
+            render_bytes: Vec::new(),
+            content_hash: "remote-hash".into(),
+            context_metric_rounds: Some(serde_json::json!([{"totalContextTokens": 50}])),
+            metrics_only: true,
+        };
+        let tx = conn.transaction().expect("begin transaction");
+        DbWriteQueue::rusqlite_upsert_messages_batch(
+            &tx,
+            &TopicKey::new("agent", "agent", "topic"),
+            vec![write("local"), write("absent")],
+            std::path::Path::new("attachments"),
+        )
+        .expect("metrics-only batch");
+        let (content, hash, updated_at, metrics): (String, String, i64, Option<String>) = tx
+            .query_row(
+                "SELECT content, content_hash, updated_at, context_metrics FROM messages
+                 WHERE msg_id = 'local'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .expect("read local message");
+        assert_eq!(
+            (content.as_str(), hash.as_str(), updated_at),
+            ("local body", "local-hash", 3)
+        );
+        let metrics: serde_json::Value =
+            serde_json::from_str(&metrics.expect("metrics merged")).expect("metrics json");
+        assert_eq!(metrics["rounds"].as_array().unwrap().len(), 1);
+        let absent: i64 = tx
+            .query_row(
+                "SELECT COUNT(*) FROM messages WHERE msg_id = 'absent'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count absent");
+        assert_eq!(absent, 0);
     }
 
     #[test]
@@ -1245,6 +1325,7 @@ mod tests {
                 render_bytes: vec![1, 2, 3],
                 content_hash: "stale-hash".into(),
                 context_metric_rounds: None,
+                metrics_only: false,
             }],
             std::path::Path::new("attachments"),
         )
@@ -2190,6 +2271,7 @@ impl DbWriteQueue {
                 (!rounds.is_empty()).then(|| (write.message.id.clone(), rounds.clone()))
             })
             .collect();
+        writes.retain(|write| !write.metrics_only);
         writes.retain(|write| {
             let updated_at = write.message.updated_at.unwrap_or(write.message.timestamp) as i64;
             match existing_states.get(&write.message.id) {
@@ -2638,7 +2720,13 @@ impl DbWriteQueue {
                 "UPDATE messages SET context_metrics = ?
                  WHERE owner_type = ? AND owner_id = ? AND topic_id = ? AND msg_id = ?
                    AND deleted_at IS NULL",
-                rusqlite::params![payload, &key.owner_type, &key.owner_id, &key.topic_id, msg_id],
+                rusqlite::params![
+                    payload,
+                    &key.owner_type,
+                    &key.owner_id,
+                    &key.topic_id,
+                    msg_id
+                ],
             )?;
         }
         Ok(())
