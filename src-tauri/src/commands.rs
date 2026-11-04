@@ -139,7 +139,8 @@ macro_rules! app_command_handler {
             canvas_bindings_get, canvas_bindings_put, canvas_delete, canvas_local_delete,
             canvas_local_forget, canvas_local_list, canvas_local_missing, canvas_local_read,
             canvas_local_save_conflict, canvas_local_write, canvas_manifest, canvas_pull,
-            canvas_push, canvas_wait, canvas_wait_cancel,
+            canvas_push, canvas_revision_load, canvas_revision_pull, canvas_wait,
+            canvas_wait_cancel,
         };
         use crate::vcp_modules::sync::sidechat_sync::{
             sidechat_delete, sidechat_forget_base, sidechat_local_list, sidechat_local_read,
@@ -473,6 +474,8 @@ macro_rules! app_command_handler {
                 canvas_local_delete,
                 canvas_local_missing,
                 canvas_local_forget,
+                canvas_revision_load,
+                canvas_revision_pull,
                 canvas_bindings_get,
                 canvas_bindings_put,
                 canvas_local_list,
