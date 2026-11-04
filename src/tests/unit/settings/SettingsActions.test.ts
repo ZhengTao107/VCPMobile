@@ -331,7 +331,7 @@ describe('配置导入的原生选择与局部覆盖层生命周期', () => {
     mockInvoke('parse_config_backup', () => ({
       domains: {}, exportedAt: '', preferences: {
         theme: { themeKey: 'removed-theme.ts', mode: 'dark' },
-        chat: { smoothStreamingEnabled: 'true', messageHapticsEnabled: false },
+        chat: { smoothStreamingEnabled: 'false', messageHapticsEnabled: false },
       },
     }));
     const applyImport = vi.fn(async () => ({ applied: ['主题与深浅模式', '聊天偏好'], skipped: [], failed: [] }));
@@ -345,7 +345,7 @@ describe('配置导入的原生选择与局部覆盖层生命周期', () => {
     expect(applyImport).toHaveBeenCalledExactlyOnceWith({
       domains: {}, exportedAt: '', preferences: {
         theme: { themeKey: THEME_PREFERENCE_DEFAULTS.themeKey, mode: 'dark' },
-        chat: { smoothStreamingEnabled: false, messageHapticsEnabled: false },
+        chat: { smoothStreamingEnabled: true, messageHapticsEnabled: false },
       },
     });
     expect(deleteTempFile).toHaveBeenCalledWith(filePath);

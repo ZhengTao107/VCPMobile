@@ -143,7 +143,7 @@ watch(
   <nav v-if="items.length > 0" class="open-tabs-bar shrink-0 border-b border-white/5 flex items-center"
     aria-label="已打开的话题">
     <div ref="scrollerRef" role="tablist"
-      class="open-tabs-scroller flex-1 min-w-0 overflow-x-auto no-swipe flex items-center gap-2 pl-3 pr-1 py-1.5">
+      class="open-tabs-scroller flex-1 min-w-0 overflow-x-auto no-swipe flex items-center gap-1.5 pl-3 pr-1 py-1">
       <div v-for="item in items" :key="item.key" :data-tab-key="item.key" :data-tab-kind="item.kind"
         v-longpress.suppress-click="() => showTabMenu(item)"
         class="open-tab-chip shrink-0 flex items-center max-w-[11rem] rounded-full border transition-colors"
@@ -151,32 +151,32 @@ watch(
           ? 'bg-primary/15 border-primary/40 text-primary-text'
           : 'bg-black/5 dark:bg-white/5 border-black/5 dark:border-white/10 opacity-80'">
         <button type="button" role="tab" :aria-selected="item.active" :title="item.label"
-          class="flex items-center gap-1.5 min-w-0 pl-1 pr-1 py-1 active:scale-95 transition-transform"
+          class="flex items-center gap-1 min-w-0 min-h-7 pl-1 pr-0.5 py-0.5 active:scale-95 transition-transform"
           @click="activate(item)">
           <span v-if="item.kind === 'canvas'"
-            class="shrink-0 w-5 h-5 flex items-center justify-center rounded-full bg-black/5 dark:bg-white/10">
-            <FileText :size="12" aria-hidden="true" />
+            class="shrink-0 w-4 h-4 flex items-center justify-center rounded-full bg-black/5 dark:bg-white/10">
+            <FileText :size="10" aria-hidden="true" />
           </span>
           <span v-else class="relative shrink-0">
-            <VcpAvatar :target="avatarTarget(item.tab)" size="w-5 h-5" rounded="rounded-full" />
+            <VcpAvatar :target="avatarTarget(item.tab)" size="w-4 h-4" rounded="rounded-full" />
             <span v-if="item.unread"
               class="absolute -top-0.5 -right-0.5 w-2 h-2 rounded-full border border-white dark:border-gray-900"
               style="background: #ff6b6b"></span>
           </span>
-          <span class="text-xs font-semibold truncate">{{ item.kind === "canvas" ? item.tab.name : item.tab.title }}</span>
+          <span class="text-[11px] leading-tight font-semibold truncate">{{ item.kind === "canvas" ? item.tab.name : item.tab.title }}</span>
           <Loader2 v-if="item.streaming" :size="12" class="shrink-0 animate-spin opacity-70"
             aria-hidden="true" />
           <span v-if="item.streaming" class="sr-only">生成中</span>
           <span v-if="item.unread" class="sr-only">有未读消息</span>
         </button>
         <button type="button" :aria-label="`关闭 ${item.label}`"
-          class="shrink-0 w-6 h-6 mr-0.5 flex items-center justify-center rounded-full opacity-60 active:scale-90"
+          class="shrink-0 w-7 h-7 flex items-center justify-center rounded-full opacity-60 active:scale-90"
           @click.stop="closeAny(item.tab)">
           <X :size="12" />
         </button>
       </div>
     </div>
-    <div class="shrink-0 flex items-center gap-1.5 pl-1 pr-3 py-1.5">
+    <div class="shrink-0 flex items-center gap-1.5 pl-1 pr-3 py-1">
       <button type="button" aria-label="新建话题标签" title="新建话题标签"
         class="open-tab-add shrink-0 w-7 h-7 flex items-center justify-center rounded-full border border-black/5 dark:border-white/10 bg-black/5 dark:bg-white/5 opacity-80 active:scale-90 transition-transform disabled:opacity-40"
         :disabled="!currentOwner || creating" @click="openNewTab">
