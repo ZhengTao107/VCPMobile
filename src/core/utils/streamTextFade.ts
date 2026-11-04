@@ -206,6 +206,8 @@ export function appendStreamTextFragment(
   };
   animation.onfinish = fragment.finish;
   animation.oncancel = fragment.finish;
+  // cancel() 以 AbortError reject finished；完成态由 onfinish/oncancel 处理，这里只防未处理 rejection。
+  void animation.finished?.catch(() => undefined);
   state.fragments.push(fragment);
 }
 

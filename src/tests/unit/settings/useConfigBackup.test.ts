@@ -132,13 +132,13 @@ describe('配置恢复的真实领域状态与失败边界', () => {
     const normalized = normalizeParsedConfigBackup({
       domains: {}, exportedAt: '', preferences: {
         theme: { mode: null, ignored: true },
-        chat: { presentationMode: 'future-mode', smoothStreamingEnabled: 'true', messageHapticsEnabled: false },
+        chat: { presentationMode: 'future-mode', smoothStreamingEnabled: 'false', messageHapticsEnabled: false },
         unknown: { enabled: true },
       },
     });
     expect(normalized.preferences).toEqual({
       theme: { mode: THEME_PREFERENCE_DEFAULTS.mode },
-      chat: { presentationMode: CHAT_PREFERENCE_DEFAULTS.presentationMode, smoothStreamingEnabled: false, messageHapticsEnabled: false },
+      chat: { presentationMode: CHAT_PREFERENCE_DEFAULTS.presentationMode, smoothStreamingEnabled: true, messageHapticsEnabled: false },
     });
     expect(configBackupScopes(normalized)).toEqual(['主题与深浅模式', '聊天偏好']);
     const applySettings = vi.fn(async () => ({ missingGroups: false, missingAgents: false }));
@@ -148,7 +148,7 @@ describe('配置恢复的真实领域状态与失败边界', () => {
     expect(theme.currentTheme).toBe('themes-bear-holiday.ts');
     expect(theme.mode).toBe('light');
     expect(chat.presentationMode).toBe('bubble');
-    expect(chat.smoothStreamingEnabled).toBe(false);
+    expect(chat.smoothStreamingEnabled).toBe(true);
     expect(chat.messageHapticsEnabled).toBe(false);
     expect(chat.collapseToolsWhileStreaming).toBe(true);
   });
@@ -190,7 +190,7 @@ describe('配置恢复的真实领域状态与失败边界', () => {
     expect(reopened.presentationMode).toBe('immersive');
     expect(reopened.messageHapticsEnabled).toBe(true);
     expect(reopened.collapseToolsWhileStreaming).toBe(true);
-    expect(reopened.smoothStreamingEnabled).toBe(false);
+    expect(reopened.smoothStreamingEnabled).toBe(true);
   });
 
   it('数据库写入失败不会伪报连接已恢复，也不阻止独立聊天偏好生效', async () => {

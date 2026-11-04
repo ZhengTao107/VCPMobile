@@ -51,12 +51,12 @@ describe('theme and chat presentation store contracts', () => {
       return originalSetItem(key, value);
     });
 
-    const result = store.setSmoothStreamingEnabled(true);
+    const result = store.setSmoothStreamingEnabled(false);
 
     expect(result.ok).toBe(false);
     expect(result.changed).toBe(false);
-    expect(result.enabled).toBe(false);
-    expect(store.smoothStreamingEnabled).toBe(false);
+    expect(result.enabled).toBe(true);
+    expect(store.smoothStreamingEnabled).toBe(true);
     store.$dispose();
   });
 
@@ -112,7 +112,7 @@ describe('theme and chat presentation store contracts', () => {
     const write = vi.spyOn(localStorage, 'setItem');
     const store = useChatPreferencesStore();
     expect(store.presentationMode).toBe('bubble');
-    expect(store.smoothStreamingEnabled).toBe(false);
+    expect(store.smoothStreamingEnabled).toBe(true);
     expect(store.messageHapticsEnabled).toBe(true);
     expect(store.collapseToolsWhileStreaming).toBe(false);
     expect(write).not.toHaveBeenCalled();
@@ -181,8 +181,8 @@ describe('theme and chat presentation store contracts', () => {
       .toEqual({ themeKey: THEME_PREFERENCE_DEFAULTS.themeKey, mode: 'dark' });
     expect(normalizeThemePreferencePatch({ mode: 'sepia' }))
       .toEqual({ mode: THEME_PREFERENCE_DEFAULTS.mode });
-    expect(normalizeChatPreferencePatch({ presentationMode: 'magazine', messageHapticsEnabled: false, smoothStreamingEnabled: 'true' }))
-      .toEqual({ presentationMode: 'bubble', messageHapticsEnabled: false, smoothStreamingEnabled: false });
+    expect(normalizeChatPreferencePatch({ presentationMode: 'magazine', messageHapticsEnabled: false, smoothStreamingEnabled: 'false' }))
+      .toEqual({ presentationMode: 'bubble', messageHapticsEnabled: false, smoothStreamingEnabled: true });
     expect(normalizeChatPreferencePatch({ ignored: true })).toEqual({});
     expect(normalizeChatPreferencePatch(null)).toEqual(CHAT_PREFERENCE_DEFAULTS);
 

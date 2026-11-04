@@ -23,7 +23,8 @@ export interface ChatPreferences {
 
 export const CHAT_PREFERENCE_DEFAULTS: ChatPreferences = {
   presentationMode: 'bubble',
-  smoothStreamingEnabled: false,
+  // ptp4g#43：手机默认开启（电脑 enableSmoothStreaming 默认关，差异已报备）。
+  smoothStreamingEnabled: true,
   messageHapticsEnabled: true,
   collapseToolsWhileStreaming: false,
 };
