@@ -113,6 +113,10 @@ impl From<&GroupConfig> for GroupSyncDTO {
     }
 }
 
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
 /// Agent Topic 同步 DTO (包含 locked/unread)
 #[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -123,6 +127,9 @@ pub struct AgentTopicSyncDTO {
     pub created_at: i64,
     pub locked: bool,
     pub unread: bool,
+    /// ptp4g#44：电脑只在 true 时发送；缺省=未置顶。false 不序列化，未置顶话题线格式与哈希不变。
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub pinned: bool,
     pub owner_id: String,
     #[serde(
         rename = "configHash",
@@ -141,6 +148,9 @@ pub struct GroupTopicSyncDTO {
     pub name: String,
     #[serde(default, deserialize_with = "deserialize_nullable_created_at")]
     pub created_at: i64,
+    /// ptp4g#44：与 AgentTopicSyncDTO 同语义，电脑只在 true 时发送；缺省=未置顶，false 不序列化。
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub pinned: bool,
     pub owner_id: String,
     #[serde(
         rename = "configHash",
@@ -201,6 +211,10 @@ pub struct MessageSyncDTO {
         deserialize_with = "deserialize_required_sha256"
     )]
     pub content_hash: String,
+    /// ptp4g#44：电脑原样透传的用量轮次（纯 round 数组）。只收不发、不进消息指纹；
+    /// 用 Value 接收，非数组时只丢弃用量，不拒收整条消息。
+    #[serde(rename = "assistantContextMetricRounds", default, skip_serializing)]
+    pub assistant_context_metric_rounds: Option<serde_json::Value>,
 }
 
 impl From<MessageSyncDTO> for crate::vcp_modules::chat_manager::ChatMessage {
@@ -282,5 +296,47 @@ mod tests {
         assert!(
             serde_json::from_value::<AgentTopicSyncDTO>(base(Some(json!("2026-11-01")))).is_err()
         );
+    }
+
+    /// ptp4g#44：pinned 缺省=未置顶且不序列化；true 原样往返；未知字段仍被拒收。
+    #[test]
+    fn agent_topic_sync_dto_pinned_round_trip() {
+        let mut value = json!({
+            "id": "topic-1",
+            "name": "Topic",
+            "createdAt": 1,
+            "locked": false,
+            "unread": false,
+            "ownerId": "agent-1",
+            "configHash": "a".repeat(64),
+            "updatedAt": 456
+        });
+        let legacy: AgentTopicSyncDTO =
+            serde_json::from_value(value.clone()).expect("legacy DTO without pinned");
+        assert!(!legacy.pinned);
+        assert!(serde_json::to_value(&legacy)
+            .unwrap()
+            .get("pinned")
+            .is_none());
+
+        value["pinned"] = json!(true);
+        let pinned: AgentTopicSyncDTO = serde_json::from_value(value.clone()).expect("pinned DTO");
+        assert!(pinned.pinned);
+        assert_eq!(
+            serde_json::to_value(&pinned).unwrap()["pinned"],
+            json!(true)
+        );
+
+        value["pinned"] = json!(false);
+        let unpinned: AgentTopicSyncDTO =
+            serde_json::from_value(value.clone()).expect("explicit false");
+        assert!(!unpinned.pinned);
+        assert!(serde_json::to_value(&unpinned)
+            .unwrap()
+            .get("pinned")
+            .is_none());
+
+        value["bogus"] = json!(1);
+        assert!(serde_json::from_value::<AgentTopicSyncDTO>(value).is_err());
     }
 }

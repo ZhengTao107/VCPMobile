@@ -4,7 +4,8 @@
 //! - 存储：`messages.context_metrics`（迁移 9001；ptp4g#31 前为 0101，旧库启动时改号），JSON
 //!   `{"rounds":[...], "attachmentTokenEstimate":N}`；前端暴露为
 //!   `assistantContextMetricRounds`，字段名与桌面端 history.json 一致。
-//! - 元数据不是流所有权：不参与消息指纹、不进同步 DTO、不阻塞 finalize。
+//! - 元数据不是流所有权：不参与消息指纹、不阻塞 finalize。同步只收不发（ptp4g#44）：
+//!   pull 把电脑端 `assistantContextMetricRounds`（纯 round 数组）合并进本列，push 不带。
 //! - 附件估算照搬桌面端 modules/vcpClient.js 的 estimate*Tokens（桌面端未展示此项）。
 
 use serde_json::{json, Value};
@@ -180,6 +181,25 @@ pub fn estimate_attachment_tokens(messages: &Value) -> u64 {
 
 pub fn encode_payload(rounds: &[Value], attachment_tokens: u64) -> Value {
     json!({ "rounds": rounds, "attachmentTokenEstimate": attachment_tokens })
+}
+
+/// ptp4g#44：把电脑端透传的 round 数组按 roundIndex 合入本地 payload（同轮以电脑为准），
+/// 保留本端 attachmentTokenEstimate。入参没有有效 round 时返回 None，调用方不写库。
+pub fn merge_payload(existing: Option<&str>, incoming: &[Value]) -> Option<String> {
+    let incoming: Vec<Value> = incoming.iter().filter_map(normalize_round).collect();
+    if incoming.is_empty() {
+        return None;
+    }
+    let mut collector = RoundCollector::default();
+    let mut attachment_tokens = 0;
+    if let Some(previous) = existing.and_then(|raw| serde_json::from_str::<Value>(raw).ok()) {
+        collector.extend(previous["rounds"].as_array().cloned().unwrap_or_default());
+        attachment_tokens = previous["attachmentTokenEstimate"].as_u64().unwrap_or(0);
+    }
+    for round in incoming {
+        collector.record(round);
+    }
+    Some(encode_payload(&collector.to_vec(), attachment_tokens).to_string())
 }
 
 /// 流结束、finalize 之前写入（pending 行已存在）；只改 context_metrics 列，

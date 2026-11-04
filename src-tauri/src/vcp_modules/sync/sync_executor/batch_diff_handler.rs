@@ -473,6 +473,7 @@ impl BatchDiffHandler {
                         &pull_batch,
                         write_queue,
                         prerender_enabled,
+                        false,
                     )
                     .await
                     .map(|results| {

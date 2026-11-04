@@ -152,7 +152,7 @@ async fn read_agent_config_locked<R: Runtime>(
     if let Some(row) = agent_row {
         use sqlx::Row;
         let topic_rows = sqlx::query(
-            "SELECT topic_id, title, created_at, locked, unread, unread_count, msg_count 
+            "SELECT topic_id, title, created_at, locked, unread, pinned, unread_count, msg_count
              FROM topics WHERE owner_type = 'agent' AND owner_id = ? AND deleted_at IS NULL ORDER BY updated_at DESC"
         )
         .bind(agent_id)
@@ -168,6 +168,7 @@ async fn read_agent_config_locked<R: Runtime>(
                 created_at: tr.get("created_at"),
                 locked: tr.get::<i32, _>("locked") != 0,
                 unread: tr.get::<i32, _>("unread") != 0,
+                pinned: tr.get::<i32, _>("pinned") != 0,
                 unread_count: tr.get("unread_count"),
                 msg_count: tr.get("msg_count"),
                 owner_id: agent_id.to_string(),
@@ -557,6 +558,7 @@ pub async fn create_agent(
             created_at: timestamp,
             locked: true,
             unread: false,
+            pinned: false,
             unread_count: 0,
             msg_count: 0,
             owner_id: agent_id.clone(),

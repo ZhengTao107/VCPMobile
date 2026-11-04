@@ -2635,6 +2635,31 @@ async fn run_sync_session(
                                             let _ = close_ws_with_deadline(&mut ws_stream).await;
                                             break;
                                         }
+                                        // ptp4g#44：收尾成功后后台回填历史用量（已完成则立即返回），不阻塞确认。
+                                        {
+                                            let h = handle_clone.clone();
+                                            let c = http_client.clone();
+                                            let base = http_url.clone();
+                                            let token = sync_token.clone();
+                                            let wq = write_queue_task.clone();
+                                            task_tracker
+                                                .spawn(async move {
+                                                    match crate::vcp_modules::sync::context_metrics_backfill::run(
+                                                        &h, &c, &base, &token, &wq,
+                                                    )
+                                                    .await
+                                                    {
+                                                        Ok(Some(count)) => log::info!(
+                                                            "[ContextMetricsBackfill] done, requested {count} messages"
+                                                        ),
+                                                        Ok(None) => {}
+                                                        Err(error) => log::warn!(
+                                                            "[ContextMetricsBackfill] will retry next sync: {error}"
+                                                        ),
+                                                    }
+                                                })
+                                                .await;
+                                        }
                                         let final_ack = FinalAckKey::new(session_id, attempt_id);
                                         match send_ws_frame(&mut ws_stream, &final_ack.message()).await
                                         {

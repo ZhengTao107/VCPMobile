@@ -176,24 +176,33 @@ impl HashAggregator {
     pub fn compute_agent_topic_metadata_hash(dto: &AgentTopicSyncDTO) -> String {
         // 排除 owner_id，仅使用 topic 自身属性计算 hash
         // 确保与桌面端 AGENT_TOPIC_SYNC_FIELDS ["id","name","createdAt","locked","unread"] 一致
-        let meta = serde_json::json!({
+        let mut meta = serde_json::json!({
             "id": &dto.id,
             "name": &dto.name,
             "createdAt": dto.created_at,
             "locked": dto.locked,
             "unread": dto.unread,
         });
+        // ptp4g#44：pinned 只在 true 时计入（与桌面 computeDtoHash 跳过空值同语义），
+        // 未置顶话题哈希与旧版逐字节一致。
+        if dto.pinned {
+            meta["pinned"] = serde_json::Value::Bool(true);
+        }
         compute_deterministic_hash(&meta)
     }
 
     pub fn compute_group_topic_metadata_hash(dto: &GroupTopicSyncDTO) -> String {
         // 排除 owner_id，仅使用 topic 自身属性计算 hash
-        // 确保与桌面端 GROUP_TOPIC_SYNC_FIELDS ["id","name","createdAt"] 一致
-        let meta = serde_json::json!({
+        // 确保与桌面端 GROUP_TOPIC_SYNC_FIELDS ["id","name","createdAt","pinned"] 一致；
+        // pinned 只在 true 时计入，未置顶群组话题哈希与旧版逐字节一致。
+        let mut meta = serde_json::json!({
             "id": &dto.id,
             "name": &dto.name,
             "createdAt": dto.created_at,
         });
+        if dto.pinned {
+            meta["pinned"] = serde_json::Value::Bool(true);
+        }
         compute_deterministic_hash(&meta)
     }
 
@@ -481,7 +490,7 @@ impl SyncDtoLoader {
         key: &TopicKey,
     ) -> Result<AgentTopicSyncDTO, String> {
         let row = sqlx::query(
-            "SELECT topic_id, title, created_at, locked, unread, owner_id,
+            "SELECT topic_id, title, created_at, locked, unread, pinned, owner_id,
                     config_hash, updated_at FROM topics
              WHERE owner_type = 'agent' AND owner_id = ? AND topic_id = ? AND deleted_at IS NULL",
         )
@@ -510,6 +519,9 @@ impl SyncDtoLoader {
             unread: row.try_get::<i64, _>("unread").map_err(|error| {
                 format!("Agent topic {} unread decode failed: {error}", key.topic_id)
             })? != 0,
+            pinned: row.try_get::<i64, _>("pinned").map_err(|error| {
+                format!("Agent topic {} pinned decode failed: {error}", key.topic_id)
+            })? != 0,
             owner_id: row.try_get("owner_id").map_err(|error| {
                 format!("Agent topic {} owner decode failed: {error}", key.topic_id)
             })?,
@@ -533,7 +545,7 @@ impl SyncDtoLoader {
         key: &TopicKey,
     ) -> Result<GroupTopicSyncDTO, String> {
         let row = sqlx::query(
-            "SELECT topic_id, title, created_at, owner_id, config_hash, updated_at FROM topics
+            "SELECT topic_id, title, created_at, pinned, owner_id, config_hash, updated_at FROM topics
              WHERE owner_type = 'group' AND owner_id = ? AND topic_id = ? AND deleted_at IS NULL",
         )
         .bind(&key.owner_id)
@@ -555,6 +567,9 @@ impl SyncDtoLoader {
                     key.topic_id
                 )
             })?,
+            pinned: row.try_get::<i64, _>("pinned").map_err(|error| {
+                format!("Group topic {} pinned decode failed: {error}", key.topic_id)
+            })? != 0,
             owner_id: row.try_get("owner_id").map_err(|error| {
                 format!("Group topic {} owner decode failed: {error}", key.topic_id)
             })?,
@@ -809,6 +824,7 @@ mod tests {
             created_at: 123,
             locked: true,
             unread: false,
+            pinned: false,
             owner_id: "agent-a".to_string(),
             config_hash: "a".repeat(64),
             updated_at: 456,
@@ -827,6 +843,7 @@ mod tests {
             id: "topic-1".to_string(),
             name: "Topic".to_string(),
             created_at: 123,
+            pinned: false,
             owner_id: "group-a".to_string(),
             config_hash: "b".repeat(64),
             updated_at: 456,
@@ -840,6 +857,49 @@ mod tests {
             HashAggregator::compute_group_topic_metadata_hash(&group_topic),
             HashAggregator::compute_group_topic_metadata_hash(&same_metadata_other_owner)
         );
+    }
+
+    /// ptp4g#44 对拍：未置顶话题哈希必须与加 pinned 之前的 json! 写法逐字节一致；
+    /// 置顶后只多出 "pinned": true 一项。
+    #[test]
+    fn agent_topic_hash_counts_pinned_only_when_true() {
+        let mut topic = AgentTopicSyncDTO {
+            id: "topic-1".to_string(),
+            name: "置顶对拍".to_string(),
+            created_at: 1_730_000_000_000,
+            locked: false,
+            unread: true,
+            pinned: false,
+            owner_id: "agent-a".to_string(),
+            config_hash: "a".repeat(64),
+            updated_at: 456,
+        };
+        let legacy = compute_deterministic_hash(&serde_json::json!({
+            "id": "topic-1",
+            "name": "置顶对拍",
+            "createdAt": 1_730_000_000_000_i64,
+            "locked": false,
+            "unread": true,
+        }));
+        assert_eq!(
+            HashAggregator::compute_agent_topic_metadata_hash(&topic),
+            legacy
+        );
+
+        topic.pinned = true;
+        let pinned = compute_deterministic_hash(&serde_json::json!({
+            "id": "topic-1",
+            "name": "置顶对拍",
+            "createdAt": 1_730_000_000_000_i64,
+            "locked": false,
+            "unread": true,
+            "pinned": true,
+        }));
+        assert_eq!(
+            HashAggregator::compute_agent_topic_metadata_hash(&topic),
+            pinned
+        );
+        assert_ne!(pinned, legacy);
     }
 
     async fn compute_owner_root(tx: &mut SqliteConnection, owner_type: &str) -> String {

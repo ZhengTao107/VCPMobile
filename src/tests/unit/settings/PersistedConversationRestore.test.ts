@@ -209,8 +209,11 @@ describe('real Pinia persisted-state conversation restoration', () => {
     await first.session.selectTopicById(ownerId, 'agent', 'agent-topic');
     await first.session.selectTopicById(ownerId, 'group', 'group-topic');
     first.topics.setSortMode('updated');
-    first.topics.toggleTopicPinned(ownerId, 'agent', 'agent-topic');
-    first.topics.toggleTopicPinned(ownerId, 'group', 'group-topic');
+    // ptp4g#44 前的版本把置顶存在 pinia persist：模拟旧数据，验证读兼容与一次性迁入 DB。
+    first.topics.pinnedTopicKeys = [
+      JSON.stringify(['agent', ownerId, 'agent-topic']),
+      JSON.stringify(['group', ownerId, 'group-topic']),
+    ];
     first.topics.topics = [groupTopic('transient-topic')];
     first.topics.searchTerm = 'transient search';
     first.topics.loading = true;
@@ -243,6 +246,10 @@ describe('real Pinia persisted-state conversation restoration', () => {
     expect(restored.session.currentSelectedItem?.name).toBe('Renamed on server');
     expect(restored.session.headerTitle).toBe('Current server topic');
     expect(restored.topics.topicSections.pinned.map(topic => topic.id)).toEqual(['group-topic']);
+    expect(invokeMock).toHaveBeenCalledWith('migrate_legacy_topic_pins', {
+      pins: expect.arrayContaining([{ ownerId, ownerType: 'group', topicId: 'group-topic' }]),
+    });
+    expect(restored.topics.pinnedTopicKeys).toEqual([]);
     expect(invokeMock).toHaveBeenCalledWith('get_topics_streamed', expect.objectContaining({
       ownerId, ownerType: 'group', sortMode: 'updated',
     }));
@@ -252,7 +259,7 @@ describe('real Pinia persisted-state conversation restoration', () => {
     const first = startFrontend();
     await first.assistants.fetchAgentsAndGroups();
     await first.session.selectTopicById(ownerId, 'group', 'deleted-topic');
-    first.topics.toggleTopicPinned(ownerId, 'group', 'deleted-topic');
+    first.topics.pinnedTopicKeys = [JSON.stringify(['group', ownerId, 'deleted-topic'])];
     await nextTick();
     stopFrontend(first.pinia);
 

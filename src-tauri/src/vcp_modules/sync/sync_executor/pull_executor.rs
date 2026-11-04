@@ -446,6 +446,7 @@ async fn process_topic_messages(
     parsed_messages: Vec<crate::vcp_modules::sync_dto::MessageSyncDTO>,
     write_queue: &DbWriteQueue,
     prerender_enabled: bool,
+    metrics_only: bool,
 ) -> Result<(), String> {
     if !parsed_messages.is_empty() {
         // 1. 将预渲染和 Zstd 压缩移至 blocking 线程池；消息指纹直接使用 Wire 值。
@@ -453,8 +454,9 @@ async fn process_topic_messages(
         let prepared_writes = tokio::task::spawn_blocking(move || {
             let mut writes = Vec::with_capacity(parsed_messages.len());
 
-            for dto in parsed_messages {
+            for mut dto in parsed_messages {
                 let content_hash = dto.content_hash.clone();
+                let context_metric_rounds = dto.assistant_context_metric_rounds.take();
                 let msg = crate::vcp_modules::chat_manager::ChatMessage::from(dto);
 
                 // B. 预渲染（按开关控制）
@@ -486,6 +488,8 @@ async fn process_topic_messages(
                     message: msg,
                     render_bytes: rb,
                     content_hash,
+                    context_metric_rounds,
+                    metrics_only,
                 });
             }
 
@@ -842,6 +846,7 @@ impl PullExecutor {
         requests: &[(TopicKey, Vec<String>)], // (topic identity, msg_ids)，空 vec = 拉全部消息
         write_queue: &DbWriteQueue,
         prerender_enabled: bool,
+        metrics_only: bool,
     ) -> Result<Vec<BatchPullResult>, String> {
         if requests.is_empty() {
             return Ok(Vec::new());
@@ -1084,8 +1089,14 @@ impl PullExecutor {
                 let legacy_attachment_warnings = frame.legacy_attachment_warnings;
 
                 spawn_handles.spawn(async move {
-                    match process_topic_messages(&key, pull_dtos, &wq_clone, prerender_enabled)
-                        .await
+                    match process_topic_messages(
+                        &key,
+                        pull_dtos,
+                        &wq_clone,
+                        prerender_enabled,
+                        metrics_only,
+                    )
+                    .await
                     {
                         Ok(()) => {
                             let _ = tx_clone
@@ -1169,8 +1180,14 @@ impl PullExecutor {
                     let wq_clone = write_queue.clone();
                     let tx_clone = tx.clone();
                     spawn_handles.spawn(async move {
-                        match process_topic_messages(&key, pull_dtos, &wq_clone, prerender_enabled)
-                            .await
+                        match process_topic_messages(
+                            &key,
+                            pull_dtos,
+                            &wq_clone,
+                            prerender_enabled,
+                            metrics_only,
+                        )
+                        .await
                         {
                             Ok(()) => {
                                 let _ = tx_clone
@@ -1387,6 +1404,7 @@ mod ndjson_frame_tests {
                 finish_reason: None,
                 attachments: None,
                 content_hash: "a".repeat(64),
+                assistant_context_metric_rounds: None,
             },
             crate::vcp_modules::sync_dto::MessageSyncDTO {
                 id: "message-b".into(),
@@ -1402,6 +1420,7 @@ mod ndjson_frame_tests {
                 finish_reason: None,
                 attachments: None,
                 content_hash: "b".repeat(64),
+                assistant_context_metric_rounds: None,
             },
         ];
         assert!(validate_requested_message_ids(

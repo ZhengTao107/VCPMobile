@@ -1171,6 +1171,12 @@ mod group_turn_tests {
             .execute(&pool)
             .await
             .unwrap();
+        sqlx::raw_sql(include_str!(
+            "../../../migrations/9002_add_topic_pinned.sql"
+        ))
+        .execute(&pool)
+        .await
+        .unwrap();
         for (id, role, agent, timestamp, deleted) in [
             ("a-old", "assistant", Some("a"), 1, None),
             ("a-new", "assistant", Some("a"), 2, None),
@@ -1237,6 +1243,12 @@ mod group_turn_tests {
             .unwrap();
         sqlx::raw_sql(include_str!(
             "../../../migrations/0102_stream_stop_intent.sql"
+        ))
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::raw_sql(include_str!(
+            "../../../migrations/9002_add_topic_pinned.sql"
         ))
         .execute(&pool)
         .await
@@ -1387,6 +1399,12 @@ mod group_turn_tests {
         .execute(&pool)
         .await
         .expect("stream stop schema");
+        sqlx::raw_sql(include_str!(
+            "../../../migrations/9002_add_topic_pinned.sql"
+        ))
+        .execute(&pool)
+        .await
+        .expect("topic pinned schema");
         sqlx::raw_sql(
             "INSERT INTO agents (owner_type, agent_id, name, model, updated_at)
              VALUES ('agent', 'first', 'First', 'test', 1),

@@ -1886,6 +1886,12 @@ mod tests {
             .execute(&mut db)
             .await
             .unwrap();
+        sqlx::raw_sql(include_str!(
+            "../../../migrations/9002_add_topic_pinned.sql"
+        ))
+        .execute(&mut db)
+        .await
+        .unwrap();
         sqlx::raw_sql(include_str!("../../../migrations/0101_current_share.sql"))
             .execute(&mut db)
             .await

@@ -14,6 +14,7 @@ import {
   channelInstances,
   invokeMock,
   mockInvoke,
+  type MockChannel,
 } from "@/tests/mocks/tauri";
 
 vi.mock("vue-router", () => ({
@@ -101,7 +102,8 @@ describe("topic list concurrency guards", () => {
       "tie-a",
     ]);
 
-    store.toggleTopicPinned("agent-a", "agent", "same-topic");
+    store.topics = [...store.topics, topic("same-topic")];
+    void store.toggleTopicPinned("agent-a", "agent", "same-topic");
     expect(store.isTopicPinned("agent-a", "agent", "same-topic")).toBe(true);
     expect(store.isTopicPinned("agent-b", "agent", "same-topic")).toBe(false);
     expect(store.isTopicPinned("agent-a", "group", "same-topic")).toBe(false);
@@ -127,15 +129,65 @@ describe("topic list concurrency guards", () => {
     expect(store.topics.map((item) => item.id)).toEqual(["topic-b", "topic-a"]);
   });
 
-  it("persists the global sort mode and local pinned topic keys", async () => {
+  it("persists the global sort mode while pins are written to the database", async () => {
     const first = createPersistedTopicStore();
     first.setSortMode("updated");
-    first.toggleTopicPinned("agent-a", "agent", "topic-a");
+    first.topics = [topic("topic-a")];
+    await expect(first.toggleTopicPinned("agent-a", "agent", "topic-a")).resolves.toBe(true);
+    expect(invokeMock).toHaveBeenCalledWith("set_topic_pinned", {
+      ownerId: "agent-a",
+      ownerType: "agent",
+      topicId: "topic-a",
+      pinned: true,
+    });
+    expect(first.isTopicPinned("agent-a", "agent", "topic-a")).toBe(true);
+    expect(first.pinnedTopicKeys).toEqual([]);
     await nextTick();
 
     const restored = createPersistedTopicStore();
     expect(restored.effectiveSortMode).toBe("updated");
-    expect(restored.isTopicPinned("agent-a", "agent", "topic-a")).toBe(true);
+    // 置顶不再进 pinia，重启后由 DB 列表重新带回
+    expect(restored.isTopicPinned("agent-a", "agent", "topic-a")).toBe(false);
+  });
+
+  it("rolls back a failed optimistic pin and unpins through the database", async () => {
+    const store = useTopicStore();
+    store.topics = [topic("topic-a")];
+    mockInvoke("set_topic_pinned", () => Promise.reject(new Error("db down")));
+    await expect(store.toggleTopicPinned("agent-a", "agent", "topic-a")).rejects.toThrow("db down");
+    expect(store.isTopicPinned("agent-a", "agent", "topic-a")).toBe(false);
+
+    mockInvoke("set_topic_pinned", (args) => (args?.pinned ? 50 : 60));
+    await expect(store.toggleTopicPinned("agent-a", "agent", "topic-a")).resolves.toBe(true);
+    expect(store.topics[0]).toMatchObject({ pinned: true, updatedAt: 50 });
+    await expect(store.toggleTopicPinned("agent-a", "agent", "topic-a")).resolves.toBe(false);
+    expect(store.topics[0]).toMatchObject({ pinned: false, updatedAt: 60 });
+    expect(store.isTopicPinned("agent-a", "agent", "topic-a")).toBe(false);
+  });
+
+  it("reads legacy pinned keys and migrates them into the database once", async () => {
+    const store = useTopicStore();
+    store.pinnedTopicKeys = [
+      JSON.stringify(["agent", "agent-a", "topic-a"]),
+      JSON.stringify(["agent", "agent-a", "gone"]),
+    ];
+    expect(store.isTopicPinned("agent-a", "agent", "topic-a")).toBe(true);
+    const migrated: unknown[] = [];
+    mockInvoke("migrate_legacy_topic_pins", (args) => {
+      migrated.push(args?.pins);
+      return 1;
+    });
+    mockInvoke("get_topics_streamed", (args) => {
+      (args?.onChunk as MockChannel<Topic[]>).emit([topic("topic-a")]);
+    });
+
+    await store.loadTopicList("agent-a", "agent");
+    expect(migrated).toEqual([[{ ownerId: "agent-a", ownerType: "agent", topicId: "topic-a" }]]);
+    expect(store.pinnedTopicKeys).toEqual([]);
+    expect(store.topicSections.pinned.map((item) => item.id)).toEqual(["topic-a"]);
+
+    await store.loadTopicList("agent-a", "agent");
+    expect(migrated).toHaveLength(1);
   });
 
 
