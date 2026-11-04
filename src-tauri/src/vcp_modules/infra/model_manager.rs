@@ -261,6 +261,32 @@ pub async fn import_favorite_models(
 
 pub use import_favorite_models as import_model_favorites;
 
+/// 以电脑端 `model_favorites.json` 为准整表替换收藏（ptp4g#47）：先清空再按数组顺序写入，
+/// `created_at` 递减分配，使 `export_favorite_models`（DESC）读回的顺序与数组一致。
+pub async fn replace_favorite_models(
+    connection: &mut sqlx::SqliteConnection,
+    models: &[String],
+) -> Result<(), String> {
+    sqlx::query("DELETE FROM model_favorites")
+        .execute(&mut *connection)
+        .await
+        .map_err(|e| format!("清空模型收藏失败: {e}"))?;
+    import_favorite_models(connection, models).await
+}
+
+/// 由 libraryRemote 在拉到电脑端收藏后调用；返回写入后的收藏顺序。
+#[tauri::command]
+pub async fn sync_replace_favorite_models<R: Runtime>(
+    app: AppHandle<R>,
+    models: Vec<String>,
+) -> Result<Vec<String>, String> {
+    let db_state = app.state::<DbState>();
+    let mut tx = db_state.write_transaction("model.favorite.replace").await?;
+    replace_favorite_models(&mut tx, &models).await?;
+    tx.commit().await.map_err(|e| e.to_string())?;
+    export_favorite_models(&db_state).await
+}
+
 #[tauri::command]
 pub async fn toggle_favorite_model<R: Runtime>(
     app: AppHandle<R>,
@@ -642,5 +668,36 @@ mod cache_tests {
         let db = DbState::new(pool, std::path::PathBuf::new());
         let exported = export_favorite_models(&db).await.unwrap();
         assert_eq!(exported, models);
+    }
+
+    #[tokio::test]
+    async fn test_replace_favorite_models_drops_extras_and_keeps_order() {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::query(
+            "CREATE TABLE model_favorites (model_id TEXT PRIMARY KEY, created_at BIGINT NOT NULL)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query("INSERT INTO model_favorites VALUES ('local-only', 1), ('b', 2)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let models = vec!["a".to_string(), "b".to_string(), " a ".to_string()];
+        {
+            let mut conn = pool.acquire().await.unwrap();
+            replace_favorite_models(&mut conn, &models).await.unwrap();
+        }
+        let db = DbState::new(pool.clone(), std::path::PathBuf::new());
+        assert_eq!(export_favorite_models(&db).await.unwrap(), vec!["a", "b"]);
+        {
+            let mut conn = pool.acquire().await.unwrap();
+            replace_favorite_models(&mut conn, &[]).await.unwrap();
+        }
+        assert!(export_favorite_models(&db).await.unwrap().is_empty());
     }
 }

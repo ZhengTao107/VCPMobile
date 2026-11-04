@@ -5,6 +5,7 @@ export type SettingsPageId =
   | 'connection'
   | 'theme'
   | 'rendering'
+  | 'prompts'
   | 'voice'
   | 'jev'
   | 'advanced'

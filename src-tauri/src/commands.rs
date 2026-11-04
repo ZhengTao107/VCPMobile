@@ -112,7 +112,7 @@ macro_rules! app_command_handler {
         use crate::vcp_modules::model_manager::{
             get_cached_models, get_favorite_models, get_hot_models, record_model_usage,
             refresh_models, start_batch_model_test, stop_all_model_tests, test_model_connectivity,
-            toggle_favorite_model,
+            sync_replace_favorite_models, toggle_favorite_model,
         };
         use crate::vcp_modules::settings_manager::{
             export_config_domains, export_group_preferences, import_settings_backup,
@@ -145,6 +145,10 @@ macro_rules! app_command_handler {
             sidechat_delete, sidechat_forget_base, sidechat_local_list, sidechat_local_read,
             sidechat_local_remove, sidechat_local_status, sidechat_local_write, sidechat_manifest,
             sidechat_pull, sidechat_push, sidechat_save_conflict,
+        };
+        use crate::vcp_modules::sync::library_sync::{
+            library_local_list, library_local_read, library_local_remove, library_local_write,
+            library_pull, library_push,
         };
         use crate::vcp_modules::sync::open_tabs::{open_tabs_get, open_tabs_put};
         use crate::vcp_modules::sync::settings_sync::{settings_sync_get, settings_sync_put};
@@ -413,6 +417,7 @@ macro_rules! app_command_handler {
                 stop_all_model_tests,
                 test_model_connectivity,
                 toggle_favorite_model,
+                sync_replace_favorite_models,
                 // ── VCP 信息 / 日志通道（vcp_info_service / vcp_log_service）──
                 clear_vcp_info,
                 get_vcp_info_connection_status,
@@ -442,6 +447,12 @@ macro_rules! app_command_handler {
                 open_tabs_put,
                 settings_sync_get,
                 settings_sync_put,
+                library_pull,
+                library_push,
+                library_local_list,
+                library_local_read,
+                library_local_write,
+                library_local_remove,
                 canvas_manifest,
                 canvas_pull,
                 canvas_push,

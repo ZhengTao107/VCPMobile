@@ -3,6 +3,7 @@ pub mod canvas_shared_translation;
 pub mod canvas_sync;
 pub mod canvas_translate;
 pub mod context_metrics_backfill;
+pub mod library_sync;
 pub mod open_tabs;
 pub mod settings_sync;
 pub mod sidechat_sync;
