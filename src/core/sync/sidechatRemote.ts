@@ -64,6 +64,8 @@ export interface SidechatSyncSummary {
   deletedRemote?: number;
   /** 双向模式：双改另存冲突副本的文件数。 */
   conflicts?: number;
+  /** 子话题生成中、本轮跳过的条目数（结束后由发送方补一轮）。 */
+  busy?: number;
   unchanged: number;
   failed: number;
 }
@@ -169,7 +171,22 @@ export interface SidechatRemoteDeps {
   saveConflict?: (path: string) => Promise<void>;
   /** 两端都已没有该文件时清掉基线。 */
   forget?: (path: string) => Promise<void>;
+  /** 该路径所属子话题是否正在生成；默认读本模块的 busy 登记。 */
+  isBusy?: (path: string) => boolean;
   now?: () => number;
+}
+
+const busyChildren = new Set<string>();
+
+/** 发送方在生成期间登记子话题目录（`UserData/<owner>/topics/<id>`）。 */
+export function setSidechatBusy(dir: string, busy: boolean): void {
+  if (busy) busyChildren.add(dir);
+  else busyChildren.delete(dir);
+}
+
+export function isSidechatPathBusy(path: string): boolean {
+  for (const dir of busyChildren) if (path.startsWith(`${dir}/`)) return true;
+  return false;
 }
 
 export interface SidechatRemote {
@@ -179,6 +196,7 @@ export interface SidechatRemote {
 
 export function createSidechatRemote(deps: SidechatRemoteDeps): SidechatRemote {
   const now = deps.now ?? Date.now;
+  const isBusy = deps.isBusy ?? isSidechatPathBusy;
   const known = new Map<string, string>();
   let backoffUntil = 0;
   let inflight: Promise<SidechatSyncSummary | null> | null = null;
@@ -227,6 +245,11 @@ export function createSidechatRemote(deps: SidechatRemoteDeps): SidechatRemote {
       await pullInto(path, sha256);
     };
     for (const action of actions) {
+      // 生成中不覆盖、不删除、不上推半截历史；结束后发送方会补一轮。
+      if (isBusy(action.path)) {
+        summary.busy = (summary.busy ?? 0) + 1;
+        continue;
+      }
       try {
         switch (action.kind) {
           case "download":
@@ -301,6 +324,10 @@ export function createSidechatRemote(deps: SidechatRemoteDeps): SidechatRemote {
         summary.unchanged += 1;
         continue;
       }
+      if (isBusy(file.path)) {
+        summary.busy = (summary.busy ?? 0) + 1;
+        continue;
+      }
       try {
         const result = await deps.pull(target, file.path, file.sha256);
         if (result.status === 200 && result.sha256) {
@@ -324,7 +351,7 @@ export function createSidechatRemote(deps: SidechatRemoteDeps): SidechatRemote {
       }
       const isMeta = (path: string) => Number(path.endsWith(`/${CHILD_META}`));
       const stale = entries
-        .filter((entry) => !live.has(entry.path))
+        .filter((entry) => !live.has(entry.path) && !isBusy(entry.path))
         .sort((a, b) => isMeta(a.path) - isMeta(b.path));
       if (stale.length > SIDECHAT_MAX_DELETES_PER_ROUND) {
         summary.held = stale.length;
