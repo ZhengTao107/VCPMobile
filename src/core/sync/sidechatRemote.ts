@@ -14,6 +14,8 @@ import { useSettingsStore } from "../stores/settings";
 import { hintTargetFromSettings, onRemoteHint, type HintTarget } from "./remoteChangeHint";
 
 export const SIDECHAT_BACKOFF_MS = 60_000;
+/** 单轮删除本机镜像的安全阀。 */
+export const SIDECHAT_MAX_DELETES_PER_ROUND = 20;
 const CHILD_META = "sidechat-child.json";
 
 export interface SidechatManifestFile {
@@ -52,6 +54,10 @@ export interface SidechatMessage {
 }
 export interface SidechatSyncSummary {
   pulled: number;
+  /** 电脑端已删、本轮从本机镜像删掉的文件数。 */
+  removed?: number;
+  /** 超过安全阀暂缓删除的文件数。 */
+  held?: number;
   unchanged: number;
   failed: number;
 }
@@ -79,6 +85,8 @@ export interface SidechatRemoteDeps {
   getTarget: () => HintTarget | null;
   fetchManifest: (target: HintTarget) => Promise<SidechatHttpResponse>;
   pull: (target: HintTarget, path: string, sha256: string) => Promise<SidechatPullResult>;
+  listLocal?: () => Promise<SidechatLocalEntry[]>;
+  removeLocal?: (path: string) => Promise<boolean>;
   now?: () => number;
 }
 
@@ -128,6 +136,33 @@ export function createSidechatRemote(deps: SidechatRemoteDeps): SidechatRemote {
         }
       } catch {
         summary.failed += 1;
+      }
+    }
+    if (deps.listLocal && deps.removeLocal) {
+      const live = new Set(files.map((file) => file.path));
+      let entries: SidechatLocalEntry[] = [];
+      try {
+        entries = await deps.listLocal();
+      } catch {
+        entries = [];
+      }
+      const isMeta = (path: string) => Number(path.endsWith(`/${CHILD_META}`));
+      const stale = entries
+        .filter((entry) => !live.has(entry.path))
+        .sort((a, b) => isMeta(a.path) - isMeta(b.path));
+      if (stale.length > SIDECHAT_MAX_DELETES_PER_ROUND) {
+        summary.held = stale.length;
+      } else {
+        let removed = 0;
+        for (const entry of stale) {
+          try {
+            if (await deps.removeLocal(entry.path)) removed += 1;
+            known.delete(entry.path);
+          } catch {
+            summary.failed += 1;
+          }
+        }
+        if (removed) summary.removed = removed;
       }
     }
     return summary;
@@ -254,6 +289,8 @@ export function useSidechatRemote(isForeground: () => boolean): () => void {
         path,
         sha256,
       }),
+    listLocal: () => invoke<SidechatLocalEntry[]>("sidechat_local_list"),
+    removeLocal: (path) => invoke<boolean>("sidechat_local_remove", { path }),
   });
   activeRemote = remote;
   const stopTarget = watch(

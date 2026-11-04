@@ -147,6 +147,12 @@ const openDoc = (name: string) => {
   tabsStore.openCanvasTab(name);
 };
 
+/** 删除文稿：三端一起删（离线时下次同步补推）。 */
+const removeDoc = async (name: string) => {
+  if (!window.confirm(`删除「${name}」？电脑和 Mac 上也会一起删除。`)) return;
+  await canvas.deleteDoc(name);
+};
+
 /** 返回：文稿 → 列表（标签保留）；列表 → 离开 Canvas 回聊天。 */
 const goBack = async () => {
   if (current.value) {
@@ -262,10 +268,10 @@ onBeforeUnmount(() => {
 
     <ul v-if="!current" class="flex-1 min-h-0 overflow-y-auto p-2">
       <li v-if="!docs.length" class="p-4 text-[13px] opacity-60 text-[var(--primary-text)]">还没有文稿</li>
-      <li v-for="doc in docs" :key="doc.name">
+      <li v-for="doc in docs" :key="doc.name" class="flex items-center gap-1">
         <button
           type="button"
-          class="w-full text-left px-3 py-2.5 rounded-xl hover:bg-[var(--secondary-bg)] text-[var(--primary-text)]"
+          class="flex-1 min-w-0 text-left px-3 py-2.5 rounded-xl hover:bg-[var(--secondary-bg)] text-[var(--primary-text)]"
           @click="openDoc(doc.name)"
         >
           <span class="block truncate text-[14px]">{{ doc.name }}</span>
@@ -273,6 +279,14 @@ onBeforeUnmount(() => {
             {{ formatTime(doc.mtime) }}<template v-if="doc.localOnly"> · 仅手机</template>
             <template v-else-if="doc.baseSha !== doc.sha256"> · 未同步</template>
           </span>
+        </button>
+        <button
+          type="button"
+          class="shrink-0 px-2 py-2 rounded-lg text-[12px] opacity-60 hover:opacity-100 text-[var(--primary-text)]"
+          :aria-label="`删除 ${doc.name}`"
+          @click="removeDoc(doc.name)"
+        >
+          删除
         </button>
       </li>
     </ul>
