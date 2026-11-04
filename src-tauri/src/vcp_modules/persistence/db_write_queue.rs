@@ -1004,6 +1004,7 @@ mod tests {
                 created_at: 2,
                 locked: false,
                 unread: true,
+                pinned: false,
                 owner_id: "agent-live".into(),
                 config_hash: "a".repeat(64),
                 updated_at: 2,
@@ -1183,6 +1184,7 @@ mod tests {
                 created_at: 1,
                 locked: true,
                 unread: false,
+                pinned: false,
                 owner_id: "agent-b".into(),
                 config_hash: "c".repeat(64),
                 updated_at: 2,
@@ -1876,15 +1878,15 @@ impl DbWriteQueue {
             )));
         }
         let changed = tx.execute(
-            "INSERT INTO topics (topic_id, title, owner_id, owner_type, created_at, locked, unread, config_hash, updated_at)
-            SELECT ?, ?, ?, 'agent', ?, ?, ?, ?, ?
+            "INSERT INTO topics (topic_id, title, owner_id, owner_type, created_at, locked, unread, pinned, config_hash, updated_at)
+            SELECT ?, ?, ?, 'agent', ?, ?, ?, ?, ?, ?
             WHERE EXISTS (
                 SELECT 1 FROM agents
                 WHERE owner_type = 'agent' AND agent_id = ? AND deleted_at IS NULL
             )
             ON CONFLICT(owner_type, owner_id, topic_id) DO UPDATE SET
             title=excluded.title, created_at=excluded.created_at,
-            locked=excluded.locked, unread=excluded.unread,
+            locked=excluded.locked, unread=excluded.unread, pinned=excluded.pinned,
             unread_count=CASE
                 WHEN excluded.unread = 0 THEN 0
                 ELSE topics.unread_count
@@ -1899,6 +1901,7 @@ impl DbWriteQueue {
                 topic_id, &dto.name, &dto.owner_id, dto.created_at,
                 if dto.locked { 1 } else { 0 },
                 if dto.unread { 1 } else { 0 },
+                if dto.pinned { 1 } else { 0 },
                 &dto.config_hash, dto.updated_at, &dto.owner_id
             ]
         )?;

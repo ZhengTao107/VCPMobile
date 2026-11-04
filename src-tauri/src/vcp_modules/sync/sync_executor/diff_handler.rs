@@ -413,7 +413,7 @@ impl DiffHandler {
                     for chunk in requested_topics.chunks(TOPIC_QUERY_CHUNK) {
                         let placeholders = vec!["(?, ?, ?)"; chunk.len()].join(", ");
                         let query_sql = format!(
-                            "SELECT topic_id, title, created_at, locked, unread, owner_id, owner_type,
+                            "SELECT topic_id, title, created_at, locked, unread, pinned, owner_id, owner_type,
                                     config_hash, updated_at
                              FROM topics
                              WHERE (owner_type, owner_id, topic_id) IN ({placeholders})
@@ -472,6 +472,8 @@ impl DiffHandler {
                                         .map_err(|error| format!("locked: {error}"))?,
                                     row.try_get::<i64, _>("unread")
                                         .map_err(|error| format!("unread: {error}"))?,
+                                    row.try_get::<i64, _>("pinned")
+                                        .map_err(|error| format!("pinned: {error}"))?,
                                     row.try_get::<String, _>("owner_id")
                                         .map_err(|error| format!("owner_id: {error}"))?,
                                     row.try_get::<String, _>("owner_type")
@@ -486,6 +488,7 @@ impl DiffHandler {
                                 created_at,
                                 locked,
                                 unread,
+                                pinned,
                                 owner_id,
                                 owner_type,
                                 config_hash,
@@ -518,6 +521,7 @@ impl DiffHandler {
                                         created_at,
                                         locked: locked != 0,
                                         unread: unread != 0,
+                                        pinned: pinned != 0,
                                         owner_id,
                                         config_hash,
                                         updated_at,
