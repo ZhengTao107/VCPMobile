@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, ref, watch } from "vue";
-import { renderSafeMarkdown } from "../../core/utils/safeMarkdown";
+import { renderCanvasMarkdown } from "./canvasMarkdown";
+import "./canvasDocument.css";
 import { isArticleName, type CanvasLocalEntry } from "../../core/stores/canvasStore";
 import { useSettingsStore } from "../../core/stores/settings";
 import { hintTargetFromSettings } from "../../core/sync/remoteChangeHint";
@@ -39,7 +40,7 @@ const isMarkdown = computed(() => isArticleName(props.doc.name));
 const shown = computed(() =>
   view.value === "translation" && translation.value ? translation.value.content : content.value,
 );
-const html = computed(() => (isMarkdown.value ? renderSafeMarkdown(shown.value) : ""));
+const html = computed(() => (isMarkdown.value ? renderCanvasMarkdown(shown.value) : ""));
 const translationStale = computed(() => !!translation.value && translation.value.sourceSha !== props.doc.sha256);
 const translateLabel = computed(() => {
   if (!translating.value) return translation.value ? "重新翻译" : "翻译";
@@ -227,9 +228,9 @@ const save = async () => {
       spellcheck="false"
       aria-label="编辑文稿"
     ></textarea>
-    <div v-else class="flex-1 min-h-0 overflow-y-auto p-3 text-[14px] leading-relaxed text-[var(--primary-text)]">
-      <div v-if="isMarkdown" class="canvas-markdown" v-html="html"></div>
-      <pre v-else class="whitespace-pre-wrap break-words font-sans">{{ shown }}</pre>
+    <div v-else class="flex-1 min-h-0 overflow-y-auto text-[var(--primary-text)]">
+      <div v-if="isMarkdown" class="markdown-preview canvas-markdown" v-html="html"></div>
+      <pre v-else class="p-3 text-[14px] leading-relaxed whitespace-pre-wrap break-words font-sans">{{ shown }}</pre>
     </div>
   </section>
 </template>

@@ -1,0 +1,179 @@
+/*
+ * Canvas 文稿区样式：移植自电脑端 VCPChat Canvasmodules/canvas.css 的 .markdown-preview 段（L813-990）。
+ * 作用域限定 .canvas-doc .markdown-preview，聊天气泡不受影响；颜色走主题变量，随明暗切换。
+ * 与电脑端只有三类差异：窄屏边距；表格横滚、代码块换行；补回被 preflight 清掉的浏览器默认
+ * （列表符号、h4-h6、链接下划线等，电脑端依赖浏览器默认样式）。
+ */
+
+.canvas-doc .markdown-preview {
+  /* 电脑：width: min(100% - 56px, 860px); padding: 42px 0 80px */
+  width: 100%;
+  max-width: 860px;
+  margin: 0 auto;
+  padding: 20px 18px 64px;
+  box-sizing: border-box;
+  color: var(--primary-text);
+  font-family: Georgia, "Times New Roman", "Noto Serif SC", "Noto Serif CJK SC", "Source Han Serif SC", serif;
+  font-size: 16px;
+  line-height: 1.82;
+  overflow-wrap: anywhere;
+}
+
+.canvas-doc .markdown-preview :is(h1, h2, h3, h4, h5, h6) {
+  color: var(--primary-text);
+  line-height: 1.35;
+  font-family: var(--vcp-ui-font-family, system-ui, -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif);
+  font-weight: 700;
+  letter-spacing: 0;
+}
+
+.canvas-doc .markdown-preview h1 {
+  margin: 0 0 1.4em;
+  font-size: 2em;
+  text-align: center;
+}
+
+.canvas-doc .markdown-preview h2 {
+  margin: 2.1em 0 0.8em;
+  padding-bottom: 0.3em;
+  border-bottom: 1px solid var(--border-color);
+  font-size: 1.45em;
+}
+
+.canvas-doc .markdown-preview h3 {
+  margin: 1.7em 0 0.65em;
+  font-size: 1.18em;
+}
+
+/* 以下 h4-h6、列表、hr、链接、粗体：电脑端未覆写，取浏览器默认值。 */
+.canvas-doc .markdown-preview h4 { margin: 1.33em 0; font-size: 1em; }
+.canvas-doc .markdown-preview h5 { margin: 1.67em 0; font-size: 0.83em; }
+.canvas-doc .markdown-preview h6 { margin: 2.33em 0; font-size: 0.67em; }
+
+.canvas-doc .markdown-preview p {
+  margin: 0 0 1em;
+  text-align: justify;
+}
+
+.canvas-doc .markdown-preview :is(ul, ol) {
+  margin: 1em 0;
+  /* 电脑默认 40px，窄屏收到 1.6em */
+  padding-left: 1.6em;
+}
+
+.canvas-doc .markdown-preview ul { list-style: disc; }
+.canvas-doc .markdown-preview ol { list-style: decimal; }
+.canvas-doc .markdown-preview :is(ul, ol) :is(ul, ol) { margin: 0; }
+.canvas-doc .markdown-preview ul ul { list-style: circle; }
+
+.canvas-doc .markdown-preview hr {
+  height: 0;
+  margin: 0.5em 0;
+  border: 0;
+  border-top: 1px solid var(--border-color);
+}
+
+.canvas-doc .markdown-preview :is(strong, b) { font-weight: 700; }
+
+.canvas-doc .markdown-preview blockquote {
+  margin: 1.2em 0;
+  padding: 0.2em 1em;
+  border-left: 3px solid #62a682;
+  color: var(--secondary-text);
+}
+
+.canvas-doc .markdown-preview .vdoc-table-scroll {
+  max-width: 100%;
+  margin: 1.4em 0;
+  overflow-x: auto;
+  -webkit-overflow-scrolling: touch;
+}
+
+.canvas-doc .markdown-preview table {
+  width: 100%;
+  margin: 1.4em 0;
+  border-collapse: collapse;
+  font-family: var(--vcp-ui-font-family, system-ui, sans-serif);
+  font-size: 13px;
+}
+
+.canvas-doc .markdown-preview .vdoc-table-scroll > table {
+  margin: 0;
+}
+
+.canvas-doc .markdown-preview :is(th, td) {
+  padding: 8px 10px;
+  border: 1px solid var(--border-color);
+  text-align: left;
+}
+
+/* 电脑端：普通表格统一用论文三线表风格（白底黑字），不随暗色主题变化，与 Word 导出一致。 */
+.canvas-doc .markdown-preview table:not([data-vdoc-word-table]) {
+  background: #fff;
+  color: #000;
+  border: 0.5pt solid #000;
+  border-bottom-width: 0.75pt;
+  font-family: "Times New Roman", "宋体", "Noto Serif CJK SC", serif;
+  font-size: 12pt;
+  line-height: 1.5;
+  /* 电脑为 anywhere；窄屏改 normal，配合单元格最小宽度，宽表横向滚动而不是被压成一列一字 */
+  overflow-wrap: normal;
+}
+
+.canvas-doc .markdown-preview table:not([data-vdoc-word-table]) :is(th, td) {
+  min-width: 4.5em;
+  height: 22.5pt;
+  padding: 0 5.4pt;
+  border: 0.5pt solid #a9a9a9;
+  background: #fff;
+  color: #000;
+  text-align: center;
+  vertical-align: middle;
+  font-weight: normal;
+}
+
+.canvas-doc .markdown-preview table:not([data-vdoc-word-table]) th {
+  background: #ccc;
+  border-left-color: #fff;
+  border-right-color: #fff;
+}
+
+.canvas-doc .markdown-preview table:not([data-vdoc-word-table]) :is(th, td):first-child { border-left-color: #000; }
+.canvas-doc .markdown-preview table:not([data-vdoc-word-table]) :is(th, td):last-child { border-right-color: #000; }
+.canvas-doc .markdown-preview table:not([data-vdoc-word-table]) thead tr:first-child th { border-top-color: #000; }
+.canvas-doc .markdown-preview table:not([data-vdoc-word-table]) tbody tr:last-child td { border-bottom: 0.75pt solid #000; }
+.canvas-doc .markdown-preview table:not([data-vdoc-word-table]) p { margin: 0; text-align: center; text-indent: 0; }
+
+.canvas-doc .markdown-preview :is(pre, code) {
+  font-family: Consolas, "Cascadia Code", "JetBrains Mono", ui-monospace, monospace;
+}
+
+.canvas-doc .markdown-preview pre {
+  margin: 1em 0;
+  padding: 14px;
+  border: 1px solid var(--border-color);
+  border-radius: 5px;
+  background: var(--input-bg, var(--secondary-bg));
+  font-size: 13px;
+  line-height: 1.55;
+  overflow-x: auto;
+  /* 电脑横向滚动；窄屏改为自动换行 */
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.canvas-doc .markdown-preview pre code {
+  white-space: inherit;
+}
+
+.canvas-doc .markdown-preview img {
+  display: inline;
+  max-width: 100%;
+  height: auto;
+  vertical-align: middle;
+}
+
+.canvas-doc .markdown-preview a {
+  color: #4d94c4;
+  text-decoration: underline;
+}
