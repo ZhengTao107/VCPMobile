@@ -6,7 +6,7 @@
 //! 路径口径与电脑端 `parseScopedPath` 一致；网络 helper 复用 [`super::canvas_sync`]。
 
 use super::canvas_sync::{atomic_write, canvas_client, describe_error, io_err, read_limited};
-use reqwest::header::ACCEPT;
+use reqwest::header::{ACCEPT, CONTENT_TYPE};
 use reqwest::{Client, Url};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -14,7 +14,7 @@ use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const API_PREFIX: &str = "/api/sidechat-sync";
 const MIRROR_DIR: &str = "sidechat-mirror";
@@ -292,6 +292,202 @@ fn remove_local(root: &Path, path: &str) -> Result<bool, String> {
     Ok(removed)
 }
 
+// ---------------------------------------------------------------- 双向（ptp4g#46）
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SidechatTransferResult {
+    pub status: u16,
+    /// push 成功时为现在的 baseSha。
+    pub sha256: Option<String>,
+    /// 409 时带 `serverSha`。
+    pub body: Option<Value>,
+}
+
+/// 三方比对的本机一侧：`sha256` 为 None 表示本机已删、只剩基线。
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SidechatLocalStatus {
+    pub path: String,
+    pub sha256: Option<String>,
+    pub base_sha: Option<String>,
+}
+
+async fn read_json(response: reqwest::Response) -> Result<Option<Value>, String> {
+    Ok(read_limited(response, MAX_JSON_BYTES)
+        .await?
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok()))
+}
+
+fn forget_base(root: &Path, path: &str) -> Result<(), String> {
+    let _guard = state_guard();
+    let mut state = load_state(root);
+    if state.base.remove(path).is_some() {
+        let bytes = serde_json::to_vec(&state).map_err(|e| format!("STATE_ENCODE: {e}"))?;
+        atomic_write(&root.join(STATE_FILE), &bytes)?;
+    }
+    Ok(())
+}
+
+/// 本机现有文件的 sha 与基线，加上"记过基线、本机已删"的条目。
+fn local_status(root: &Path) -> Result<Vec<SidechatLocalStatus>, String> {
+    let base = {
+        let _guard = state_guard();
+        load_state(root).base
+    };
+    let mut out = Vec::new();
+    for entry in list_local(root)? {
+        let segments = validate_path(&entry.path)?;
+        let bytes = match std::fs::read(local_path(root, &segments)) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(io_err(error)),
+        };
+        out.push(SidechatLocalStatus {
+            base_sha: base.get(&entry.path).cloned(),
+            sha256: Some(sha_hex(&bytes)),
+            path: entry.path,
+        });
+    }
+    for (path, sha) in &base {
+        if validate_path(path).is_ok() && !out.iter().any(|s| &s.path == path) {
+            out.push(SidechatLocalStatus {
+                path: path.clone(),
+                sha256: None,
+                base_sha: Some(sha.clone()),
+            });
+        }
+    }
+    out.sort_by(|a, b| a.path.cmp(&b.path));
+    Ok(out)
+}
+
+/// 原子写本机子话题文件，返回新 sha；不动基线（是否上推由同步决定）。
+fn write_local(root: &Path, path: &str, content: &[u8]) -> Result<String, String> {
+    let segments = validate_path(path)?;
+    if content.len() > MAX_FILE_BYTES {
+        return Err("FILE_TOO_LARGE".to_owned());
+    }
+    atomic_write(&local_path(root, &segments), content)?;
+    Ok(sha_hex(content))
+}
+
+/// 本机版本另存为 `<stem>.conflict-手机<ext>`（重名再加毫秒）；同步口径排除该名，不会被推走。
+fn save_conflict(root: &Path, path: &str) -> Result<String, String> {
+    let segments = validate_path(path)?;
+    let source = local_path(root, &segments);
+    let name = segments[segments.len() - 1];
+    let (stem, ext) = match name.rfind('.') {
+        Some(i) if i > 0 => (&name[..i], &name[i..]),
+        _ => (name, ""),
+    };
+    let dir = source.parent().ok_or_else(|| "INVALID_PATH".to_owned())?;
+    let mut target = dir.join(format!("{stem}.conflict-手机{ext}"));
+    if target.exists() {
+        let ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0);
+        target = dir.join(format!("{stem}.conflict-手机-{ms}{ext}"));
+    }
+    let bytes = std::fs::read(&source).map_err(io_err)?;
+    atomic_write(&target, &bytes)?;
+    Ok(target
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default())
+}
+
+/// 以基线做乐观并发 PUT；200 记新基线，409 不动基线并交回 body（含 serverSha）。
+async fn push(
+    client: &Client,
+    root: &Path,
+    base_url: &str,
+    token: &str,
+    path: &str,
+) -> Result<SidechatTransferResult, String> {
+    let segments = validate_path(path)?;
+    let bytes = std::fs::read(local_path(root, &segments)).map_err(io_err)?;
+    if bytes.len() > MAX_FILE_BYTES {
+        return Err("FILE_TOO_LARGE".to_owned());
+    }
+    let sha = sha_hex(&bytes);
+    let base = base_of(root, path).unwrap_or_default();
+    if base == sha {
+        return Ok(SidechatTransferResult {
+            status: 200,
+            sha256: Some(sha),
+            body: None,
+        });
+    }
+    let url = api_url(base_url, "/file", &[("path", path), ("baseSha", &base)])?;
+    let response = client
+        .put(url)
+        .bearer_auth(token)
+        .header(ACCEPT, "application/json")
+        .header(CONTENT_TYPE, "application/octet-stream")
+        .timeout(TRANSFER_TIMEOUT)
+        .body(bytes)
+        .send()
+        .await
+        .map_err(describe_error)?;
+    let status = response.status().as_u16();
+    let body = read_json(response).await?;
+    if status != 200 {
+        return Ok(SidechatTransferResult {
+            status,
+            sha256: None,
+            body,
+        });
+    }
+    let server_sha = body
+        .as_ref()
+        .and_then(|value| value.get("sha256"))
+        .and_then(Value::as_str)
+        .unwrap_or(&sha)
+        .to_owned();
+    set_base(root, path, &server_sha)?;
+    Ok(SidechatTransferResult {
+        status,
+        sha256: Some(server_sha),
+        body,
+    })
+}
+
+/// 本机已删：以基线请电脑端物理删除。200 与 409 都清基线
+/// （409 serverSha 为空即电脑端也已删；带 sha 表示电脑端改过，下一轮拉回）。
+async fn delete_remote(
+    client: &Client,
+    root: &Path,
+    base_url: &str,
+    token: &str,
+    path: &str,
+) -> Result<SidechatTransferResult, String> {
+    validate_path(path)?;
+    let Some(base) = base_of(root, path) else {
+        return Err("NO_BASE".to_owned());
+    };
+    let url = api_url(base_url, "/file", &[("path", path), ("baseSha", &base)])?;
+    let response = client
+        .delete(url)
+        .bearer_auth(token)
+        .header(ACCEPT, "application/json")
+        .timeout(REQUEST_TIMEOUT)
+        .send()
+        .await
+        .map_err(describe_error)?;
+    let status = response.status().as_u16();
+    let body = read_json(response).await?;
+    if status == 200 || status == 409 {
+        forget_base(root, path)?;
+    }
+    Ok(SidechatTransferResult {
+        status,
+        sha256: None,
+        body,
+    })
+}
+
 fn mirror_root(app: &tauri::AppHandle) -> Result<PathBuf, String> {
     Ok(crate::vcp_modules::infra::file_manager::get_support_root_dir(app)?.join(MIRROR_DIR))
 }
@@ -364,9 +560,209 @@ pub async fn sidechat_local_remove(app: tauri::AppHandle, path: String) -> Resul
     remove_local(&mirror_root(&app)?, &path)
 }
 
+/// 以记录的基线上推一个子话题文件；409 时 body 带 `serverSha`。
+#[tauri::command]
+pub async fn sidechat_push(
+    app: tauri::AppHandle,
+    base_url: String,
+    token: String,
+    path: String,
+) -> Result<SidechatTransferResult, String> {
+    let token = require_token(&token)?;
+    let root = mirror_root(&app)?;
+    push(canvas_client()?, &root, &base_url, token, &path).await
+}
+
+/// 本机已删的子话题文件：请电脑端删除。
+#[tauri::command]
+pub async fn sidechat_delete(
+    app: tauri::AppHandle,
+    base_url: String,
+    token: String,
+    path: String,
+) -> Result<SidechatTransferResult, String> {
+    let token = require_token(&token)?;
+    let root = mirror_root(&app)?;
+    delete_remote(canvas_client()?, &root, &base_url, token, &path).await
+}
+
+/// 三方比对用的本机状态（含只剩基线的已删条目）。
+#[tauri::command]
+pub async fn sidechat_local_status(
+    app: tauri::AppHandle,
+) -> Result<Vec<SidechatLocalStatus>, String> {
+    local_status(&mirror_root(&app)?)
+}
+
+/// 原子写本机子话题文件（UTF-8 文本），返回新 sha。
+#[tauri::command]
+pub async fn sidechat_local_write(
+    app: tauri::AppHandle,
+    path: String,
+    content: String,
+) -> Result<String, String> {
+    write_local(&mirror_root(&app)?, &path, content.as_bytes())
+}
+
+/// 清基线：电脑端已删、本机又改过时，让本机版本按新建上推。
+#[tauri::command]
+pub async fn sidechat_forget_base(app: tauri::AppHandle, path: String) -> Result<(), String> {
+    validate_path(&path)?;
+    forget_base(&mirror_root(&app)?, &path)
+}
+
+/// 本机版本另存冲突副本，返回副本文件名。
+#[tauri::command]
+pub async fn sidechat_save_conflict(app: tauri::AppHandle, path: String) -> Result<String, String> {
+    save_conflict(&mirror_root(&app)?, &path)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::{TcpListener, TcpStream};
+    use tokio::task::JoinHandle;
+
+    const P: &str = "UserData/o/topics/sidechat_1_ab/history.json";
+
+    fn test_client() -> Client {
+        Client::builder().no_proxy().build().unwrap()
+    }
+
+    async fn read_request(socket: &mut TcpStream) -> String {
+        let mut buffer = Vec::new();
+        let mut chunk = [0u8; 4096];
+        loop {
+            let read = socket.read(&mut chunk).await.unwrap_or(0);
+            if read == 0 {
+                break;
+            }
+            buffer.extend_from_slice(&chunk[..read]);
+            if let Some(end) = buffer.windows(4).position(|w| w == b"\r\n\r\n") {
+                let head = String::from_utf8_lossy(&buffer[..end]).to_ascii_lowercase();
+                let length = head
+                    .lines()
+                    .find_map(|line| line.strip_prefix("content-length:"))
+                    .and_then(|value| value.trim().parse::<usize>().ok())
+                    .unwrap_or(0);
+                if buffer.len() >= end + 4 + length {
+                    break;
+                }
+            }
+        }
+        String::from_utf8_lossy(&buffer).into_owned()
+    }
+
+    async fn serve_once(status: &str, body: &str) -> (String, JoinHandle<String>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let reply = format!(
+            "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        let handle = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let request = read_request(&mut socket).await;
+            socket.write_all(reply.as_bytes()).await.ok();
+            socket.shutdown().await.ok();
+            request
+        });
+        (base, handle)
+    }
+
+    #[tokio::test]
+    async fn push_new_file_sends_empty_base_and_records_sha() {
+        let dir = tempfile::tempdir().unwrap();
+        let sha = write_local(dir.path(), P, b"[1]").unwrap();
+        let (base, server) = serve_once("200 OK", &format!(r#"{{"sha256":"{sha}"}}"#)).await;
+        let result = push(&test_client(), dir.path(), &base, "tok", P)
+            .await
+            .unwrap();
+        let request = server.await.unwrap();
+        assert!(request.starts_with("PUT /api/sidechat-sync/file?path=UserData%2Fo%2Ftopics%2Fsidechat_1_ab%2Fhistory.json&baseSha= "), "{request}");
+        assert!(request
+            .to_ascii_lowercase()
+            .contains("content-type: application/octet-stream"));
+        assert!(request.ends_with("[1]"));
+        assert_eq!(result.status, 200);
+        assert_eq!(base_of(dir.path(), P).as_deref(), Some(sha.as_str()));
+        // 已一致：不发请求。
+        let again = push(&test_client(), dir.path(), "http://127.0.0.1:9", "tok", P)
+            .await
+            .unwrap();
+        assert_eq!(again.sha256.as_deref(), Some(sha.as_str()));
+    }
+
+    #[tokio::test]
+    async fn push_conflict_keeps_base_and_returns_server_sha() {
+        let dir = tempfile::tempdir().unwrap();
+        let old = "a".repeat(64);
+        write_local(dir.path(), P, b"mine").unwrap();
+        set_base(dir.path(), P, &old).unwrap();
+        let server_sha = "b".repeat(64);
+        let (base, server) = serve_once(
+            "409 Conflict",
+            &format!(r#"{{"code":"SIDECHAT_SYNC_CONFLICT","serverSha":"{server_sha}"}}"#),
+        )
+        .await;
+        let result = push(&test_client(), dir.path(), &base, "tok", P)
+            .await
+            .unwrap();
+        assert!(server.await.unwrap().contains(&format!("baseSha={old}")));
+        assert_eq!(result.status, 409);
+        assert_eq!(result.body.unwrap()["serverSha"], server_sha.as_str());
+        assert_eq!(base_of(dir.path(), P).as_deref(), Some(old.as_str()));
+    }
+
+    #[tokio::test]
+    async fn delete_sends_base_and_forgets_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let old = "c".repeat(64);
+        set_base(dir.path(), P, &old).unwrap();
+        let (base, server) = serve_once("200 OK", r#"{"deleted":true}"#).await;
+        let result = delete_remote(&test_client(), dir.path(), &base, "tok", P)
+            .await
+            .unwrap();
+        let request = server.await.unwrap();
+        assert!(
+            request.starts_with("DELETE /api/sidechat-sync/file?"),
+            "{request}"
+        );
+        assert!(request.contains(&format!("baseSha={old}")));
+        assert_eq!(result.status, 200);
+        assert_eq!(base_of(dir.path(), P), None);
+        let error = delete_remote(&test_client(), dir.path(), "http://127.0.0.1:9", "tok", P)
+            .await
+            .unwrap_err();
+        assert_eq!(error, "NO_BASE");
+    }
+
+    #[test]
+    fn status_lists_local_and_deleted_and_conflict_copy_is_excluded() {
+        let dir = tempfile::tempdir().unwrap();
+        let sha = write_local(dir.path(), P, b"[]").unwrap();
+        set_base(dir.path(), P, &sha).unwrap();
+        let gone = "UserData/o/topics/sidechat_1_ab/sidechat-child.json";
+        set_base(dir.path(), gone, &"d".repeat(64)).unwrap();
+
+        let copy = save_conflict(dir.path(), P).unwrap();
+        assert_eq!(copy, "history.conflict-手机.json");
+        let second = save_conflict(dir.path(), P).unwrap();
+        assert!(second.starts_with("history.conflict-手机-") && second.ends_with(".json"));
+
+        let status = local_status(dir.path()).unwrap();
+        assert_eq!(status.len(), 2, "{status:?}");
+        assert_eq!(status[0].path, P);
+        assert_eq!(status[0].sha256.as_deref(), Some(sha.as_str()));
+        assert_eq!(status[0].base_sha.as_deref(), Some(sha.as_str()));
+        assert_eq!(status[1].path, gone);
+        assert_eq!(status[1].sha256, None);
+
+        forget_base(dir.path(), gone).unwrap();
+        assert_eq!(local_status(dir.path()).unwrap().len(), 1);
+        assert!(write_local(dir.path(), "UserData/o/topics/topic_1/history.json", b"x").is_err());
+    }
 
     #[test]
     fn accepts_files_under_child_dir() {
