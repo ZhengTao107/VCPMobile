@@ -1,2 +1,9 @@
 # SQLx hashes migration text verbatim; keep the same bytes on every build host.
 /src-tauri/migrations/*.sql text eol=lf
+# tauri build.rs renders this from an LF template via write_if_changed and declares rerun-if-changed on it;
+# CRLF on disk makes every build rewrite it and rebuild the whole tauri crate tree.
+/src-tauri/gen/android/app/src/main/java/com/vcp/avatar/generated/TauriActivity.kt text eol=lf
+# tauri-plugin build declares rerun-if-changed=permissions and rewrites these as LF; same self-invalidation.
+/src-tauri/plugins/vcp-mobile/permissions/** text eol=lf
+# tauri-build (mobile.rs) writes this via write_if_changed with rerun-if-changed; same self-invalidation.
+/src-tauri/gen/android/app/tauri.build.gradle.kts text eol=lf
