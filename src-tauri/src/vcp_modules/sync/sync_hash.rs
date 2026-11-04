@@ -193,12 +193,16 @@ impl HashAggregator {
 
     pub fn compute_group_topic_metadata_hash(dto: &GroupTopicSyncDTO) -> String {
         // 排除 owner_id，仅使用 topic 自身属性计算 hash
-        // 确保与桌面端 GROUP_TOPIC_SYNC_FIELDS ["id","name","createdAt"] 一致
-        let meta = serde_json::json!({
+        // 确保与桌面端 GROUP_TOPIC_SYNC_FIELDS ["id","name","createdAt","pinned"] 一致；
+        // pinned 只在 true 时计入，未置顶群组话题哈希与旧版逐字节一致。
+        let mut meta = serde_json::json!({
             "id": &dto.id,
             "name": &dto.name,
             "createdAt": dto.created_at,
         });
+        if dto.pinned {
+            meta["pinned"] = serde_json::Value::Bool(true);
+        }
         compute_deterministic_hash(&meta)
     }
 
@@ -541,7 +545,7 @@ impl SyncDtoLoader {
         key: &TopicKey,
     ) -> Result<GroupTopicSyncDTO, String> {
         let row = sqlx::query(
-            "SELECT topic_id, title, created_at, owner_id, config_hash, updated_at FROM topics
+            "SELECT topic_id, title, created_at, pinned, owner_id, config_hash, updated_at FROM topics
              WHERE owner_type = 'group' AND owner_id = ? AND topic_id = ? AND deleted_at IS NULL",
         )
         .bind(&key.owner_id)
@@ -563,6 +567,9 @@ impl SyncDtoLoader {
                     key.topic_id
                 )
             })?,
+            pinned: row.try_get::<i64, _>("pinned").map_err(|error| {
+                format!("Group topic {} pinned decode failed: {error}", key.topic_id)
+            })? != 0,
             owner_id: row.try_get("owner_id").map_err(|error| {
                 format!("Group topic {} owner decode failed: {error}", key.topic_id)
             })?,
@@ -836,6 +843,7 @@ mod tests {
             id: "topic-1".to_string(),
             name: "Topic".to_string(),
             created_at: 123,
+            pinned: false,
             owner_id: "group-a".to_string(),
             config_hash: "b".repeat(64),
             updated_at: 456,

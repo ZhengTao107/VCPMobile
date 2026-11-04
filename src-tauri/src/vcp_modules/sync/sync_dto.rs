@@ -148,6 +148,9 @@ pub struct GroupTopicSyncDTO {
     pub name: String,
     #[serde(default, deserialize_with = "deserialize_nullable_created_at")]
     pub created_at: i64,
+    /// ptp4g#44：与 AgentTopicSyncDTO 同语义，电脑只在 true 时发送；缺省=未置顶，false 不序列化。
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub pinned: bool,
     pub owner_id: String,
     #[serde(
         rename = "configHash",

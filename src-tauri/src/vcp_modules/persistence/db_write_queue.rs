@@ -1026,6 +1026,7 @@ mod tests {
                 id: "topic-under-deleted-owner".into(),
                 name: "stale-child".into(),
                 created_at: 2,
+                pinned: false,
                 owner_id: "group-deleted".into(),
                 config_hash: "b".repeat(64),
                 updated_at: 2,
@@ -2141,14 +2142,14 @@ impl DbWriteQueue {
             )));
         }
         let changed = tx.execute(
-            "INSERT INTO topics (topic_id, title, owner_id, owner_type, created_at, locked, unread, config_hash, updated_at)
-            SELECT ?, ?, ?, 'group', ?, 1, 0, ?, ?
+            "INSERT INTO topics (topic_id, title, owner_id, owner_type, created_at, locked, unread, pinned, config_hash, updated_at)
+            SELECT ?, ?, ?, 'group', ?, 1, 0, ?, ?, ?
             WHERE EXISTS (
                 SELECT 1 FROM groups
                 WHERE owner_type = 'group' AND group_id = ? AND deleted_at IS NULL
             )
             ON CONFLICT(owner_type, owner_id, topic_id) DO UPDATE SET
-            title=excluded.title, created_at=excluded.created_at,
+            title=excluded.title, created_at=excluded.created_at, pinned=excluded.pinned,
             updated_at=CASE
                 WHEN topics.config_hash IS NOT excluded.config_hash THEN excluded.updated_at
                 ELSE topics.updated_at
@@ -2157,6 +2158,7 @@ impl DbWriteQueue {
             WHERE topics.deleted_at IS NULL",
             rusqlite::params![
                 topic_id, &dto.name, &dto.owner_id, dto.created_at,
+                if dto.pinned { 1 } else { 0 },
                 &dto.config_hash, dto.updated_at, &dto.owner_id
             ]
         )?;

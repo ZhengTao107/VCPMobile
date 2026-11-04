@@ -535,6 +535,7 @@ impl DiffHandler {
                                         id: topic_id,
                                         name: title,
                                         created_at,
+                                        pinned: pinned != 0,
                                         owner_id,
                                         config_hash,
                                         updated_at,
