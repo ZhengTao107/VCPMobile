@@ -65,10 +65,20 @@ export const waitForCurrentConversationIdle = (
 ): Promise<boolean> =>
   waitUntil(() => !stream.isConversationStreaming(session.currentConversationKey), timeoutMs);
 
+/** 电脑端变化提示触发的同步：静默窗口合并，且两轮之间至少间隔这么久。 */
+export const REMOTE_HINT_QUIET_MS = 3000;
+export const REMOTE_HINT_MIN_INTERVAL_MS = 30_000;
+const DEFAULT_THROTTLED_REASONS: ReadonlySet<string> = new Set(["remote-hint"]);
+
 export interface AutoSyncTriggerOptions {
   isReady: () => boolean;
   run: (reason: string) => Promise<unknown>;
   delayMs?: number;
+  /** 走节流的来源（默认只有 remote-hint）；其余来源保持原防抖。 */
+  throttledReasons?: ReadonlySet<string>;
+  throttleQuietMs?: number;
+  throttleMinIntervalMs?: number;
+  now?: () => number;
 }
 
 export interface AutoSyncTrigger {
@@ -80,16 +90,34 @@ export function createAutoSyncTrigger(
   options: AutoSyncTriggerOptions,
 ): AutoSyncTrigger {
   const delayMs = options.delayMs ?? AUTO_SYNC_DEBOUNCE_MS;
+  const throttled = options.throttledReasons ?? DEFAULT_THROTTLED_REASONS;
+  const quietMs = options.throttleQuietMs ?? REMOTE_HINT_QUIET_MS;
+  const minIntervalMs = options.throttleMinIntervalMs ?? REMOTE_HINT_MIN_INTERVAL_MS;
+  const now = options.now ?? Date.now;
   let timer: ReturnType<typeof setTimeout> | null = null;
+  let timerThrottled = false;
   let running = false;
   let pendingReason: string | null = null;
   let lastReason = "";
+  let lastRunAt = Number.NEGATIVE_INFINITY;
+  // 本批节流提示的最迟触发时刻：持续有变化时也保证到点跑一轮。
+  let throttleCapAt: number | null = null;
   let disposed = false;
+
+  const isThrottled = (reason: string) => throttled.has(reason);
+
+  const clearTimer = () => {
+    if (timer) clearTimeout(timer);
+    timer = null;
+  };
 
   const fire = async () => {
     timer = null;
+    timerThrottled = false;
+    throttleCapAt = null;
     if (disposed || !options.isReady()) return;
     running = true;
+    lastRunAt = now();
     try {
       await options.run(lastReason);
     } catch (error) {
@@ -105,19 +133,36 @@ export function createAutoSyncTrigger(
   const request = (reason: string) => {
     if (disposed || !options.isReady()) return;
     if (running) {
-      pendingReason = reason;
+      // 非节流来源（消息完成、回前台）优先保留，不被提示覆盖。
+            if (!isThrottled(reason) || pendingReason === null || isThrottled(pendingReason)) {
+        pendingReason = reason;
+      }
       return;
     }
+    if (!isThrottled(reason)) {
+      lastReason = reason;
+      clearTimer();
+      timerThrottled = false;
+      throttleCapAt = null;
+      timer = setTimeout(() => void fire(), delayMs);
+      return;
+    }
+    // 已排了一次立即同步，它会一并覆盖这次提示。
+    if (timer && !timerThrottled) return;
+    const t = now();
+    throttleCapAt ??= Math.max(t, lastRunAt) + minIntervalMs;
+    const dueAt = Math.min(throttleCapAt, Math.max(t + quietMs, lastRunAt + minIntervalMs));
     lastReason = reason;
-    if (timer) clearTimeout(timer);
-    timer = setTimeout(() => void fire(), delayMs);
+    clearTimer();
+    timerThrottled = true;
+    timer = setTimeout(() => void fire(), Math.max(0, dueAt - t));
   };
 
   const dispose = () => {
     disposed = true;
     pendingReason = null;
-    if (timer) clearTimeout(timer);
-    timer = null;
+    throttleCapAt = null;
+    clearTimer();
   };
 
   return { request, dispose };
