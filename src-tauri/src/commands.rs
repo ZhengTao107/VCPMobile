@@ -142,8 +142,9 @@ macro_rules! app_command_handler {
             canvas_push, canvas_wait, canvas_wait_cancel,
         };
         use crate::vcp_modules::sync::sidechat_sync::{
-            sidechat_local_list, sidechat_local_read, sidechat_local_remove, sidechat_manifest,
-            sidechat_pull,
+            sidechat_delete, sidechat_forget_base, sidechat_local_list, sidechat_local_read,
+            sidechat_local_remove, sidechat_local_status, sidechat_local_write, sidechat_manifest,
+            sidechat_pull, sidechat_push, sidechat_save_conflict,
         };
         use crate::vcp_modules::sync::open_tabs::{open_tabs_get, open_tabs_put};
         use crate::vcp_modules::sync::settings_sync::{settings_sync_get, settings_sync_put};
@@ -448,6 +449,12 @@ macro_rules! app_command_handler {
                 sidechat_local_list,
                 sidechat_local_read,
                 sidechat_local_remove,
+                sidechat_push,
+                sidechat_delete,
+                sidechat_local_status,
+                sidechat_local_write,
+                sidechat_forget_base,
+                sidechat_save_conflict,
                 canvas_delete,
                 canvas_local_delete,
                 canvas_local_missing,
