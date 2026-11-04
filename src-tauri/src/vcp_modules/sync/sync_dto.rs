@@ -208,6 +208,10 @@ pub struct MessageSyncDTO {
         deserialize_with = "deserialize_required_sha256"
     )]
     pub content_hash: String,
+    /// ptp4g#44：电脑原样透传的用量轮次（纯 round 数组）。只收不发、不进消息指纹；
+    /// 用 Value 接收，非数组时只丢弃用量，不拒收整条消息。
+    #[serde(rename = "assistantContextMetricRounds", default, skip_serializing)]
+    pub assistant_context_metric_rounds: Option<serde_json::Value>,
 }
 
 impl From<MessageSyncDTO> for crate::vcp_modules::chat_manager::ChatMessage {

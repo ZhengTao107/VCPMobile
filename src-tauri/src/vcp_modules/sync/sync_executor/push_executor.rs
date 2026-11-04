@@ -511,6 +511,7 @@ async fn load_outbound_message_page(
             })?,
             attachments: None,
             content_hash,
+            assistant_context_metric_rounds: None,
         });
     }
 

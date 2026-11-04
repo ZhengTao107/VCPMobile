@@ -453,8 +453,9 @@ async fn process_topic_messages(
         let prepared_writes = tokio::task::spawn_blocking(move || {
             let mut writes = Vec::with_capacity(parsed_messages.len());
 
-            for dto in parsed_messages {
+            for mut dto in parsed_messages {
                 let content_hash = dto.content_hash.clone();
+                let context_metric_rounds = dto.assistant_context_metric_rounds.take();
                 let msg = crate::vcp_modules::chat_manager::ChatMessage::from(dto);
 
                 // B. 预渲染（按开关控制）
@@ -486,6 +487,7 @@ async fn process_topic_messages(
                     message: msg,
                     render_bytes: rb,
                     content_hash,
+                    context_metric_rounds,
                 });
             }
 
@@ -1387,6 +1389,7 @@ mod ndjson_frame_tests {
                 finish_reason: None,
                 attachments: None,
                 content_hash: "a".repeat(64),
+                assistant_context_metric_rounds: None,
             },
             crate::vcp_modules::sync_dto::MessageSyncDTO {
                 id: "message-b".into(),
@@ -1402,6 +1405,7 @@ mod ndjson_frame_tests {
                 finish_reason: None,
                 attachments: None,
                 content_hash: "b".repeat(64),
+                assistant_context_metric_rounds: None,
             },
         ];
         assert!(validate_requested_message_ids(
