@@ -2,7 +2,14 @@
 import { computed, onBeforeUnmount, ref, watch } from "vue";
 import { renderCanvasMarkdown } from "./canvasMarkdown";
 import "./canvasDocument.css";
-import { isArticleName, type CanvasLocalEntry } from "../../core/stores/canvasStore";
+import {
+  isArticleName,
+  NO_REVISIONS,
+  REVISION_STALE_HINT,
+  type CanvasLocalEntry,
+  type CanvasRevisionSpan,
+  type CanvasRevisionView,
+} from "../../core/stores/canvasStore";
 import { useSettingsStore } from "../../core/stores/settings";
 import { hintTargetFromSettings } from "../../core/sync/remoteChangeHint";
 import {
@@ -17,6 +24,8 @@ const props = defineProps<{
   doc: CanvasLocalEntry;
   read: (name: string) => Promise<string>;
   save: (name: string, content: string) => Promise<boolean>;
+  /** ptp4g#49 电脑端修订（只读）；不传则不显示。 */
+  revisions?: (name: string, content: string) => Promise<CanvasRevisionView>;
 }>();
 
 const settingsStore = useSettingsStore();
@@ -67,6 +76,46 @@ watch(
   },
   { immediate: true },
 );
+
+// ptp4g#49 修订（只读）：只用电脑端 sidecar 缓存的净变更；正文哈希不一致只给轻提示；手机本机保存过即隐藏。
+const revisionView = ref<CanvasRevisionView>(NO_REVISIONS);
+const showRevisions = ref(false);
+const editedHere = ref(false);
+let revisionSeq = 0;
+watch(
+  () => [props.doc.name, content.value] as const,
+  async ([name, text], previous) => {
+    if (previous && previous[0] !== name) {
+      showRevisions.value = false;
+      editedHere.value = false;
+    }
+    const seq = ++revisionSeq;
+    revisionView.value = NO_REVISIONS;
+    if (!props.revisions || !text) return;
+    try {
+      const next = await props.revisions(name, text);
+      if (seq === revisionSeq) revisionView.value = next;
+    } catch {
+      if (seq === revisionSeq) revisionView.value = NO_REVISIONS;
+    }
+  },
+  { immediate: true },
+);
+const revisionsReady = computed(() => {
+  const current = revisionView.value;
+  return !editedHere.value && current.status === "ready" ? current : null;
+});
+const revisionsStale = computed(() => !editedHere.value && revisionView.value.status === "stale");
+const revisionTotal = computed(() => {
+  const counts = revisionsReady.value?.counts;
+  return counts ? counts.insert + counts.delete + counts.replace : 0;
+});
+const revisionTitle = (span: CanvasRevisionSpan) =>
+  [span.author, span.timestamp ? new Date(span.timestamp).toLocaleString() : ""].filter(Boolean).join(" · ");
+const toggleRevisions = () => {
+  showRevisions.value = !showRevisions.value;
+  if (showRevisions.value) view.value = "source";
+};
 
 const cancelTranslate = () => {
   translateAbort?.abort();
@@ -156,6 +205,7 @@ const save = async () => {
   try {
     const synced = await props.save(props.doc.name, draft.value);
     content.value = draft.value;
+    editedHere.value = true;
     editing.value = false;
     saveHint.value = synced ? "已保存并同步到电脑端" : "已保存到手机，稍后同步";
   } catch (error) {
@@ -185,6 +235,15 @@ const save = async () => {
           {{ item.label }}
         </button>
       </div>
+      <button
+        v-if="!editing && revisionsReady"
+        type="button"
+        class="px-3 min-h-8 rounded-full text-[12px] font-bold border border-black/10 dark:border-white/10 text-[var(--primary-text)]"
+        :aria-pressed="showRevisions"
+        @click="toggleRevisions"
+      >
+        修订 {{ revisionTotal }}
+      </button>
       <button
         v-if="!editing"
         type="button"
@@ -220,6 +279,14 @@ const save = async () => {
     >
       译文基于旧版本，原文已更新；点“重新翻译”只译改动的段
     </p>
+    <p
+      v-if="revisionsStale && !editing"
+      class="px-3 py-1.5 text-[11px] opacity-70 text-[var(--primary-text)]"
+      role="status"
+      data-rev="stale"
+    >
+      {{ REVISION_STALE_HINT }}
+    </p>
     <p v-if="loadError" class="p-3 text-[12px] text-red-500">读取失败：{{ loadError }}</p>
     <textarea
       v-else-if="editing"
@@ -229,7 +296,27 @@ const save = async () => {
       aria-label="编辑文稿"
     ></textarea>
     <div v-else class="flex-1 min-h-0 overflow-y-auto text-[var(--primary-text)]">
-      <div v-if="isMarkdown" class="markdown-preview canvas-markdown" v-html="html"></div>
+      <template v-if="showRevisions && revisionsReady && view === 'source'">
+        <p class="px-3 pt-2 text-[11px] opacity-60" data-rev="summary">
+          新增 {{ revisionsReady.counts.insert }} · 删除 {{ revisionsReady.counts.delete }} · 替换
+          {{ revisionsReady.counts.replace }}<template v-if="revisionsReady.authors.length">
+            · {{ revisionsReady.authors.join("、") }}</template>
+        </p>
+        <pre
+          class="p-3 text-[14px] leading-relaxed whitespace-pre-wrap break-words font-sans"
+        ><template v-for="(span, index) in revisionsReady.spans" :key="index"><ins
+          v-if="span.kind === 'ins'"
+          data-rev="ins"
+          class="no-underline rounded-sm bg-green-500/15 text-green-700 dark:text-green-300"
+          :title="revisionTitle(span)"
+        >{{ span.text }}</ins><del
+          v-else-if="span.kind === 'del'"
+          data-rev="del"
+          class="line-through rounded-sm bg-red-500/10 text-red-600 dark:text-red-300"
+          :title="revisionTitle(span)"
+        >{{ span.text }}</del><template v-else>{{ span.text }}</template></template></pre>
+      </template>
+      <div v-else-if="isMarkdown" class="markdown-preview canvas-markdown" v-html="html"></div>
       <pre v-else class="p-3 text-[14px] leading-relaxed whitespace-pre-wrap break-words font-sans">{{ shown }}</pre>
     </div>
   </section>

@@ -292,7 +292,13 @@ onBeforeUnmount(() => {
     </ul>
 
     <div v-else class="flex-1 min-h-0" @touchstart.passive="onTouchStart" @touchend.passive="onTouchEnd">
-      <CanvasDocPane v-show="segment === 'doc'" :doc="current" :read="canvas.readDoc" :save="canvas.saveDoc" />
+      <CanvasDocPane
+        v-show="segment === 'doc'"
+        :doc="current"
+        :read="canvas.readDoc"
+        :save="canvas.saveDoc"
+        :revisions="canvas.loadRevisions"
+      />
       <CanvasChatPane
         v-if="segment === 'chat'"
         :name="current.name"

@@ -94,6 +94,9 @@ export interface CanvasApi {
   localDelete: (name: string, docKey: string | null, keepBase: boolean) => Promise<number>;
   localMissing: () => Promise<CanvasMissingEntry[]>;
   localForget: (name: string) => Promise<void>;
+  /** ptp4g#49 修订 sidecar（只读）：读本机缓存；按 manifest sha 拉取单个 docKey。 */
+  revisionLoad?: (docKey: string) => Promise<string | null>;
+  revisionPull?: (target: CanvasTarget, docKey: string, sha256: string) => Promise<CanvasTransferResult>;
 }
 
 // ---------------------------------------------------------------- 纯函数
@@ -110,16 +113,32 @@ export const isLocalOnlyName = (name: string) => name.includes(".bak") || name.i
 const isSha = (value: unknown): value is string => typeof value === "string" && /^[a-f0-9]{64}$/.test(value);
 const isDisabledStatus = (status: number) => status === 404 || status === 503;
 
-/** 只取 canvas 根下单层、可同步的 .md/.txt；CanvasRevisions 等一期不镜像。 */
-export function parseManifest(body: unknown): { revision: string; files: CanvasRemoteFile[] } | null {
+const REVISIONS_PREFIX = "CanvasRevisions/";
+const REVISION_FILE_RE = /^([a-f0-9]{64})\.json$/;
+
+/**
+ * 文稿只取 canvas 根下单层、可同步的 .md/.txt；
+ * 修订 sidecar（`CanvasRevisions/<docKey>.json`，单层）单独放 revisions（docKey → sha256），不进文稿列表。
+ * 其余 CanvasRevisions 条目（.revisions.jsonl、子目录）不使用。
+ */
+export function parseManifest(
+  body: unknown,
+): { revision: string; files: CanvasRemoteFile[]; revisions: Record<string, string> } | null {
   if (!body || typeof body !== "object") return null;
   const { revision, files } = body as Record<string, unknown>;
   if (typeof revision !== "string" || !Array.isArray(files)) return null;
   const out: CanvasRemoteFile[] = [];
+  const revisions: Record<string, string> = Object.create(null);
   for (const raw of files) {
     if (!raw || typeof raw !== "object") continue;
     const { path, size, mtime, sha256 } = raw as Record<string, unknown>;
-    if (typeof path !== "string" || !path.startsWith(SCOPE_PREFIX) || !isSha(sha256)) continue;
+    if (typeof path !== "string" || !isSha(sha256)) continue;
+    if (path.startsWith(REVISIONS_PREFIX)) {
+      const match = REVISION_FILE_RE.exec(path.slice(REVISIONS_PREFIX.length));
+      if (match) revisions[match[1]] = sha256;
+      continue;
+    }
+    if (!path.startsWith(SCOPE_PREFIX)) continue;
     const name = path.slice(SCOPE_PREFIX.length);
     if (!name || name.includes("/") || !isCanvasDocName(name) || isLocalOnlyName(name)) continue;
     out.push({
@@ -129,7 +148,7 @@ export function parseManifest(body: unknown): { revision: string; files: CanvasR
       mtime: typeof mtime === "number" ? mtime : 0,
     });
   }
-  return { revision, files: out };
+  return { revision, files: out, revisions };
 }
 
 export function parseBindings(body: unknown): Record<string, CanvasBinding> {
@@ -227,6 +246,127 @@ export function bindingToTab(binding: CanvasBinding): OpenTabRef {
 /** 与电脑端 Canvasmodules/canvas.js isArticleDocument 一致：md/txt/markdown 按 Markdown 预览。 */
 export const isArticleName = (name: string) => /\.(md|txt|markdown)$/i.test(name);
 
+// ---------------------------------------------------------------- 修订（ptp4g#49，只读）
+
+/** 同电脑 canvasRevisionTracker 的 NET_CHANGES_ALGORITHM_VERSION；版本不同的缓存不可信。 */
+export const NET_CHANGES_ALGORITHM_VERSION = 4;
+export const REVISION_STALE_HINT = "修订记录与当前内容不一致，请在电脑端查看";
+
+export interface CanvasRevisionSpan {
+  kind: "same" | "ins" | "del";
+  text: string;
+  author?: string;
+  source?: string;
+  timestamp?: string | null;
+}
+
+export interface CanvasRevisionCounts {
+  insert: number;
+  delete: number;
+  replace: number;
+}
+
+export type CanvasRevisionView =
+  | { status: "none" }
+  | { status: "stale" }
+  | { status: "ready"; spans: CanvasRevisionSpan[]; counts: CanvasRevisionCounts; authors: string[] };
+
+export const NO_REVISIONS: CanvasRevisionView = { status: "none" };
+const STALE_REVISIONS: CanvasRevisionView = { status: "stale" };
+
+interface RawRevisionHunk {
+  afterStart: number;
+  afterEnd: number;
+  oldText: string;
+  newText: string;
+  type?: unknown;
+  author?: unknown;
+  source?: unknown;
+  timestamp?: unknown;
+}
+
+/** 同电脑 hashContent：UTF-8 正文 sha256 十六进制。 */
+async function hashContent(text: string): Promise<string> {
+  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(String(text ?? "")));
+  return Array.from(new Uint8Array(digest), (b) => b.toString(16).padStart(2, "0")).join("");
+}
+
+const isIndex = (value: unknown): value is number => Number.isInteger(value) && (value as number) >= 0;
+const optionalText = (value: unknown) => (typeof value === "string" && value ? value : undefined);
+
+const hunkType = (hunk: RawRevisionHunk): keyof CanvasRevisionCounts => {
+  if (hunk.type === "insert" || hunk.type === "delete" || hunk.type === "replace") return hunk.type;
+  if (hunk.oldText && hunk.newText) return "replace";
+  return hunk.oldText ? "delete" : "insert";
+};
+
+/**
+ * 只用电脑端 sidecar 缓存的 netChanges，不在手机上重算 diff。
+ * 校验同电脑 hasCurrentNetChangesCache：内容哈希（finalContentHash 与 netChangesContentHash）、算法版本、
+ * 基线哈希、修订数；再逐条核对 content[afterStart, afterEnd) === newText。任一不符 → stale。
+ */
+export async function evaluateRevisions(raw: string | null, content: string): Promise<CanvasRevisionView> {
+  if (!raw) return NO_REVISIONS;
+  let state: Record<string, unknown>;
+  try {
+    const parsed: unknown = JSON.parse(raw);
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return NO_REVISIONS;
+    state = parsed as Record<string, unknown>;
+  } catch {
+    return NO_REVISIONS;
+  }
+  const changes = state.netChanges;
+  if (!Array.isArray(changes) || changes.length === 0) return NO_REVISIONS;
+  const hash = await hashContent(content);
+  if (
+    state.finalContentHash !== hash
+    || state.netChangesContentHash !== hash
+    || state.netChangesAlgorithmVersion !== NET_CHANGES_ALGORITHM_VERSION
+  ) {
+    return STALE_REVISIONS;
+  }
+  if (typeof state.baseContent === "string" && state.netChangesBaseHash !== (await hashContent(state.baseContent))) {
+    return STALE_REVISIONS;
+  }
+  const revisionCount = Array.isArray(state.revisions) ? state.revisions.length : state.revisionCount;
+  if (typeof revisionCount === "number" && state.netChangesRevisionCount !== revisionCount) return STALE_REVISIONS;
+
+  const hunks: RawRevisionHunk[] = [];
+  for (const change of changes) {
+    if (!change || typeof change !== "object") return STALE_REVISIONS;
+    const hunk = change as Record<string, unknown>;
+    const { afterStart, afterEnd, oldText, newText } = hunk;
+    if (!isIndex(afterStart) || !isIndex(afterEnd) || afterEnd < afterStart || afterEnd > content.length) {
+      return STALE_REVISIONS;
+    }
+    if (typeof oldText !== "string" || typeof newText !== "string") return STALE_REVISIONS;
+    if (content.slice(afterStart, afterEnd) !== newText) return STALE_REVISIONS;
+    hunks.push(hunk as unknown as RawRevisionHunk);
+  }
+  hunks.sort((a, b) => a.afterStart - b.afterStart || a.afterEnd - b.afterEnd);
+
+  const spans: CanvasRevisionSpan[] = [];
+  const counts: CanvasRevisionCounts = { insert: 0, delete: 0, replace: 0 };
+  const authors = new Set<string>();
+  let cursor = 0;
+  for (const hunk of hunks) {
+    if (hunk.afterStart < cursor) return STALE_REVISIONS;
+    if (hunk.afterStart > cursor) spans.push({ kind: "same", text: content.slice(cursor, hunk.afterStart) });
+    const meta = {
+      author: optionalText(hunk.author),
+      source: optionalText(hunk.source),
+      timestamp: optionalText(hunk.timestamp) ?? null,
+    };
+    if (hunk.oldText) spans.push({ kind: "del", text: hunk.oldText, ...meta });
+    if (hunk.newText) spans.push({ kind: "ins", text: hunk.newText, ...meta });
+    counts[hunkType(hunk)] += 1;
+    if (meta.author) authors.add(meta.author);
+    cursor = hunk.afterEnd;
+  }
+  if (cursor < content.length) spans.push({ kind: "same", text: content.slice(cursor) });
+  return { status: "ready", spans, counts, authors: [...authors] };
+}
+
 /** [对话] 切换时限：超时或失败时显示原因与重试，不再停在“正在切换”。 */
 export const CHAT_SWITCH_TIMEOUT_MS = 3_000;
 export interface ChatSwitchState {
@@ -279,6 +419,8 @@ export interface CanvasState {
   notices: string[];
   error: string | null;
   lastSyncAt: number;
+  /** docKey → 修订 sidecar sha256（来自最近一次 manifest，只读）。 */
+  revisions: Record<string, string>;
 }
 
 export interface CanvasControllerDeps {
@@ -304,6 +446,7 @@ export function createCanvasController(deps: CanvasControllerDeps) {
     notices: [],
     error: null,
     lastSyncAt: 0,
+    revisions: Object.create(null),
   });
   let generation = 0;
   let waitSeq = 0;
@@ -419,6 +562,7 @@ export function createCanvasController(deps: CanvasControllerDeps) {
       await refreshLocal();
       if (gen !== generation) return false;
       state.revision = manifest.revision;
+      state.revisions = manifest.revisions;
       state.lastSyncAt = now();
       state.error = failures.length ? failures.join("；") : null;
       state.status = "ready";
@@ -565,6 +709,27 @@ export function createCanvasController(deps: CanvasControllerDeps) {
     state.notices = state.notices.filter((_, i) => i !== index);
   };
 
+  /**
+   * 打开文稿时按需取修订（只读）：只拉这一篇 docKey 的 sidecar，manifest sha 与本机缓存一致时 Rust 不走网络。
+   * 已对过账且电脑端没有这份 sidecar 时不用旧缓存；离线或拉取失败退回缓存，仍由内容哈希把关。
+   */
+  const loadRevisions = async (name: string, content: string): Promise<CanvasRevisionView> => {
+    if (!api.revisionLoad) return NO_REVISIONS;
+    const key = await docKeyOf(name);
+    if (!key) return NO_REVISIONS;
+    const sha = state.revisions[key];
+    if (!sha && state.revision !== null) return NO_REVISIONS;
+    const target = deps.getTarget();
+    if (sha && target && api.revisionPull) {
+      try {
+        await api.revisionPull(target, key, sha);
+      } catch {
+        // 退回本机缓存。
+      }
+    }
+    return evaluateRevisions(await api.revisionLoad(key), content);
+  };
+
   return {
     state,
     start,
@@ -575,6 +740,7 @@ export function createCanvasController(deps: CanvasControllerDeps) {
     bindingFor,
     bind,
     dismissNotice,
+    loadRevisions,
     isRunning: () => running,
   };
 }
@@ -608,6 +774,9 @@ export const tauriCanvasApi: CanvasApi = {
   localDelete: (name, docKey, keepBase) => invoke("canvas_local_delete", { name, docKey, keepBase }),
   localMissing: () => invoke("canvas_local_missing"),
   localForget: (name) => invoke("canvas_local_forget", { name }),
+  revisionLoad: (docKey) => invoke("canvas_revision_load", { docKey }),
+  revisionPull: (t, docKey, sha256) =>
+    invoke("canvas_revision_pull", { baseUrl: t.baseUrl, token: t.token, docKey, sha256 }),
 };
 
 export const useCanvasStore = defineStore("canvas", () => {

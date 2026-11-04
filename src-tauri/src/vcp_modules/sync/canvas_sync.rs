@@ -656,6 +656,77 @@ async fn wait_once(
     }
 }
 
+// ---------------------------------------------------------------- 修订 sidecar（ptp4g#49，只读）
+
+/// 电脑端 `AppData/CanvasRevisions/<docKey>.json` 的手机缓存 `<mirror>/CanvasRevisions/<docKey>.json`。
+/// 只在打开文稿时按 manifest 的 sha256 拉这一份；本机缓存 sha 一致时不走网络。手机不写回、不上推。
+const REVISIONS_DIR: &str = "CanvasRevisions";
+
+fn revision_path(root: &Path, doc_key: &str) -> PathBuf {
+    root.join(REVISIONS_DIR).join(format!("{doc_key}.json"))
+}
+
+fn load_revision(root: &Path, doc_key: &str) -> Result<Option<String>, String> {
+    if !is_doc_key(doc_key) {
+        return Err("INVALID_DOC_KEY".to_owned());
+    }
+    match std::fs::read(revision_path(root, doc_key)) {
+        Ok(bytes) => Ok(String::from_utf8(bytes).ok()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(io_err(error)),
+    }
+}
+
+async fn pull_revision(
+    client: &Client,
+    root: &Path,
+    base_url: &str,
+    token: &str,
+    doc_key: &str,
+    expected: &str,
+) -> Result<CanvasTransferResult, String> {
+    if !is_doc_key(doc_key) || !is_doc_key(expected) {
+        return Err("INVALID_DOC_KEY".to_owned());
+    }
+    let target = revision_path(root, doc_key);
+    if let Ok(bytes) = std::fs::read(&target) {
+        if sha_hex(&bytes) == expected {
+            return Ok(CanvasTransferResult {
+                status: 200,
+                sha256: Some(expected.to_owned()),
+                body: None,
+            });
+        }
+    }
+    let path = format!("{REVISIONS_DIR}/{doc_key}.json");
+    let url = api_url(base_url, "/file", &[("path", &path)])?;
+    let response = client
+        .get(url)
+        .bearer_auth(token)
+        .timeout(TRANSFER_TIMEOUT)
+        .send()
+        .await
+        .map_err(describe_error)?;
+    let status = response.status().as_u16();
+    if status != 200 {
+        return Ok(CanvasTransferResult {
+            status,
+            sha256: None,
+            body: read_json(response).await?,
+        });
+    }
+    let bytes = read_limited(response, MAX_FILE_BYTES)
+        .await?
+        .ok_or_else(|| "FILE_TOO_LARGE".to_owned())?;
+    let sha = sha_hex(&bytes);
+    atomic_write(&target, &bytes)?;
+    Ok(CanvasTransferResult {
+        status,
+        sha256: Some(sha),
+        body: None,
+    })
+}
+
 // ---------------------------------------------------------------- tauri 命令
 
 pub(super) fn mirror_root(app: &tauri::AppHandle) -> Result<PathBuf, String> {
@@ -847,6 +918,36 @@ pub async fn canvas_local_forget(app: tauri::AppHandle, name: String) -> Result<
     forget_base(&mirror_root(&app)?, &name)
 }
 
+/// 读本机缓存的修订 sidecar（未缓存为 None）。
+#[tauri::command]
+pub async fn canvas_revision_load(
+    app: tauri::AppHandle,
+    doc_key: String,
+) -> Result<Option<String>, String> {
+    load_revision(&mirror_root(&app)?, &doc_key)
+}
+
+/// 按 manifest 的 sha256 拉 `CanvasRevisions/<docKey>.json` 到本机缓存；非 200 原样交回。
+#[tauri::command]
+pub async fn canvas_revision_pull(
+    app: tauri::AppHandle,
+    base_url: String,
+    token: String,
+    doc_key: String,
+    sha256: String,
+) -> Result<CanvasTransferResult, String> {
+    let token = require_token(&token)?;
+    pull_revision(
+        canvas_client()?,
+        &mirror_root(&app)?,
+        &base_url,
+        token,
+        &doc_key,
+        &sha256,
+    )
+    .await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1018,6 +1119,48 @@ mod tests {
         .unwrap();
         assert_eq!(result.sha256.as_deref(), Some(sha.as_str()));
         assert_eq!(base_of(dir.path(), "a.md").as_deref(), Some(sha.as_str()));
+    }
+
+    #[tokio::test]
+    async fn revision_pull_caches_by_doc_key_and_skips_when_sha_matches() {
+        let dir = tempfile::tempdir().unwrap();
+        let key = sha_hex(b"tgfs.txt");
+        let body: &[u8] = br#"{"finalContentHash":"x","netChanges":[]}"#;
+        let sha = sha_hex(body);
+        let (base, server) = serve_once(reply("200 OK", "application/json", body)).await;
+        let result = pull_revision(&test_client(), dir.path(), &base, "tok", &key, &sha)
+            .await
+            .unwrap();
+        let request = server.await.unwrap();
+        let expected = format!("GET /api/canvas-sync/file?path=CanvasRevisions%2F{key}.json ");
+        assert!(request.starts_with(&expected), "{request}");
+        assert_eq!(result.status, 200);
+        assert_eq!(result.sha256.as_deref(), Some(sha.as_str()));
+        assert_eq!(
+            load_revision(dir.path(), &key).unwrap().as_deref(),
+            Some(std::str::from_utf8(body).unwrap())
+        );
+        // 缓存 sha 一致：不连网络（UNUSED_BASE 连不上）。
+        let cached = pull_revision(&test_client(), dir.path(), UNUSED_BASE, "tok", &key, &sha)
+            .await
+            .unwrap();
+        assert_eq!(cached.status, 200);
+        // 不进正文镜像。
+        assert!(list_local(dir.path()).unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn revision_rejects_non_doc_key_before_network() {
+        let dir = tempfile::tempdir().unwrap();
+        let sha = sha_hex(b"x");
+        let long = "g".repeat(64);
+        for bad in ["../x", "ABC", long.as_str()] {
+            assert!(load_revision(dir.path(), bad).is_err(), "{bad}");
+            let pulled =
+                pull_revision(&test_client(), dir.path(), UNUSED_BASE, "tok", bad, &sha).await;
+            assert!(pulled.is_err(), "{bad}");
+        }
+        assert_eq!(load_revision(dir.path(), &sha).unwrap(), None);
     }
 
     #[tokio::test]
