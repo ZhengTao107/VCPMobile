@@ -9,6 +9,8 @@ export interface TopicDto {
   updatedAt?: number;
   locked: boolean;
   unread: boolean;
+  /** ptp4g#44：DB 置顶状态（Agent 话题参与同步）。 */
+  pinned?: boolean;
   unreadCount: number;
   msgCount: number;
   ownerId: string;

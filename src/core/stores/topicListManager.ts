@@ -102,11 +102,20 @@ export const useTopicStore = defineStore("topic", () => {
   const pinnedKeySet = computed(
     () => new Set(validPinnedKeys()),
   );
+  // ptp4g#44：置顶以 DB 的 topic.pinned 为准；旧 pinnedTopicKeys 只做迁移前的读兼容。
   const isTopicPinned = (
     ownerId: string,
     ownerType: string,
     topicId: string,
-  ) => pinnedKeySet.value.has(topicPreferenceKey(ownerId, ownerType, topicId));
+  ) =>
+    pinnedKeySet.value.has(topicPreferenceKey(ownerId, ownerType, topicId)) ||
+    topics.value.some(
+      (topic) =>
+        topic.pinned === true &&
+        topic.id === topicId &&
+        topic.ownerId === ownerId &&
+        topic.ownerType === ownerType,
+    );
   const enqueueUnreadMutation = <T>(operation: () => Promise<T>): Promise<T> => {
     const queued = unreadMutationTail.catch(() => undefined).then(operation);
     unreadMutationTail = queued.then(
@@ -208,21 +217,99 @@ export const useTopicStore = defineStore("topic", () => {
     return { pinned, regular };
   });
 
-  const toggleTopicPinned = (
+  const setLoadedTopicPinned = (
     ownerId: string,
     ownerType: string,
     topicId: string,
+    pinned: boolean,
+    updatedAt?: number | null,
   ) => {
+    const index = topics.value.findIndex(
+      (topic) =>
+        topic.id === topicId &&
+        topic.ownerId === ownerId &&
+        topic.ownerType === ownerType,
+    );
+    if (index === -1) return;
+    topics.value[index] = {
+      ...topics.value[index],
+      pinned,
+      updatedAt: updatedAt ?? topics.value[index].updatedAt,
+    };
+  };
+
+  /** ptp4g#44：置顶写 DB（Agent 话题随同步回推）；先乐观更新，失败回滚。 */
+  const toggleTopicPinned = async (
+    ownerId: string,
+    ownerType: string,
+    topicId: string,
+  ): Promise<boolean> => {
     const key = topicPreferenceKey(ownerId, ownerType, topicId);
-    if (pinnedKeySet.value.has(key)) {
+    const target = !isTopicPinned(ownerId, ownerType, topicId);
+    const hadLegacyKey = pinnedKeySet.value.has(key);
+    if (hadLegacyKey) {
       pinnedTopicKeys.value = validPinnedKeys().filter(
         (candidate) => candidate !== key,
       );
-      return false;
     }
+    setLoadedTopicPinned(ownerId, ownerType, topicId, target);
+    try {
+      const updatedAt = await invoke<number | null>("set_topic_pinned", {
+        ownerId,
+        ownerType,
+        topicId,
+        pinned: target,
+      });
+      if (updatedAt != null) {
+        setLoadedTopicPinned(ownerId, ownerType, topicId, target, updatedAt);
+        reorderTopics();
+      }
+      return target;
+    } catch (e) {
+      setLoadedTopicPinned(ownerId, ownerType, topicId, !target);
+      if (hadLegacyKey && !pinnedKeySet.value.has(key)) {
+        pinnedTopicKeys.value = [...validPinnedKeys(), key];
+      }
+      console.error("[TopicStore] Failed to toggle topic pin:", e);
+      notificationStore.addNotification({
+        type: "error",
+        title: "置顶失败",
+        message: "暂时无法保存置顶状态，请稍后重试",
+        toastOnly: true,
+      });
+      throw e;
+    }
+  };
 
-    pinnedTopicKeys.value = [...validPinnedKeys(), key];
-    return true;
+  let legacyPinMigration: Promise<void> | null = null;
+  /** ptp4g#44：旧 pinia 置顶一次性迁入 DB；成功后清空，失败保留到下次加载重试。 */
+  const migrateLegacyTopicPins = () => {
+    if (legacyPinMigration) return legacyPinMigration;
+    const keys = validPinnedKeys();
+    if (keys.length === 0) return Promise.resolve();
+    const pins = keys
+      .map(parseTopicPreferenceKey)
+      .filter((identity): identity is [string, string, string] => identity !== null)
+      .map(([ownerType, ownerId, topicId]) => ({ ownerId, ownerType, topicId }));
+    legacyPinMigration = (async () => {
+      try {
+        await invoke<number>("migrate_legacy_topic_pins", { pins });
+        const migrated = new Set(keys);
+        pinnedTopicKeys.value = validPinnedKeys().filter(
+          (key) => !migrated.has(key),
+        );
+        topics.value = topics.value.map((topic) =>
+          migrated.has(topicPreferenceKey(topic.ownerId, topic.ownerType, topic.id))
+            ? { ...topic, pinned: true }
+            : topic,
+        );
+      } catch (e) {
+        console.warn("[TopicStore] Legacy pin migration failed, will retry:", e);
+      } finally {
+        legacyPinMigration = null;
+      }
+    })();
+    return legacyPinMigration;
   };
 
   const removePinnedTopic = (
@@ -351,6 +438,7 @@ export const useTopicStore = defineStore("topic", () => {
           owner_type,
           new Set(requestTopics.keys()),
         );
+        await migrateLegacyTopicPins();
       }
 
       console.log(

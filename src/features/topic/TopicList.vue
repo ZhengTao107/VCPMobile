@@ -230,7 +230,10 @@ const showTopicContextMenu = (topicId: string) => {
     icon: pinned ? PinOff : Pin,
     selected: pinned,
     handler: () => {
-      topicListStore.toggleTopicPinned(itemId, ownerType, topic.id);
+      // 失败已在 store 内提示并回滚
+      void topicListStore
+        .toggleTopicPinned(itemId, ownerType, topic.id)
+        .catch(() => undefined);
     },
   });
 };
