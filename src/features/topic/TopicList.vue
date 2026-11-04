@@ -2,14 +2,14 @@
 import { computed, watch, ref, nextTick, onUnmounted } from "vue";
 import { useRouter } from "vue-router";
 import { useVirtualList } from "@vueuse/core";
-import { useTopicStore, type Topic } from "../../core/stores/topicListManager";
+import { useTopicStore, formatTopicCreatedAt, type Topic } from "../../core/stores/topicListManager";
 import { useChatSessionStore } from "../../core/stores/chatSessionStore";
 import { useLayoutStore } from "../../core/stores/layout";
 import { useOverlayStore } from "../../core/stores/overlay";
 import { useNotificationStore } from "../../core/stores/notification";
 import { allowChatMutation, chatMutationBlockReason } from "../chat/chatMutationPolicy";
 import type { OverlayActionItem } from "../../core/types/overlay";
-import { useOpenTabsStore } from "../../core/stores/openTabsStore";
+import { useOpenTabsStore, openTabKey } from "../../core/stores/openTabsStore";
 import { Edit3, Lock, LockOpen, CheckCircle, Trash2, Copy, Pin, PinOff, ExternalLink, GitBranch } from "@lucide/vue";
 
 const emit = defineEmits<{
@@ -54,6 +54,15 @@ const currentRows = computed<TopicListRow[]>(() => {
       : []),
   ];
 });
+
+// 已在标签页打开的话题（与 VCPChat syncTopicOpenTabIndicator 同义）
+const openTopicKeys = computed(
+  () => new Set(openTabsStore.tabs.map((tab) => openTabKey(tab))),
+);
+const isOpenInTab = (topic: Topic) =>
+  openTopicKeys.value.has(
+    openTabKey({ ownerId: topic.ownerId, ownerType: topic.ownerType, topicId: topic.id }),
+  );
 
 // 虚拟列表实现
 const { list, containerProps, wrapperProps, scrollTo } = useVirtualList(currentRows, {
@@ -356,9 +365,16 @@ onUnmounted(() => {
             </div>
             <div class="flex flex-col overflow-hidden flex-1">
               <div class="flex justify-between items-center w-full">
-                <span class="font-bold text-sm truncate text-primary-text">{{
-                  item.data.topic.name
-                  }}</span>
+                <span class="flex items-center gap-1 min-w-0">
+                  <Pin v-if="topicListStore.isTopicPinned(item.data.topic.ownerId, item.data.topic.ownerType, item.data.topic.id)"
+                    :size="11" class="shrink-0 text-[var(--highlight-text)]" aria-label="已置顶" data-testid="topic-pin-icon" />
+                  <span class="font-bold text-sm truncate text-primary-text">{{
+                    item.data.topic.name
+                    }}</span>
+                  <span v-if="isOpenInTab(item.data.topic)"
+                    class="w-1.5 h-1.5 rounded-full shrink-0 bg-[var(--highlight-text)]"
+                    title="已在标签页打开" aria-label="已在标签页打开" data-testid="topic-open-tab-dot"></span>
+                </span>
                 <span v-if="item.data.topic.msgCount !== undefined"
                   class="text-[11px] font-bold shrink-0 ml-2 px-[8px] py-[3px] rounded-[10px]" style="
                     background-color: var(--accent-bg);
@@ -368,8 +384,8 @@ onUnmounted(() => {
                   {{ item.data.topic.msgCount }}
                 </span>
               </div>
-              <span class="text-[9px] text-secondary-text opacity-70 truncate font-mono tracking-tighter">{{
-                item.data.topic.id
+              <span class="text-[10px] text-secondary-text opacity-70 truncate tabular-nums" data-testid="topic-created-at">{{
+                formatTopicCreatedAt(item.data.topic.createdAt)
                 }}</span>
             </div>
 

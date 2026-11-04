@@ -27,6 +27,14 @@ const normalizeTopicTimestamp = (
     : fallback
 );
 
+/** 话题创建时间 → "YYYY-MM-DD HH:mm"（本地时区）；兼容毫秒与秒级时间戳，无效值返回空串。 */
+export const formatTopicCreatedAt = (value: number | null | undefined): string => {
+  if (typeof value !== "number" || !Number.isFinite(value) || value <= 0) return "";
+  const date = new Date(value > 1e11 ? value : value * 1000);
+  const pad = (part: number) => String(part).padStart(2, "0");
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}`;
+};
+
 interface TopicUnreadMutationDto {
   unreadCount: number;
   updatedAt: number | null;
@@ -121,8 +129,11 @@ export const useTopicStore = defineStore("topic", () => {
     activeLoadKey = null;
     activeLoadPromise = null;
     loading.value = false;
-    topics.value = [];
-    // 当前 owner 身份保留，由调用方显式 reload，避免依赖不会再次触发的 selection watch。
+    // 旧列表保留到调用方 reload 提交新结果；owner 已不再被选中时才清空。
+    const selected = sessionStore.currentSelectedItem;
+    if (!selected || !isCurrentOwner(selected.id, selected.type)) {
+      topics.value = [];
+    }
     console.log("[TopicStore] All topic caches invalidated");
   };
 
@@ -139,18 +150,10 @@ export const useTopicStore = defineStore("topic", () => {
       // 标题匹配
       const nameMatch = topic.name.toLowerCase().includes(term);
 
-      // 日期匹配 (格式化后搜索)
-      let dateMatch = false;
-      const createdAt = topic.createdAt;
-      if (createdAt) {
-        // Rust 返回的是毫秒级时间戳 (i64) 或秒级
-        const date = new Date(createdAt > 1e11 ? createdAt : createdAt * 1000);
-        const fullDateStr = `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, "0")}-${String(date.getDate()).padStart(2, "0")} ${String(date.getHours()).padStart(2, "0")}:${String(date.getMinutes()).padStart(2, "0")}`;
-        const shortDateStr = `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, "0")}-${String(date.getDate()).padStart(2, "0")}`;
-        dateMatch =
-          fullDateStr.toLowerCase().includes(term) ||
-          shortDateStr.toLowerCase().includes(term);
-      }
+      // 日期匹配：与列表副标题同一格式，"YYYY-MM-DD" 前缀天然覆盖。
+      const createdLabel = formatTopicCreatedAt(topic.createdAt);
+      const dateMatch =
+        createdLabel !== "" && createdLabel.toLowerCase().includes(term);
 
       return nameMatch || dateMatch;
     });
@@ -289,11 +292,16 @@ export const useTopicStore = defineStore("topic", () => {
     }
 
     const generation = ++loadGeneration;
+    // 同 owner 重载（同步、排序切换）保留旧列表，新结果完整到达后一次提交，避免闪空。
+    const keepPreviousUntilCommit =
+      isCurrentOwner(ownerId, owner_type) && topics.value.length > 0;
     currentAgentId.value = ownerId;
     currentOwnerType.value = owner_type;
     console.log(`[TopicStore] Loading topics for ${owner_type}: ${ownerId}`);
     loading.value = true;
-    topics.value = [];
+    if (!keepPreviousUntilCommit) {
+      topics.value = [];
+    }
 
     const requestTopics = new Map<string, Topic>();
     // The IIFE can reach finally before its first await if Channel/IPC setup throws.
@@ -321,7 +329,9 @@ export const useTopicStore = defineStore("topic", () => {
         for (const topic of mappedChunk) {
           requestTopics.set(topic.id, topic);
         }
-        topics.value = [...requestTopics.values()];
+        if (!keepPreviousUntilCommit) {
+          topics.value = [...requestTopics.values()];
+        }
       };
 
       // 调用 Rust 命令开始流式获取
@@ -333,6 +343,9 @@ export const useTopicStore = defineStore("topic", () => {
       });
 
       if (generation === loadGeneration && isCurrentOwner(ownerId, owner_type)) {
+        if (keepPreviousUntilCommit) {
+          topics.value = [...requestTopics.values()];
+        }
         pruneMissingPinsForOwner(
           ownerId,
           owner_type,
