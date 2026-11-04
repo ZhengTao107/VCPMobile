@@ -7,6 +7,7 @@ import { requestAutoSync } from '../sync/autoSyncTrigger';
 import { useRemoteChangeHint } from '../sync/remoteChangeHint';
 import { useSettingsRemote } from '../sync/settingsRemote';
 import { useSidechatRemote } from '../sync/sidechatRemote';
+import { useLibraryRemote } from '../sync/libraryRemote';
 import { isIOS } from '../utils/platform';
 import type { LifecycleSnapshotDto } from '../types/lifecycle';
 import { createVoiceHistorySync } from '../../features/chat/voice/voiceHistorySync';
@@ -91,6 +92,8 @@ export function useAppLifecycle() {
   const disposeSettingsRemote = useSettingsRemote(isForeground);
   // 子话题文件通道：前台目标出现与 remote-hint 时增量拉取（只拉不推）。
   const disposeSidechatRemote = useSidechatRemote(isForeground);
+  // 提示词仓库/预设（只读镜像）与模型收藏（双向，冲突以电脑端为准）。
+  const disposeLibraryRemote = useLibraryRemote(isForeground);
 
   const handleVisibilityChange = () => {
     documentHidden.value = document.hidden;
@@ -142,6 +145,7 @@ export function useAppLifecycle() {
     voiceHistory.dispose();
     disposeSettingsRemote();
     disposeSidechatRemote();
+    disposeLibraryRemote();
     document.removeEventListener("visibilitychange", handleVisibilityChange);
     if (unlisten) {
       unlisten();
