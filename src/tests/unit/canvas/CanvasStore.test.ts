@@ -42,6 +42,10 @@ function fakeApi(overrides: Partial<CanvasApi> = {}) {
     localRead: vi.fn(async () => ""),
     localWrite: vi.fn(async () => A),
     saveConflict: vi.fn(async (name: string) => name.replace(/\.md$/, ".conflict-手机-1.md")),
+    deleteRemote: vi.fn(async () => ({ status: 200, sha256: null, body: { deleted: true } })),
+    localDelete: vi.fn(async () => 0),
+    localMissing: vi.fn(async () => []),
+    localForget: vi.fn(async () => {}),
     ...overrides,
   };
   return { api, setLocal: (next: CanvasLocalEntry[]) => (files = next) };
@@ -93,6 +97,7 @@ describe("planSync 三方比较", () => {
       { kind: "push", name: "push.md" },
       { kind: "conflict", name: "both.md", sha256: C },
       { kind: "push", name: "mine.md" },
+      { kind: "delete-local", name: "gone.md" },
     ]);
   });
 });

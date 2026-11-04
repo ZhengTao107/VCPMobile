@@ -46,6 +46,12 @@ export interface CanvasLocalEntry {
   localOnly: boolean;
 }
 
+/** 记过 baseSha、本机正文已不在：本机删除，待推给电脑端。 */
+export interface CanvasMissingEntry {
+  name: string;
+  baseSha: string;
+}
+
 export interface CanvasRemoteFile {
   name: string;
   size: number;
@@ -84,6 +90,10 @@ export interface CanvasApi {
   localRead: (name: string) => Promise<string>;
   localWrite: (name: string, content: string) => Promise<string>;
   saveConflict: (name: string) => Promise<string>;
+  deleteRemote: (target: CanvasTarget, name: string) => Promise<CanvasTransferResult>;
+  localDelete: (name: string, docKey: string | null, keepBase: boolean) => Promise<number>;
+  localMissing: () => Promise<CanvasMissingEntry[]>;
+  localForget: (name: string) => Promise<void>;
 }
 
 // ---------------------------------------------------------------- 纯函数
@@ -144,21 +154,42 @@ export function parseBindings(body: unknown): Record<string, CanvasBinding> {
 export type CanvasAction =
   | { kind: "pull"; name: string; sha256: string }
   | { kind: "push"; name: string }
-  | { kind: "conflict"; name: string; sha256: string };
+  | { kind: "conflict"; name: string; sha256: string }
+  /** 电脑端已删、本机自上次同步未改：删本机（连带同 docKey 译文）。 */
+  | { kind: "delete-local"; name: string }
+  /** 本机已删、电脑端未改：请电脑端删除。 */
+  | { kind: "delete-remote"; name: string }
+  /** 电脑端已删、本机改过：清基线后按新建上推（修改优先于删除）。 */
+  | { kind: "repush"; name: string }
+  /** 两端都已删：只清本机基线。 */
+  | { kind: "forget"; name: string };
+
+/** 单轮删除安全阀：超过即整轮不删，只提示。 */
+export const CANVAS_MAX_DELETES_PER_ROUND = 20;
+export const isDeleteAction = (action: CanvasAction) =>
+  action.kind === "delete-local" || action.kind === "delete-remote";
 
 /**
  * 三方比较 本机 sha / 记录的 baseSha / 电脑端 sha：
  * 本机未改 → 拉；电脑端未改 → 推；两边都改且不一致 → 冲突；内容已一致 → 拉（Rust 只补记 baseSha，不下载）。
- * 本机有、电脑端没有：从未同步过的视为本机新建上推；同步过的（电脑端已删）保留本机不动。
+ * 删除：本机删除时保留 baseSha（missing）；本机有 baseSha 而电脑端没有，视为电脑端已删。
  */
-export function planSync(remote: readonly CanvasRemoteFile[], local: readonly CanvasLocalEntry[]): CanvasAction[] {
+export function planSync(
+  remote: readonly CanvasRemoteFile[],
+  local: readonly CanvasLocalEntry[],
+  missing: readonly CanvasMissingEntry[] = [],
+): CanvasAction[] {
   const byName = new Map(local.map((entry) => [entry.name, entry]));
+  const gone = new Map(missing.map((entry) => [entry.name, entry.baseSha]));
   const actions: CanvasAction[] = [];
   for (const file of remote) {
     const mine = byName.get(file.name);
     byName.delete(file.name);
     if (!mine) {
-      actions.push({ kind: "pull", name: file.name, sha256: file.sha256 });
+      const base = gone.get(file.name);
+      gone.delete(file.name);
+      if (base === file.sha256) actions.push({ kind: "delete-remote", name: file.name });
+      else actions.push({ kind: "pull", name: file.name, sha256: file.sha256 });
     } else if (mine.sha256 === file.sha256) {
       if (mine.baseSha !== file.sha256) actions.push({ kind: "pull", name: file.name, sha256: file.sha256 });
     } else if (mine.sha256 === mine.baseSha) {
@@ -170,8 +201,12 @@ export function planSync(remote: readonly CanvasRemoteFile[], local: readonly Ca
     }
   }
   for (const mine of byName.values()) {
-    if (!mine.localOnly && mine.baseSha === null) actions.push({ kind: "push", name: mine.name });
+    if (mine.localOnly) continue;
+    if (mine.baseSha === null) actions.push({ kind: "push", name: mine.name });
+    else if (mine.sha256 === mine.baseSha) actions.push({ kind: "delete-local", name: mine.name });
+    else actions.push({ kind: "repush", name: mine.name });
   }
+  for (const name of gone.keys()) actions.push({ kind: "forget", name });
   return actions;
 }
 
@@ -251,6 +286,8 @@ export interface CanvasControllerDeps {
   getTarget: () => CanvasTarget | null;
   now?: () => number;
   retryMs?: number;
+  /** 电脑同规则 docKey（翻译缓存文件名前缀），删除文稿时连带清本机译文。 */
+  docKey?: (name: string) => Promise<string>;
 }
 
 const errorText = (error: unknown) => (error instanceof Error ? error.message : String(error));
@@ -274,6 +311,7 @@ export function createCanvasController(deps: CanvasControllerDeps) {
   let sleepTimer: ReturnType<typeof setTimeout> | null = null;
   let wakeSleep: (() => void) | null = null;
   let running = false;
+  let heldDeletes = 0;
 
   const notify = (text: string) => {
     state.notices = [...state.notices, text].slice(-20);
@@ -301,6 +339,27 @@ export function createCanvasController(deps: CanvasControllerDeps) {
     if (result.status !== 200) throw new Error(`上推 ${name} 失败：HTTP ${result.status}`);
   };
 
+  const docKeyOf = async (name: string): Promise<string | null> => {
+    if (!deps.docKey) return null;
+    try {
+      return await deps.docKey(name);
+    } catch {
+      return null;
+    }
+  };
+
+  /** 请电脑端删除；409 serverSha 为空视为已删，带 sha 说明电脑端改过（Rust 已清基线，下轮拉回）。 */
+  const deleteRemoteOne = async (target: CanvasTarget, name: string) => {
+    const result = await api.deleteRemote(target, name);
+    if (isDisabledStatus(result.status)) throw Object.assign(new Error("disabled"), { disabled: true });
+    if (result.status === 409) {
+      const serverSha = (result.body as { serverSha?: unknown } | null)?.serverSha;
+      if (isSha(serverSha)) notify(`「${name}」电脑端改过，未删除，将重新拉回`);
+      return;
+    }
+    if (result.status !== 200) throw new Error(`删除 ${name} 失败：HTTP ${result.status}`);
+  };
+
   /** 一次完整对账；返回 false 表示电脑端未启用或不可用，订阅应停止。 */
   const syncOnce = async (gen: number): Promise<boolean> => {
     const target = deps.getTarget();
@@ -318,18 +377,34 @@ export function createCanvasController(deps: CanvasControllerDeps) {
       }
       const manifest = response.status === 200 ? parseManifest(response.body) : null;
       if (!manifest) throw new Error(`manifest 无效：HTTP ${response.status}`);
-      const actions = planSync(manifest.files, await api.localList());
+      const actions = planSync(manifest.files, await api.localList(), await api.localMissing());
+      const deletes = actions.filter(isDeleteAction).length;
+      const allowDeletes = deletes <= CANVAS_MAX_DELETES_PER_ROUND;
+      if (!allowDeletes && deletes !== heldDeletes) {
+        notify(`本轮有 ${deletes} 个删除，超过安全上限 ${CANVAS_MAX_DELETES_PER_ROUND}，已暂缓执行`);
+      }
+      heldDeletes = allowDeletes ? 0 : deletes;
       const failures: string[] = [];
       for (const action of actions) {
         if (gen !== generation) return false;
+        if (!allowDeletes && isDeleteAction(action)) continue;
         try {
           if (action.kind === "pull") {
             const pulled = await api.pull(target, action.name, action.sha256);
             if (pulled.status !== 200) failures.push(`${action.name}: HTTP ${pulled.status}`);
           } else if (action.kind === "push") {
             await pushOne(target, action.name);
-          } else {
+          } else if (action.kind === "conflict") {
             await resolveConflict(target, action.name, action.sha256);
+          } else if (action.kind === "delete-local") {
+            await api.localDelete(action.name, await docKeyOf(action.name), false);
+          } else if (action.kind === "delete-remote") {
+            await deleteRemoteOne(target, action.name);
+          } else if (action.kind === "repush") {
+            await api.localForget(action.name);
+            await pushOne(target, action.name);
+          } else {
+            await api.localForget(action.name);
           }
         } catch (error) {
           if ((error as { disabled?: boolean }).disabled) {
@@ -460,6 +535,21 @@ export function createCanvasController(deps: CanvasControllerDeps) {
     return synced;
   };
 
+  /** 删除文稿：本机先删（保留基线作删除记录），联网可用时立即请电脑端删除；离线则下次同步补推。 */
+  const deleteDoc = async (name: string) => {
+    await api.localDelete(name, await docKeyOf(name), true);
+    const target = deps.getTarget();
+    if (target && state.status !== "unavailable") {
+      try {
+        await deleteRemoteOne(target, name);
+      } catch (error) {
+        if ((error as { disabled?: boolean }).disabled) state.status = "unavailable";
+        else state.error = errorText(error);
+      }
+    }
+    await refreshLocal();
+  };
+
   const bindingFor = (name: string): CanvasBinding | null => state.bindings[normalizeCanvasKey(name)] ?? null;
 
   const bind = async (name: string, binding: Pick<CanvasBinding, "agentId" | "topicId" | "itemType">) => {
@@ -480,6 +570,7 @@ export function createCanvasController(deps: CanvasControllerDeps) {
     start,
     stop,
     saveDoc,
+    deleteDoc,
     readDoc: (name: string) => api.localRead(name),
     bindingFor,
     bind,
@@ -513,6 +604,10 @@ export const tauriCanvasApi: CanvasApi = {
   localRead: (name) => invoke("canvas_local_read", { name }),
   localWrite: (name, content) => invoke("canvas_local_write", { name, content }),
   saveConflict: (name) => invoke("canvas_local_save_conflict", { name }),
+  deleteRemote: (t, name) => invoke("canvas_delete", { baseUrl: t.baseUrl, token: t.token, name }),
+  localDelete: (name, docKey, keepBase) => invoke("canvas_local_delete", { name, docKey, keepBase }),
+  localMissing: () => invoke("canvas_local_missing"),
+  localForget: (name) => invoke("canvas_local_forget", { name }),
 };
 
 export const useCanvasStore = defineStore("canvas", () => {
@@ -520,6 +615,8 @@ export const useCanvasStore = defineStore("canvas", () => {
   const controller = createCanvasController({
     api: tauriCanvasApi,
     getTarget: () => hintTargetFromSettings(settingsStore.settings, true),
+    docKey: (name) =>
+      import("../../features/canvas/canvasSharedTranslation").then((mod) => mod.canvasDocKey(name)),
   });
   return { ...controller };
 });

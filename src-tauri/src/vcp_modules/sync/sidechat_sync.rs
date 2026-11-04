@@ -261,6 +261,37 @@ fn list_local(root: &Path) -> Result<Vec<SidechatLocalEntry>, String> {
     Ok(out)
 }
 
+/// 电脑端已删的子话题文件：删本机镜像与 base，再自下而上删空目录（停在 `UserData/<owner>/topics`）。
+fn remove_local(root: &Path, path: &str) -> Result<bool, String> {
+    let segments = validate_path(path)?;
+    let target = local_path(root, &segments);
+    let removed = match std::fs::remove_file(&target) {
+        Ok(()) => true,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+        Err(error) => return Err(io_err(error)),
+    };
+    {
+        let _guard = state_guard();
+        let mut state = load_state(root);
+        if state.base.remove(path).is_some() {
+            let bytes = serde_json::to_vec(&state).map_err(|e| format!("STATE_ENCODE: {e}"))?;
+            atomic_write(&root.join(STATE_FILE), &bytes)?;
+        }
+    }
+    let stop = local_path(root, &segments[..3]);
+    let mut dir = target.parent().map(Path::to_path_buf);
+    while let Some(current) = dir {
+        if current == stop || !current.starts_with(&stop) {
+            break;
+        }
+        if std::fs::remove_dir(&current).is_err() {
+            break;
+        }
+        dir = current.parent().map(Path::to_path_buf);
+    }
+    Ok(removed)
+}
+
 fn mirror_root(app: &tauri::AppHandle) -> Result<PathBuf, String> {
     Ok(crate::vcp_modules::infra::file_manager::get_support_root_dir(app)?.join(MIRROR_DIR))
 }
@@ -327,6 +358,12 @@ pub async fn sidechat_local_read(app: tauri::AppHandle, path: String) -> Result<
     String::from_utf8(bytes).map_err(|_| "NOT_UTF8".to_owned())
 }
 
+/// 删除本机镜像中电脑端已不存在的子话题文件（连带清空空目录）。
+#[tauri::command]
+pub async fn sidechat_local_remove(app: tauri::AppHandle, path: String) -> Result<bool, String> {
+    remove_local(&mirror_root(&app)?, &path)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -376,6 +413,28 @@ mod tests {
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].path, path);
         assert_eq!(listed[0].size, 2);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn remove_local_deletes_file_base_and_empty_dirs() {
+        let root =
+            std::env::temp_dir().join(format!("sidechat-remove-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let a = "UserData/o/topics/sidechat_1_ab/history.json";
+        let b = "UserData/o/topics/sidechat_1_ab/sidechat-child.json";
+        for p in [a, b] {
+            let segments = validate_path(p).unwrap();
+            atomic_write(&local_path(&root, &segments), b"{}").unwrap();
+            set_base(&root, p, &sha_hex(b"{}")).unwrap();
+        }
+        assert!(remove_local(&root, a).unwrap());
+        assert!(root.join("UserData/o/topics/sidechat_1_ab").is_dir());
+        assert!(remove_local(&root, b).unwrap());
+        assert!(!root.join("UserData/o/topics/sidechat_1_ab").exists());
+        assert!(root.join("UserData/o/topics").is_dir());
+        assert_eq!(base_of(&root, a), None);
+        assert!(!remove_local(&root, a).unwrap());
         let _ = std::fs::remove_dir_all(&root);
     }
 }

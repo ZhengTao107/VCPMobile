@@ -69,6 +69,14 @@ pub struct CanvasLocalEntry {
     pub local_only: bool,
 }
 
+/// 记过 baseSha、本机正文已不在的文稿：本机删除，待推给电脑端。
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CanvasMissingEntry {
+    pub name: String,
+    pub base_sha: String,
+}
+
 #[derive(Debug, Default, Serialize, Deserialize)]
 struct MirrorState {
     #[serde(default)]
@@ -356,6 +364,87 @@ fn save_conflict(root: &Path, name: &str) -> Result<String, String> {
     Err("CONFLICT_NAME_EXHAUSTED".to_owned())
 }
 
+// ---------------------------------------------------------------- 删除
+
+/// 本机译文目录（与 canvas_shared_translation 同一镜像根）。
+const TRANSLATIONS_DIR: &str = "CanvasTranslations";
+
+fn forget_base(root: &Path, name: &str) -> Result<(), String> {
+    let _guard = state_guard();
+    let mut state = load_state(root);
+    if state.base.remove(name).is_none() {
+        return Ok(());
+    }
+    let bytes = serde_json::to_vec(&state).map_err(|e| format!("STATE_ENCODE: {e}"))?;
+    atomic_write(&root.join(STATE_FILE), &bytes)
+}
+
+fn list_missing(root: &Path) -> Result<Vec<CanvasMissingEntry>, String> {
+    let base = {
+        let _guard = state_guard();
+        load_state(root).base
+    };
+    let mut out = Vec::new();
+    for (name, sha) in base {
+        if validate_name(&name).is_err() || is_local_only(&name) {
+            continue;
+        }
+        if !file_path(root, &name).exists() {
+            out.push(CanvasMissingEntry {
+                name,
+                base_sha: sha,
+            });
+        }
+    }
+    Ok(out)
+}
+
+fn is_doc_key(key: &str) -> bool {
+    key.len() == 64
+        && key
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
+/// 删本机正文。`keep_base` 为 true 时保留 baseSha（本机删除，留作待推送记录），false 时一并清掉（电脑端已删）。
+/// `doc_key` 为电脑同规则的 64 位小写十六进制时，连带删本机同前缀译文，返回删掉的译文数。
+fn remove_local(
+    root: &Path,
+    name: &str,
+    doc_key: Option<&str>,
+    keep_base: bool,
+) -> Result<u32, String> {
+    validate_name(name)?;
+    match std::fs::remove_file(file_path(root, name)) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(io_err(error)),
+    }
+    if !keep_base {
+        forget_base(root, name)?;
+    }
+    let Some(key) = doc_key.filter(|key| is_doc_key(key)) else {
+        return Ok(0);
+    };
+    let entries = match std::fs::read_dir(root.join(TRANSLATIONS_DIR)) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(error) => return Err(io_err(error)),
+    };
+    let prefix = format!("{key}-");
+    let mut removed = 0;
+    for entry in entries.flatten() {
+        let Some(file) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        if file.starts_with(&prefix) && file.ends_with(".json") {
+            std::fs::remove_file(entry.path()).map_err(io_err)?;
+            removed += 1;
+        }
+    }
+    Ok(removed)
+}
+
 // ---------------------------------------------------------------- 拉取与上推
 
 /// 拉取电脑端正文覆盖本机镜像并记 baseSha。`expected` 与本机现有正文一致时只记 baseSha，不走网络。
@@ -467,6 +556,44 @@ async fn push(
     Ok(CanvasTransferResult {
         status,
         sha256: Some(server_sha),
+        body,
+    })
+}
+
+/// 以 baseSha 请求电脑端删除 `canvas/<name>`。200 与 409 都清本机 baseSha：
+/// 409 且 serverSha 为空表示电脑端也已删；带 serverSha 表示电脑端改过，下轮重新拉回。
+async fn delete_remote(
+    client: &Client,
+    root: &Path,
+    base_url: &str,
+    token: &str,
+    name: &str,
+) -> Result<CanvasTransferResult, String> {
+    validate_name(name)?;
+    if is_local_only(name) {
+        return Err("LOCAL_ONLY".to_owned());
+    }
+    let Some(base) = base_of(root, name) else {
+        return Err("NO_BASE".to_owned());
+    };
+    let path = scoped_path(name);
+    let url = api_url(base_url, "/file", &[("path", &path), ("baseSha", &base)])?;
+    let response = client
+        .delete(url)
+        .bearer_auth(token)
+        .header(ACCEPT, "application/json")
+        .timeout(REQUEST_TIMEOUT)
+        .send()
+        .await
+        .map_err(describe_error)?;
+    let status = response.status().as_u16();
+    let body = read_json(response).await?;
+    if status == 200 || status == 409 {
+        forget_base(root, name)?;
+    }
+    Ok(CanvasTransferResult {
+        status,
+        sha256: None,
         body,
     })
 }
@@ -680,6 +807,44 @@ pub async fn canvas_local_save_conflict(
     name: String,
 ) -> Result<String, String> {
     save_conflict(&mirror_root(&app)?, &name)
+}
+
+/// 请求电脑端删除本机已删的文稿；409 时 body 带 `serverSha`（null = 电脑端也已删）。
+#[tauri::command]
+pub async fn canvas_delete(
+    app: tauri::AppHandle,
+    base_url: String,
+    token: String,
+    name: String,
+) -> Result<CanvasTransferResult, String> {
+    let token = require_token(&token)?;
+    let root = mirror_root(&app)?;
+    delete_remote(canvas_client()?, &root, &base_url, token, &name).await
+}
+
+/// 删本机文稿；`keep_base` 见 [`remove_local`]。
+#[tauri::command]
+pub async fn canvas_local_delete(
+    app: tauri::AppHandle,
+    name: String,
+    doc_key: Option<String>,
+    keep_base: bool,
+) -> Result<u32, String> {
+    remove_local(&mirror_root(&app)?, &name, doc_key.as_deref(), keep_base)
+}
+
+#[tauri::command]
+pub async fn canvas_local_missing(
+    app: tauri::AppHandle,
+) -> Result<Vec<CanvasMissingEntry>, String> {
+    list_missing(&mirror_root(&app)?)
+}
+
+/// 清掉文稿的 baseSha，让本机版本按新建上推（电脑端已删、本机又改过时）。
+#[tauri::command]
+pub async fn canvas_local_forget(app: tauri::AppHandle, name: String) -> Result<(), String> {
+    validate_name(&name)?;
+    forget_base(&mirror_root(&app)?, &name)
 }
 
 #[cfg(test)]
@@ -1014,6 +1179,82 @@ mod tests {
                 .await
                 .unwrap_err(),
             "TOKEN_MISSING"
+        );
+    }
+
+    #[test]
+    fn local_delete_keeps_or_forgets_base_and_clears_translations() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        write_local(root, "a.md", "alpha").unwrap();
+        set_base(root, "a.md", &sha_hex(b"alpha")).unwrap();
+        let key = "a".repeat(64);
+        let other = "b".repeat(64);
+        let tr = root.join(TRANSLATIONS_DIR);
+        std::fs::create_dir_all(&tr).unwrap();
+        std::fs::write(tr.join(format!("{key}-x.json")), "{}").unwrap();
+        std::fs::write(tr.join(format!("{other}-x.json")), "{}").unwrap();
+
+        assert_eq!(remove_local(root, "a.md", Some(&key), true).unwrap(), 1);
+        assert!(!file_path(root, "a.md").exists());
+        assert!(tr.join(format!("{other}-x.json")).exists());
+        let missing = list_missing(root).unwrap();
+        assert_eq!(missing.len(), 1);
+        assert_eq!(missing[0].name, "a.md");
+
+        write_local(root, "b.md", "beta").unwrap();
+        set_base(root, "b.md", &sha_hex(b"beta")).unwrap();
+        assert_eq!(remove_local(root, "b.md", Some("bad"), false).unwrap(), 0);
+        assert_eq!(base_of(root, "b.md"), None);
+        assert_eq!(list_missing(root).unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn delete_remote_sends_base_and_forgets_on_success() {
+        let dir = tempfile::tempdir().unwrap();
+        let old = "a".repeat(64);
+        set_base(dir.path(), "a.md", &old).unwrap();
+        let (base, server) = serve_once(reply(
+            "200 OK",
+            "application/json",
+            br#"{"deleted":true,"translations":0}"#,
+        ))
+        .await;
+        let result = delete_remote(&test_client(), dir.path(), &base, "tok", "a.md")
+            .await
+            .unwrap();
+        let request = server.await.unwrap();
+        assert!(request.starts_with("DELETE "));
+        assert!(request.contains(&format!("baseSha={old}")));
+        assert_eq!(result.status, 200);
+        assert_eq!(base_of(dir.path(), "a.md"), None);
+    }
+
+    #[tokio::test]
+    async fn delete_remote_conflict_forgets_base_and_keeps_server_sha() {
+        let dir = tempfile::tempdir().unwrap();
+        set_base(dir.path(), "a.md", &"a".repeat(64)).unwrap();
+        let server_sha = "c".repeat(64);
+        let body = format!(r#"{{"code":"CANVAS_SYNC_CONFLICT","serverSha":"{server_sha}"}}"#);
+        let (base, server) =
+            serve_once(reply("409 Conflict", "application/json", body.as_bytes())).await;
+        let result = delete_remote(&test_client(), dir.path(), &base, "tok", "a.md")
+            .await
+            .unwrap();
+        server.await.unwrap();
+        assert_eq!(result.status, 409);
+        assert_eq!(result.body.unwrap()["serverSha"], server_sha.as_str());
+        assert_eq!(base_of(dir.path(), "a.md"), None);
+    }
+
+    #[tokio::test]
+    async fn delete_remote_without_base_fails_before_network() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(
+            delete_remote(&test_client(), dir.path(), UNUSED_BASE, "tok", "a.md")
+                .await
+                .unwrap_err(),
+            "NO_BASE"
         );
     }
 }
