@@ -353,13 +353,20 @@ export function useLibraryRemote(isForeground: () => boolean): () => void {
     pull: (t, path, sha256) =>
       invoke<LibraryTransferResult>("library_pull", { baseUrl: t.baseUrl, token: t.token, path, sha256 }),
     push: (t, path) => invoke<LibraryTransferResult>("library_push", { baseUrl: t.baseUrl, token: t.token, path }),
-    localList: () => invoke<LibraryLocalEntry[]>("library_local_list"),
+    localList: async () => {
+      const entries = await invoke<LibraryLocalEntry[] | null>("library_local_list");
+      return Array.isArray(entries) ? entries : [];
+    },
     localRead: (path) => invoke<string>("library_local_read", { path }),
     localWrite: (path, content) => invoke<string>("library_local_write", { path, content }),
     localRemove: (path) => invoke<void>("library_local_remove", { path }),
-    readFavorites: () => invoke<string[]>("get_favorite_models"),
+    readFavorites: async () => {
+      const list = await invoke<string[] | null>("get_favorite_models");
+      return Array.isArray(list) ? list : [];
+    },
     replaceFavorites: async (models) => {
-      const saved = await invoke<string[]>("sync_replace_favorite_models", { models });
+      const result = await invoke<string[] | null>("sync_replace_favorite_models", { models });
+      const saved = Array.isArray(result) ? result : [...models];
       modelStore.favorites = saved;
       return saved;
     },

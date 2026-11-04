@@ -8,7 +8,7 @@ import { useAttachmentStore } from '../../core/stores/attachmentStore';
 import { useNotificationStore } from '../../core/stores/notification';
 import type { Attachment } from '../../core/types/chat';
 import { useOverlayStore } from '../../core/stores/overlay';
-import { Phone } from '@lucide/vue';
+import { Phone, Cpu } from '@lucide/vue';
 import { useTarvenStore } from '../../core/stores/tarvenStore';
 import { isAndroid, isIOS } from '../../core/utils/platform';
 import { useLongTextPaste } from './composables/useLongTextPaste';
@@ -23,6 +23,11 @@ import { useMentionSelector, MENTION_ALL_ID, type MentionMember } from './compos
 import { splitMentionSegments } from '../../core/utils/mention';
 import NarrationWave from './components/NarrationWave.vue';
 import { useBubbleNarration } from './voice/useBubbleNarration';
+import { defineAsyncComponent } from 'vue';
+import { useAssistantStore } from '../../core/stores/assistant';
+import { patchAgentConfig, quickSwitchAgentId } from '../agent/agentConfigPatch';
+
+const ModelSelector = defineAsyncComponent(() => import('../../components/ModelSelector.vue'));
 
 const tarvenStore = useTarvenStore();
 
@@ -350,6 +355,31 @@ const isGroupChat = computed(() => {
   const item = sessionStore.currentSelectedItem;
   return item?.type === 'group';
 });
+
+// 快速切换模型：手机话题无独立模型列，只改 Agent 默认（同电脑端未开话题时的语义）；群聊不提供。
+const assistantStore = useAssistantStore();
+const quickAgentId = computed(() => quickSwitchAgentId(sessionStore.currentSelectedItem));
+const quickModel = computed(() => assistantStore.agents.find(agent => agent.id === quickAgentId.value)?.model ?? '');
+const modelSwitcherMounted = ref(false);
+const showModelSwitcher = ref(false);
+const modelSwitching = ref(false);
+const openModelSwitcher = () => {
+  if (!quickAgentId.value || props.disabled || props.suspended) return;
+  modelSwitcherMounted.value = true;
+  showModelSwitcher.value = true;
+};
+const switchModel = async (modelId: string) => {
+  const agentId = quickAgentId.value;
+  if (!agentId || modelSwitching.value || !modelId || modelId === quickModel.value) return;
+  modelSwitching.value = true;
+  try {
+    await patchAgentConfig(agentId, { model: modelId });
+  } catch (error) {
+    notificationStore.addNotification({ type: 'error', title: '切换模型失败', message: String(error), toastOnly: true });
+  } finally {
+    modelSwitching.value = false;
+  }
+};
 
 const inputPlaceholder = computed(() => {
   if (props.disabled) return '请先选择话题以开启对话';
@@ -685,6 +715,20 @@ onUnmounted(() => {
 
         <!-- 右侧操作区：展开编辑时仅保留发送/中止按钮。 -->
         <div class="input-actions flex items-center shrink-0 mb-0.5 relative gap-1.5">
+          <!-- 快速切换模型（仅单 Agent） -->
+          <button
+            v-if="!isExpanded && quickAgentId"
+            type="button"
+            data-testid="quick-model-switch"
+            :aria-label="quickModel ? `切换模型（当前 ${quickModel}）` : '切换模型'"
+            :disabled="disabled || suspended || modelSwitching"
+            @click="openModelSwitcher"
+            class="w-9 h-9 flex items-center justify-center rounded-full hover:bg-black/5 dark:hover:bg-white/5 text-[var(--primary-text)] opacity-80 hover:opacity-100 active:scale-90 transition-all disabled:opacity-40"
+          >
+            <Cpu :size="20" />
+          </button>
+          <ModelSelector v-if="modelSwitcherMounted" v-model="showModelSwitcher" :current-model="quickModel"
+            title="切换当前助手模型" @select="switchModel" />
           <!-- 展开附件按钮 -->
           <button
             v-if="!isExpanded"
