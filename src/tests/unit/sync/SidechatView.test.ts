@@ -34,9 +34,12 @@ vi.mock("@/core/sync/sidechatRemote", async (importOriginal) => {
   const actual = await importOriginal<typeof import("@/core/sync/sidechatRemote")>();
   return { ...actual, requestSidechatSync: vi.fn(async () => null), sidechatLocal: fixture };
 });
+vi.mock("@/core/stores/chatStreamStore", () => ({
+  useChatStreamStore: () => ({ getActiveStreamMessage: () => undefined, processStreamEvent: vi.fn() }),
+}));
 
 describe("SidechatView", () => {
-  it("列出子话题并只读渲染消息", async () => {
+  it("列出子话题并渲染消息，可输入发送", async () => {
     const { default: SidechatView } = await import("@/features/sidechat/SidechatView.vue");
     const wrapper = mount(SidechatView);
     await flushPromises();
@@ -47,5 +50,21 @@ describe("SidechatView", () => {
     const messages = wrapper.findAll('[data-testid="sidechat-message"]');
     expect(messages).toHaveLength(2);
     expect(messages[0].html()).toContain("<strong>你好</strong>");
+    expect(wrapper.find('[data-testid="sidechat-input"]').exists()).toBe(true);
+    expect(wrapper.find('[data-testid="sidechat-send"]').attributes("disabled")).toBeDefined();
+  });
+
+  it("该子话题生成中显示停止、隐藏发送", async () => {
+    const { sidechatSending } = await import("@/features/sidechat/sidechatSend");
+    const { default: SidechatView } = await import("@/features/sidechat/SidechatView.vue");
+    const wrapper = mount(SidechatView);
+    await flushPromises();
+    await wrapper.find('[data-testid="sidechat-child"]').trigger("click");
+    await flushPromises();
+    sidechatSending.set("UserData/a1/topics/sidechat_1_aa", "msg_live");
+    await flushPromises();
+    expect(wrapper.find('[data-testid="sidechat-stop"]').exists()).toBe(true);
+    expect(wrapper.find('[data-testid="sidechat-send"]').exists()).toBe(false);
+    sidechatSending.clear();
   });
 });

@@ -6,15 +6,31 @@
 //! 路径口径与电脑端 `parseScopedPath` 一致；网络 helper 复用 [`super::canvas_sync`]。
 
 use super::canvas_sync::{atomic_write, canvas_client, describe_error, io_err, read_limited};
+use crate::vcp_modules::agent_service::{read_agent_config_internal, AgentConfigState};
+use crate::vcp_modules::chat_manager::ChatMessage;
+use crate::vcp_modules::db_manager::DbState;
+use crate::vcp_modules::infra::vcp_http_endpoint::ChatRequestPurpose;
+use crate::vcp_modules::infra::vcp_ws_activity::ChatActivityGuard;
+use crate::vcp_modules::settings_manager::{read_config, SettingsState};
+use crate::vcp_modules::topic_types::{MessageKey, TopicKey};
+use crate::vcp_modules::vcp_client::{
+    deliver_request_event, discard_request_helper, freeze_chat_connection,
+    message_transport_request_id, perform_vcp_request_registered, release_committed_helper,
+    stream_error_content, ActiveRequestLease, ActiveRequests, StreamEvent, VcpRequestPayload,
+};
 use reqwest::header::{ACCEPT, CONTENT_TYPE};
 use reqwest::{Client, Url};
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use tauri::ipc::Channel;
+use tauri_plugin_vcp_mobile::stream::{ForegroundLease, ForegroundTask};
+use tokio_util::sync::CancellationToken;
 
 const API_PREFIX: &str = "/api/sidechat-sync";
 const MIRROR_DIR: &str = "sidechat-mirror";
@@ -185,6 +201,14 @@ async fn pull(
     expected: Option<&str>,
 ) -> Result<SidechatPullResult, String> {
     let segments = validate_path(path)?;
+    // 生成中的子话题不接受远端覆盖；结束后由前端补一轮同步。
+    if is_busy(&segments) {
+        return Ok(SidechatPullResult {
+            status: 423,
+            sha256: None,
+            skipped: false,
+        });
+    }
     if let Some(expected) = expected {
         if already_current(root, path, &segments, expected)? {
             return Ok(SidechatPullResult {
@@ -264,6 +288,9 @@ fn list_local(root: &Path) -> Result<Vec<SidechatLocalEntry>, String> {
 /// 电脑端已删的子话题文件：删本机镜像与 base，再自下而上删空目录（停在 `UserData/<owner>/topics`）。
 fn remove_local(root: &Path, path: &str) -> Result<bool, String> {
     let segments = validate_path(path)?;
+    if is_busy(&segments) {
+        return Err("SIDECHAT_BUSY".to_owned());
+    }
     let target = local_path(root, &segments);
     let removed = match std::fs::remove_file(&target) {
         Ok(()) => true,
@@ -492,6 +519,174 @@ fn mirror_root(app: &tauri::AppHandle) -> Result<PathBuf, String> {
     Ok(crate::vcp_modules::infra::file_manager::get_support_root_dir(app)?.join(MIRROR_DIR))
 }
 
+// ---------------------------------------------------------------- 发送（ptp4g#46）
+
+fn busy_dirs() -> MutexGuard<'static, HashSet<String>> {
+    static DIRS: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+    DIRS.get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// `UserData/<owner>/topics/<sidechat_id>`
+fn child_dir(segments: &[&str]) -> String {
+    segments[..4].join("/")
+}
+
+fn is_busy(segments: &[&str]) -> bool {
+    busy_dirs().contains(&child_dir(segments))
+}
+
+/// 同一子话题同时只允许一次生成；持有期间远端 pull/remove 不写该目录。
+struct BusyGuard(String);
+
+impl BusyGuard {
+    fn acquire(dir: String) -> Result<Self, String> {
+        if !busy_dirs().insert(dir.clone()) {
+            return Err("SIDECHAT_BUSY".to_owned());
+        }
+        Ok(Self(dir))
+    }
+}
+
+impl Drop for BusyGuard {
+    fn drop(&mut self) {
+        busy_dirs().remove(&self.0);
+    }
+}
+
+fn read_history(root: &Path, segments: &[&str]) -> Result<Vec<Value>, String> {
+    match std::fs::read(local_path(root, segments)) {
+        Ok(bytes) => match serde_json::from_slice::<Value>(&bytes) {
+            Ok(Value::Array(list)) => Ok(list),
+            _ => Err("HISTORY_INVALID".to_owned()),
+        },
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+        Err(error) => Err(io_err(error)),
+    }
+}
+
+/// 在 history.json 末尾追加一条（保留已有条目的全部字段），原子写回；不动基线，
+/// 因此 local_status 的 sha 与基线不同，三方比对识别为本机变更。
+fn append_message(
+    root: &Path,
+    history: &str,
+    message: Value,
+) -> Result<(Vec<Value>, String), String> {
+    let segments = validate_path(history)?;
+    let mut list = read_history(root, &segments)?;
+    list.push(message);
+    let bytes = serde_json::to_vec_pretty(&list).map_err(|e| format!("HISTORY_ENCODE: {e}"))?;
+    let sha = write_local(root, history, &bytes)?;
+    Ok((list, sha))
+}
+
+fn history_for_context(list: &[Value]) -> Vec<ChatMessage> {
+    list.iter()
+        .filter_map(|value| serde_json::from_value::<ChatMessage>(value.clone()).ok())
+        .filter(|message| matches!(message.role.as_str(), "user" | "assistant"))
+        .collect()
+}
+
+fn check_user_message(message: &Value) -> Result<String, String> {
+    let id = message["id"].as_str().filter(|id| !id.is_empty());
+    match id {
+        Some(id) if message["role"] == "user" && message["content"].is_string() => {
+            Ok(id.to_owned())
+        }
+        _ => Err("INVALID_USER_MESSAGE".to_owned()),
+    }
+}
+
+/// 与主聊 finalize 同口径：中止保留已收正文并标 cancelled_by_user；中止且无正文不写。
+fn terminal_record(
+    key: &MessageKey,
+    agent_name: &str,
+    content: String,
+    reason: &str,
+    timestamp: u64,
+) -> Option<Value> {
+    if content.is_empty() && reason == "cancelled_by_user" {
+        return None;
+    }
+    Some(json!({
+        "id": key.msg_id,
+        "role": "assistant",
+        "name": agent_name,
+        "agentId": key.topic.owner_id,
+        "content": content,
+        "timestamp": timestamp,
+        "finishReason": reason,
+    }))
+}
+
+/// 先落盘、再结算 helper、最后发 durable end（与 finalize_stream_message_inner 同序）。
+#[allow(clippy::too_many_arguments)]
+async fn settle_reply(
+    app: &tauri::AppHandle,
+    root: &Path,
+    history: &str,
+    key: &MessageKey,
+    agent_name: &str,
+    context: Option<Value>,
+    channel: &Channel<StreamEvent>,
+    content: String,
+    reason: String,
+) -> Result<Option<String>, String> {
+    let timestamp = crate::vcp_modules::infra::utils::now_millis() as u64;
+    let Some(record) = terminal_record(key, agent_name, content.clone(), &reason, timestamp) else {
+        discard_request_helper(app, key).await;
+        let end = StreamEvent::end(
+            key.msg_id.clone(),
+            context,
+            Some(reason),
+            Some(String::new()),
+            None,
+            Some(timestamp),
+            None,
+        );
+        deliver_request_event(app, key, Some(channel.clone()), end);
+        return Ok(None);
+    };
+    match append_message(root, history, record) {
+        Ok((_, sha)) => {
+            release_committed_helper(app, key).await;
+            let end = StreamEvent::end(
+                key.msg_id.clone(),
+                context,
+                Some(reason),
+                Some(content),
+                None,
+                Some(timestamp),
+                None,
+            );
+            deliver_request_event(app, key, Some(channel.clone()), end);
+            Ok(Some(sha))
+        }
+        Err(error) => {
+            discard_request_helper(app, key).await;
+            let mut event = StreamEvent::error(
+                key.msg_id.clone(),
+                context,
+                format!("终态保存失败: {error}"),
+            );
+            event.content = Some(content);
+            deliver_request_event(app, key, Some(channel.clone()), event);
+            Err(error)
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SidechatSendPayload {
+    /// `UserData/<agentId>/topics/<sidechat_id>`
+    pub dir: String,
+    pub agent_id: String,
+    /// 前端构造的用户消息（id/role=user/content/name/timestamp）。
+    pub user_message: Value,
+}
+
 // ---------------------------------------------------------------- commands
 
 /// GET /manifest → `{revision, files:[{path,size,mtime,sha256}]}`，原样交回。
@@ -615,6 +810,170 @@ pub async fn sidechat_forget_base(app: tauri::AppHandle, path: String) -> Result
 #[tauri::command]
 pub async fn sidechat_save_conflict(app: tauri::AppHandle, path: String) -> Result<String, String> {
     save_conflict(&mirror_root(&app)?, &path)
+}
+
+/// 子话题发送：复用主聊的上下文装配、注册请求、流式通道与 helper 结算；
+/// 历史读写落在镜像 history.json（子话题不进 SQLite）。用户消息先落盘，回复在 durable end 前落盘。
+#[tauri::command]
+#[allow(clippy::too_many_arguments)]
+pub async fn sidechat_send(
+    app: tauri::AppHandle,
+    agent_state: tauri::State<'_, AgentConfigState>,
+    db_state: tauri::State<'_, DbState>,
+    active_requests: tauri::State<'_, ActiveRequests>,
+    settings_state: tauri::State<'_, SettingsState>,
+    payload: SidechatSendPayload,
+    stream_channel: Channel<StreamEvent>,
+) -> Result<Value, String> {
+    let history = format!("{}/history.json", payload.dir.trim_end_matches('/'));
+    let segments = validate_path(&history)?;
+    if segments.len() != MIN_SEGMENTS || segments[1] != payload.agent_id {
+        return Err("INVALID_PATH".to_owned());
+    }
+    let user_id = check_user_message(&payload.user_message)?;
+    let _busy = BusyGuard::acquire(child_dir(&segments))?;
+    let key = MessageKey::new(
+        TopicKey::new("agent", &payload.agent_id, segments[3]),
+        format!("msg_{}", uuid::Uuid::new_v4()),
+    );
+    let (lease, cancellation_token) = ActiveRequestLease::try_acquire_with_cancellation(
+        active_requests.0.clone(),
+        key.clone(),
+        CancellationToken::new(),
+    )?;
+    let _activity = ChatActivityGuard::acquire(&app);
+    lease.set_origin_user_message(&user_id)?;
+    lease.bind_output(&app, Some(stream_channel.clone()))?;
+
+    let root = mirror_root(&app)?;
+    let (list, _) = append_message(&root, &history, payload.user_message)?;
+    let settings = read_config(app.clone(), settings_state).await?;
+    let connection = freeze_chat_connection(&settings, ChatRequestPurpose::Interactive)?;
+    let agent =
+        read_agent_config_internal(&app, &agent_state, &payload.agent_id, Some(true)).await?;
+    let prompt = if agent.mobile_system_prompt.is_empty() {
+        agent.system_prompt.clone()
+    } else {
+        agent.mobile_system_prompt.clone()
+    };
+    let messages = crate::vcp_modules::context_assembler::orchestrate_chat_context(
+        &db_state,
+        &history_for_context(&list),
+        &key.topic,
+        &agent.name,
+        prompt,
+        None,
+        None,
+    )
+    .await?;
+    let mut model_config = json!({
+        "model": agent.model,
+        "max_tokens": agent.max_output_tokens,
+        "contextTokenLimit": agent.context_token_limit,
+        "stream": agent.stream_output
+    });
+    if agent.use_temperature {
+        model_config["temperature"] = json!(agent.temperature);
+    }
+    let context = Some(json!({
+        "agentId": payload.agent_id,
+        "ownerId": payload.agent_id,
+        "ownerType": "agent",
+        "topicId": key.topic.topic_id,
+        "agentName": agent.name
+    }));
+    if cancellation_token.is_cancelled() {
+        return Ok(json!({ "status": "cancelled", "messageId": key.msg_id }));
+    }
+    let _foreground = ForegroundLease::acquire(&app, ForegroundTask::Stream, &agent.name).ok();
+    deliver_request_event(
+        &app,
+        &key,
+        Some(stream_channel.clone()),
+        StreamEvent::thinking(key.msg_id.clone(), context.clone()),
+    );
+    let request = VcpRequestPayload {
+        vcp_url: connection.endpoint_url,
+        vcp_api_key: connection.api_key,
+        messages,
+        model_config,
+        message_id: key.msg_id.clone(),
+        context: context.clone(),
+        transport_request_id: Some(message_transport_request_id(&key)),
+    };
+    let result = perform_vcp_request_registered(
+        &app,
+        request,
+        Some(stream_channel.clone()),
+        cancellation_token,
+    )
+    .await;
+    let (content, reason, failed) = match result {
+        Ok(response) => {
+            let reason = if response.is_aborted {
+                "cancelled_by_user".to_owned()
+            } else {
+                response
+                    .finish_reason
+                    .unwrap_or_else(|| "completed".to_owned())
+            };
+            (response.full_content, reason, None)
+        }
+        Err(failure) => {
+            let stopped = failure.is_stop_pending();
+            let (error, partial) = failure.into_parts();
+            if stopped {
+                (
+                    partial.unwrap_or_default(),
+                    "cancelled_by_user".to_owned(),
+                    None,
+                )
+            } else {
+                // 子话题没有 DB 待恢复行，接管中断也按错误终态收尾（同 finalize_stream_error）。
+                let error = if error.trim().is_empty() {
+                    "生成意外中断".to_owned()
+                } else {
+                    error
+                };
+                let body = stream_error_content(&partial.unwrap_or_default(), &error);
+                (body, "error".to_owned(), Some(error))
+            }
+        }
+    };
+    let sha = settle_reply(
+        &app,
+        &root,
+        &history,
+        &key,
+        &agent.name,
+        context,
+        &stream_channel,
+        content,
+        reason,
+    )
+    .await?;
+    drop(lease);
+    if let Some(error) = failed {
+        return Err(error);
+    }
+    Ok(json!({ "status": "sent", "messageId": key.msg_id, "sha256": sha }))
+}
+
+/// 停止子话题生成。interruptRequest 需要 SQLite 消息行做结算，子话题没有，直接取消 owner。
+#[tauri::command]
+pub async fn sidechat_stop(
+    active_requests: tauri::State<'_, ActiveRequests>,
+    agent_id: String,
+    topic_id: String,
+    message_id: String,
+) -> Result<bool, String> {
+    if !is_child_id(&topic_id) {
+        return Err("INVALID_PATH".to_owned());
+    }
+    active_requests.cancel(&MessageKey::new(
+        TopicKey::new("agent", agent_id, topic_id),
+        message_id,
+    ))
 }
 
 #[cfg(test)]
@@ -832,5 +1191,87 @@ mod tests {
         assert_eq!(base_of(&root, a), None);
         assert!(!remove_local(&root, a).unwrap());
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn append_message_is_a_local_change_and_rejects_corrupt_history() {
+        let dir = tempfile::tempdir().unwrap();
+        let old = write_local(
+            dir.path(),
+            P,
+            br#"[{"id":"m1","role":"user","content":"hi","timestamp":1,"extra":{"k":1}}]"#,
+        )
+        .unwrap();
+        set_base(dir.path(), P, &old).unwrap();
+        let (list, sha) = append_message(
+            dir.path(),
+            P,
+            json!({"id":"m2","role":"user","content":"再问","timestamp":2}),
+        )
+        .unwrap();
+        assert_eq!(list.len(), 2);
+        let bytes = std::fs::read(local_path(dir.path(), &validate_path(P).unwrap())).unwrap();
+        assert_eq!(sha, sha_hex(&bytes));
+        let saved: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(saved[0]["extra"]["k"], 1);
+        assert_eq!(saved[1]["content"], "再问");
+        let status = local_status(dir.path()).unwrap();
+        assert_eq!(status[0].sha256.as_deref(), Some(sha.as_str()));
+        assert_eq!(status[0].base_sha.as_deref(), Some(old.as_str()));
+        let context = history_for_context(&list);
+        assert_eq!(context.len(), 2);
+        assert_eq!(context[1].content, "再问");
+        write_local(dir.path(), P, b"{oops").unwrap();
+        assert_eq!(
+            append_message(dir.path(), P, json!({})).unwrap_err(),
+            "HISTORY_INVALID"
+        );
+    }
+
+    #[test]
+    fn terminal_record_follows_main_chat_stop_semantics() {
+        let key = MessageKey::new(
+            TopicKey::new("agent", "o", "sidechat_1_ab"),
+            "msg_x".to_string(),
+        );
+        assert!(terminal_record(&key, "小雪", String::new(), "cancelled_by_user", 5).is_none());
+        let partial = terminal_record(&key, "小雪", "半句".into(), "cancelled_by_user", 5).unwrap();
+        assert_eq!(partial["finishReason"], "cancelled_by_user");
+        assert_eq!(partial["content"], "半句");
+        assert_eq!(partial["role"], "assistant");
+        assert_eq!(partial["agentId"], "o");
+        let done = terminal_record(&key, "小雪", String::new(), "completed", 5).unwrap();
+        assert_eq!(done["finishReason"], "completed");
+        assert!(check_user_message(&json!({"id":"u","role":"user","content":"x"})).is_ok());
+        assert!(check_user_message(&json!({"id":"u","role":"assistant","content":"x"})).is_err());
+    }
+
+    #[tokio::test]
+    async fn busy_child_rejects_second_send_and_remote_writes() {
+        let dir = tempfile::tempdir().unwrap();
+        let child = "UserData/o/topics/sidechat_9_ef";
+        let path = "UserData/o/topics/sidechat_9_ef/history.json";
+        write_local(dir.path(), path, b"[]").unwrap();
+        let guard = BusyGuard::acquire(child.into()).unwrap();
+        assert_eq!(
+            BusyGuard::acquire(child.into()).err().as_deref(),
+            Some("SIDECHAT_BUSY")
+        );
+        let expected = "0".repeat(64);
+        let pulled = pull(
+            &test_client(),
+            dir.path(),
+            "http://127.0.0.1:9",
+            "tok",
+            path,
+            Some(expected.as_str()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(pulled.status, 423);
+        assert_eq!(remove_local(dir.path(), path).unwrap_err(), "SIDECHAT_BUSY");
+        assert!(dir.path().join(path).is_file());
+        drop(guard);
+        assert!(remove_local(dir.path(), path).unwrap());
     }
 }

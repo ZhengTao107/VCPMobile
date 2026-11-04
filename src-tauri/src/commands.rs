@@ -145,7 +145,7 @@ macro_rules! app_command_handler {
         use crate::vcp_modules::sync::sidechat_sync::{
             sidechat_delete, sidechat_forget_base, sidechat_local_list, sidechat_local_read,
             sidechat_local_remove, sidechat_local_status, sidechat_local_write, sidechat_manifest,
-            sidechat_pull, sidechat_push, sidechat_save_conflict,
+            sidechat_pull, sidechat_push, sidechat_save_conflict, sidechat_send, sidechat_stop,
         };
         use crate::vcp_modules::sync::library_sync::{
             library_local_list, library_local_read, library_local_remove, library_local_write,
@@ -470,6 +470,8 @@ macro_rules! app_command_handler {
                 sidechat_local_write,
                 sidechat_forget_base,
                 sidechat_save_conflict,
+                sidechat_send,
+                sidechat_stop,
                 canvas_delete,
                 canvas_local_delete,
                 canvas_local_missing,
