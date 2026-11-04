@@ -18,7 +18,7 @@ use std::collections::HashMap;
 use tauri::{ipc::Channel, AppHandle, Manager, State};
 
 pub(super) const TOPIC_LIST_QUERY: &str = "WITH topic_list AS (
-         SELECT t.topic_id, t.title, t.created_at, t.locked, t.unread, t.unread_count, t.msg_count,
+         SELECT t.topic_id, t.title, t.created_at, t.locked, t.unread, t.pinned, t.unread_count, t.msg_count,
             CASE
                 WHEN MAX(m.updated_at) IS NULL
                     THEN COALESCE(NULLIF(t.updated_at, 0), t.created_at)
@@ -77,6 +77,7 @@ fn topic_list_item_from_row(row: &SqliteRow, owner_id: &str, owner_type: &str) -
             created_at: row.get("created_at"),
             locked: row.get::<i32, _>("locked") != 0,
             unread: row.get::<i32, _>("unread") != 0,
+            pinned: row.get::<i32, _>("pinned") != 0,
             unread_count: row.get("unread_count"),
             msg_count: row.get("msg_count"),
             owner_id: owner_id.to_string(),
@@ -213,6 +214,7 @@ pub async fn create_topic(
         created_at: now,
         locked: true,
         unread: false,
+        pinned: false,
         unread_count: 0,
         msg_count: 0,
         owner_id: owner_id.clone(),
@@ -269,6 +271,7 @@ pub async fn delete_topic(
         created_at: now,
         locked: true,
         unread: false,
+        pinned: false,
         unread_count: 0,
         msg_count: 0,
         owner_id: owner_id.clone(),
@@ -632,6 +635,106 @@ pub async fn toggle_topic_lock(
     tx.commit().await.map_err(|e| e.to_string())?;
 
     Ok((changed.rows_affected() == 1).then_some(now))
+}
+
+/// ptp4g#44：置顶写库。Agent 话题参与同步：bump updated_at 并冒泡重算 config_hash，使其回推；
+/// Group 话题的同步 DTO 不含 pinned，只写本地列，不改 updated_at、不冒泡。
+/// 返回 Some(updated_at) 表示 Agent 话题状态确有变化。
+pub(crate) async fn set_topic_pinned_in_tx(
+    tx: &mut sqlx::SqliteConnection,
+    key: &TopicKey,
+    pinned: bool,
+    now: i64,
+) -> Result<Option<i64>, String> {
+    if !key.is_valid() {
+        return Err("Topic pin requires an exact topic identity".to_string());
+    }
+    match key.owner_type.as_str() {
+        "agent" => {
+            let changed = sqlx::query(
+                "UPDATE topics SET pinned = ?, updated_at = ?
+                 WHERE owner_type = 'agent' AND owner_id = ? AND topic_id = ?
+                   AND deleted_at IS NULL AND pinned IS NOT ?",
+            )
+            .bind(pinned)
+            .bind(now)
+            .bind(&key.owner_id)
+            .bind(&key.topic_id)
+            .bind(pinned)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| e.to_string())?;
+            if changed.rows_affected() != 1 {
+                return Ok(None);
+            }
+            HashAggregator::bubble_from_topic(tx, key).await?;
+            Ok(Some(now))
+        }
+        "group" => {
+            sqlx::query(
+                "UPDATE topics SET pinned = ?
+                 WHERE owner_type = 'group' AND owner_id = ? AND topic_id = ?
+                   AND deleted_at IS NULL AND pinned IS NOT ?",
+            )
+            .bind(pinned)
+            .bind(&key.owner_id)
+            .bind(&key.topic_id)
+            .bind(pinned)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| e.to_string())?;
+            Ok(None)
+        }
+        other => Err(format!("Topic pin has unsupported owner type {other}")),
+    }
+}
+
+#[tauri::command]
+pub async fn set_topic_pinned(
+    db_state: State<'_, DbState>,
+    owner_id: String,
+    owner_type: String,
+    topic_id: String,
+    pinned: bool,
+) -> Result<Option<i64>, String> {
+    let now = crate::vcp_modules::infra::utils::now_millis();
+    let key = TopicKey::new(owner_type, owner_id, topic_id);
+    let mut tx = db_state.write_transaction("identity.topic.pin").await?;
+    let updated_at = set_topic_pinned_in_tx(&mut tx, &key, pinned, now).await?;
+    tx.commit().await.map_err(|e| e.to_string())?;
+    Ok(updated_at)
+}
+
+#[derive(Debug, serde::Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct LegacyTopicPin {
+    pub owner_id: String,
+    pub owner_type: String,
+    pub topic_id: String,
+}
+
+/// ptp4g#44：把前端 pinia 里的旧 pinnedTopicKeys 一次性写入 DB（单事务）。
+/// 身份不合法或话题已不存在的条目跳过；返回处理的合法条目数。
+#[tauri::command]
+pub async fn migrate_legacy_topic_pins(
+    db_state: State<'_, DbState>,
+    pins: Vec<LegacyTopicPin>,
+) -> Result<u32, String> {
+    let now = crate::vcp_modules::infra::utils::now_millis();
+    let mut tx = db_state
+        .write_transaction("identity.topic.pin-migrate")
+        .await?;
+    let mut applied = 0u32;
+    for pin in pins {
+        let key = TopicKey::new(pin.owner_type, pin.owner_id, pin.topic_id);
+        if !key.is_valid() || !matches!(key.owner_type.as_str(), "agent" | "group") {
+            continue;
+        }
+        set_topic_pinned_in_tx(&mut tx, &key, true, now).await?;
+        applied += 1;
+    }
+    tx.commit().await.map_err(|e| e.to_string())?;
+    Ok(applied)
 }
 
 #[tauri::command]
@@ -1010,6 +1113,12 @@ mod tests {
             .execute(&pool)
             .await
             .expect("create current baseline schema");
+        sqlx::raw_sql(include_str!(
+            "../../../migrations/9002_add_topic_pinned.sql"
+        ))
+        .execute(&pool)
+        .await
+        .expect("topic pinned schema");
         sqlx::raw_sql(
             "INSERT INTO agents (owner_type, agent_id, name, model, updated_at)
              VALUES ('agent', 'agent', 'Agent', 'model', 1);
@@ -1138,6 +1247,12 @@ mod tests {
             .execute(&pool)
             .await
             .expect("create current baseline schema");
+        sqlx::raw_sql(include_str!(
+            "../../../migrations/9002_add_topic_pinned.sql"
+        ))
+        .execute(&pool)
+        .await
+        .expect("topic pinned schema");
         sqlx::query(
             "INSERT INTO agents (owner_type, agent_id, name, model, updated_at)
              VALUES ('agent', 'agent', 'Agent', 'model', 1);
@@ -1206,6 +1321,12 @@ mod tests {
             .execute(&pool)
             .await
             .expect("create current baseline schema");
+        sqlx::raw_sql(include_str!(
+            "../../../migrations/9002_add_topic_pinned.sql"
+        ))
+        .execute(&pool)
+        .await
+        .expect("topic pinned schema");
         sqlx::query(
             "INSERT INTO agents (owner_type, agent_id, name, model, updated_at)
              VALUES ('agent', 'agent', 'Agent', 'model', 1);
@@ -1225,6 +1346,7 @@ mod tests {
             created_at: 10,
             locked: true,
             unread: false,
+            pinned: false,
             unread_count: 0,
             msg_count: 0,
             owner_id: "agent".to_string(),
@@ -1270,5 +1392,132 @@ mod tests {
         .await
         .expect("count live topics");
         assert_eq!(live_topics, 0);
+    }
+
+    async fn pinned_test_pool() -> sqlx::SqlitePool {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .expect("open test database");
+        for sql in [
+            include_str!("../../../migrations/0100_baseline_v2.sql"),
+            include_str!("../../../migrations/0101_current_share.sql"),
+            include_str!("../../../migrations/0102_stream_stop_intent.sql"),
+            include_str!("../../../migrations/0103_config_domains.sql"),
+            include_str!("../../../migrations/0104_group_local_settings.sql"),
+            include_str!("../../../migrations/0105_agent_voice_config.sql"),
+            include_str!("../../../migrations/9001_add_message_context_metrics.sql"),
+            include_str!("../../../migrations/9002_add_topic_pinned.sql"),
+        ] {
+            sqlx::raw_sql(sql)
+                .execute(&pool)
+                .await
+                .expect("apply migration");
+        }
+        let hash = "a".repeat(64);
+        sqlx::query(
+            "INSERT INTO agents (owner_type, agent_id, name, model, updated_at)
+             VALUES ('agent', 'agent', 'Agent', 'model', 1)",
+        )
+        .execute(&pool)
+        .await
+        .expect("seed agent");
+        sqlx::query(
+            "INSERT INTO topics (topic_id, owner_type, owner_id, title, created_at, updated_at, config_hash)
+             VALUES ('t1', 'agent', 'agent', 'T1', 100, 100, ?),
+                    ('g1', 'group', 'group', 'G1', 100, 100, ?)",
+        )
+        .bind(&hash)
+        .bind(&hash)
+        .execute(&pool)
+        .await
+        .expect("seed topics");
+        pool
+    }
+
+    async fn topic_pin_row(
+        conn: &mut sqlx::SqliteConnection,
+        owner_type: &str,
+        topic_id: &str,
+    ) -> (i64, i64, String) {
+        sqlx::query_as(
+            "SELECT pinned, updated_at, COALESCE(config_hash, '') FROM topics
+             WHERE owner_type = ? AND topic_id = ?",
+        )
+        .bind(owner_type)
+        .bind(topic_id)
+        .fetch_one(&mut *conn)
+        .await
+        .expect("read topic pin row")
+    }
+
+    /// ptp4g#44：Agent 置顶写库 bump updated_at 并重算 config_hash；重复置顶无变化；
+    /// 取消置顶后哈希回到未置顶值；群话题只写本地列；非法 owner 报错。
+    #[tokio::test]
+    async fn set_topic_pinned_writes_db_and_rehashes_agent_topic() {
+        let pool = pinned_test_pool().await;
+        let mut conn = pool.acquire().await.expect("acquire");
+        let agent = TopicKey::new("agent", "agent", "t1");
+
+        HashAggregator::bubble_from_topic(&mut conn, &agent)
+            .await
+            .expect("initialize unpinned hash");
+        assert_eq!(
+            set_topic_pinned_in_tx(&mut conn, &agent, false, 150)
+                .await
+                .unwrap(),
+            None
+        );
+        let (pinned, updated_at, unpinned_hash) = topic_pin_row(&mut conn, "agent", "t1").await;
+        assert_eq!((pinned, updated_at), (0, 100));
+        let legacy =
+            crate::vcp_modules::sync_types::compute_deterministic_hash(&serde_json::json!({
+                "id": "t1", "name": "T1", "createdAt": 100, "locked": true, "unread": false,
+            }));
+        assert_eq!(unpinned_hash, legacy);
+
+        assert_eq!(
+            set_topic_pinned_in_tx(&mut conn, &agent, true, 200)
+                .await
+                .unwrap(),
+            Some(200)
+        );
+        let (pinned, updated_at, pinned_hash) = topic_pin_row(&mut conn, "agent", "t1").await;
+        assert_eq!((pinned, updated_at), (1, 200));
+        assert_ne!(pinned_hash, unpinned_hash);
+
+        assert_eq!(
+            set_topic_pinned_in_tx(&mut conn, &agent, true, 300)
+                .await
+                .unwrap(),
+            None
+        );
+        assert_eq!(topic_pin_row(&mut conn, "agent", "t1").await.1, 200);
+
+        assert_eq!(
+            set_topic_pinned_in_tx(&mut conn, &agent, false, 400)
+                .await
+                .unwrap(),
+            Some(400)
+        );
+        let (pinned, updated_at, hash) = topic_pin_row(&mut conn, "agent", "t1").await;
+        assert_eq!((pinned, updated_at), (0, 400));
+        assert_eq!(hash, unpinned_hash);
+
+        let group = TopicKey::new("group", "group", "g1");
+        assert_eq!(
+            set_topic_pinned_in_tx(&mut conn, &group, true, 500)
+                .await
+                .unwrap(),
+            None
+        );
+        let (pinned, updated_at, _) = topic_pin_row(&mut conn, "group", "g1").await;
+        assert_eq!((pinned, updated_at), (1, 100));
+
+        let bogus = TopicKey::new("user", "x", "y");
+        assert!(set_topic_pinned_in_tx(&mut conn, &bogus, true, 600)
+            .await
+            .is_err());
     }
 }

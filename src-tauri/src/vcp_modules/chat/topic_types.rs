@@ -93,6 +93,8 @@ pub struct Topic {
     pub locked: bool,
     #[serde(default)]
     pub unread: bool,
+    #[serde(default)]
+    pub pinned: bool,
     #[serde(rename = "unreadCount", default)]
     pub unread_count: i32,
     #[serde(rename = "msgCount", default)]

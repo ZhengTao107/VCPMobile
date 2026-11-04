@@ -372,6 +372,12 @@ mod tests {
             .execute(&pool)
             .await
             .unwrap();
+        sqlx::raw_sql(include_str!(
+            "../../../migrations/9002_add_topic_pinned.sql"
+        ))
+        .execute(&pool)
+        .await
+        .unwrap();
         sqlx::raw_sql(
             "INSERT INTO agents(owner_type,agent_id,name,model,updated_at) VALUES('agent','a','A','m',1);
              INSERT INTO groups(owner_type,group_id,name,updated_at) VALUES('group','a','G',1);

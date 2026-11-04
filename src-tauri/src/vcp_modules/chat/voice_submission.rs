@@ -322,6 +322,12 @@ mod tests {
             .execute(&pool)
             .await
             .unwrap();
+        sqlx::raw_sql(include_str!(
+            "../../../migrations/9002_add_topic_pinned.sql"
+        ))
+        .execute(&pool)
+        .await
+        .unwrap();
         sqlx::raw_sql(
             "INSERT INTO agents (owner_type, agent_id, name, model, updated_at)
              VALUES ('agent', 'voice-agent', 'Agent', 'test', 1);

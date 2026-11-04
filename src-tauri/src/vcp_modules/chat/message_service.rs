@@ -2220,6 +2220,12 @@ mod stream_lifecycle_tests {
             .await
             .expect("baseline schema");
         sqlx::raw_sql(include_str!(
+            "../../../migrations/9002_add_topic_pinned.sql"
+        ))
+        .execute(&pool)
+        .await
+        .expect("topic pinned schema");
+        sqlx::raw_sql(include_str!(
             "../../../migrations/0102_stream_stop_intent.sql"
         ))
         .execute(&pool)
